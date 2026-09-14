@@ -15,6 +15,7 @@ import (
 
 	"diadoche/internal/agents"
 	"diadoche/internal/config"
+	"diadoche/internal/gitutil"
 	"diadoche/internal/skills"
 	"diadoche/internal/speclock"
 	"diadoche/internal/specs"
@@ -50,6 +51,12 @@ func New(cfg config.Config) *Orchestrator {
 func (o *Orchestrator) Run(ctx context.Context) error {
 	if err := o.Layout.Ensure(); err != nil {
 		return fmt.Errorf("ensure layout: %w", err)
+	}
+
+	if !o.Cfg.DryRun {
+		if err := gitutil.EnsureRepo(ctx, o.Cfg.Dir); err != nil {
+			return fmt.Errorf("ensure git repo: %w", err)
+		}
 	}
 
 	matchedSkills, err := skills.Resolve(o.Layout.SkillsDir, o.Cfg.Langs, o.Cfg.Frameworks)
@@ -196,9 +203,26 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 
 	if done {
 		o.Log.Printf("task %s: DONE", specFile)
-		return nil
+		return o.commitDone(ctx, specFile)
 	}
 
 	o.Log.Printf("task %s: FAILED after %d iteration(s)", specFile, o.Cfg.Iter)
 	return specs.SetStatus(o.Layout, specFile, specs.StatusFailed)
+}
+
+// commitDone commits everything the planner/worker/tester changed for a
+// task that just turned DONE, so completed work is captured as its own git
+// commit. A no-op in --dry-run mode, and a no-op if there's nothing to
+// commit (e.g. the task only involved discussion, no file changes).
+func (o *Orchestrator) commitDone(ctx context.Context, specFile string) error {
+	if o.Cfg.DryRun {
+		o.Log.Printf("[dry-run] would commit: task %s done", specFile)
+		return nil
+	}
+	msg := fmt.Sprintf("diadoche: complete %s", specFile)
+	if err := gitutil.CommitAll(ctx, o.Cfg.Dir, msg); err != nil {
+		return fmt.Errorf("commit %s: %w", specFile, err)
+	}
+	o.Log.Printf("task %s: committed", specFile)
+	return nil
 }
