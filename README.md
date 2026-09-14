@@ -82,4 +82,3 @@ Agent prompts and models live in `.claude/agents/*.md` (frontmatter `name` /
 `model` / `description` plus a body — the system prompt) — editing them
 never requires rebuilding the diadoche binary.
 
-See `REPORT.md` for design decisions and known caveats.
