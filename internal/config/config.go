@@ -4,6 +4,7 @@ package config
 import (
 	"flag"
 	"fmt"
+	"path/filepath"
 	"strings"
 )
 
@@ -20,6 +21,16 @@ type Config struct {
 	Frameworks []string
 	DryRun     bool
 	ClaudeBin  string
+	Preprocess bool
+	Task       string
+}
+
+// TaskPath resolves --task relative to --dir, unless it's already absolute.
+func (c Config) TaskPath() string {
+	if filepath.IsAbs(c.Task) {
+		return c.Task
+	}
+	return filepath.Join(c.Dir, c.Task)
 }
 
 // Parse parses CLI args (excluding argv[0]) into a Config.
@@ -31,6 +42,8 @@ func Parse(args []string) (*Config, error) {
 	frameworks := fs.String("frameworks", "", "comma-separated frameworks, matched against .claude/skills subfolders")
 	dryRun := fs.Bool("dry-run", false, "log what would be sent to each agent instead of invoking the claude CLI")
 	claudeBin := fs.String("claude-bin", "claude", "path to the claude CLI binary")
+	preprocess := fs.Bool("preprocess", false, "split a raw task file into atomic task specs and exit, instead of running the main loop")
+	task := fs.String("task", "", "path to the raw task file for --preprocess, e.g. .claude/entelecheia/spec/raw/foo.md")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -38,6 +51,9 @@ func Parse(args []string) (*Config, error) {
 
 	if *iter < 1 || *iter > MaxIter {
 		return nil, fmt.Errorf("--ITER must be between 1 and %d, got %d", MaxIter, *iter)
+	}
+	if *preprocess && strings.TrimSpace(*task) == "" {
+		return nil, fmt.Errorf("--preprocess requires --task <path to raw task file>")
 	}
 
 	return &Config{
@@ -47,6 +63,8 @@ func Parse(args []string) (*Config, error) {
 		Frameworks: splitCSV(*frameworks),
 		DryRun:     *dryRun,
 		ClaudeBin:  *claudeBin,
+		Preprocess: *preprocess,
+		Task:       *task,
 	}, nil
 }
 

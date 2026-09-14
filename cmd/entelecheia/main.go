@@ -10,6 +10,7 @@ import (
 
 	"entelecheia/internal/config"
 	"entelecheia/internal/orchestrator"
+	"entelecheia/internal/preprocessor"
 )
 
 func main() {
@@ -17,6 +18,14 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "entelecheia:", err)
 		os.Exit(2)
+	}
+
+	if cfg.Preprocess {
+		if err := preprocessor.Run(context.Background(), *cfg); err != nil {
+			fmt.Fprintln(os.Stderr, "entelecheia:", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	o := orchestrator.New(*cfg)

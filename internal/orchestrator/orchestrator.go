@@ -11,12 +11,18 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"entelecheia/internal/agents"
 	"entelecheia/internal/config"
 	"entelecheia/internal/skills"
+	"entelecheia/internal/speclock"
 	"entelecheia/internal/specs"
 )
+
+// lockTimeout bounds how long the main loop waits for the spec directory
+// lock (e.g. held by a concurrent --preprocess run) before giving up.
+const lockTimeout = 2 * time.Minute
 
 type Orchestrator struct {
 	Cfg    config.Config
@@ -45,9 +51,6 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	if err := o.Layout.Ensure(); err != nil {
 		return fmt.Errorf("ensure layout: %w", err)
 	}
-	if _, _, err := specs.Sync(o.Layout); err != nil {
-		return fmt.Errorf("sync spec queue: %w", err)
-	}
 
 	matchedSkills, err := skills.Resolve(o.Layout.SkillsDir, o.Cfg.Langs, o.Cfg.Frameworks)
 	if err != nil {
@@ -71,18 +74,45 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	}
 
 	for {
-		next, err := specs.PopQueue(o.Layout)
-		if err != nil {
-			return fmt.Errorf("pop queue: %w", err)
+		if err := o.syncQueueLocked(); err != nil {
+			return fmt.Errorf("sync spec queue: %w", err)
 		}
-		if next == "" {
-			break
+
+		processedAny := false
+		for {
+			next, err := specs.PopQueue(o.Layout)
+			if err != nil {
+				return fmt.Errorf("pop queue: %w", err)
+			}
+			if next == "" {
+				break
+			}
+			processedAny = true
+			if err := o.processTask(ctx, next, planner, worker, tester, matchedSkills); err != nil {
+				o.Log.Printf("task %s: error: %v", next, err)
+			}
 		}
-		if err := o.processTask(ctx, next, planner, worker, tester, matchedSkills); err != nil {
-			o.Log.Printf("task %s: error: %v", next, err)
+
+		if !processedAny {
+			// Nothing left to do and nothing new showed up in this round's
+			// sync: no leftover work, no new task specs. We're done.
+			return nil
 		}
+		o.Log.Printf("queue drained, re-checking %s for new task specs...", o.Layout.SpecDir)
 	}
-	return nil
+}
+
+// syncQueueLocked takes the spec directory lock and refreshes STATUS.md /
+// QUEUE.md, so it never races with a concurrent --preprocess run writing new
+// spec files into the same directory.
+func (o *Orchestrator) syncQueueLocked() error {
+	lock, err := speclock.Acquire(o.Layout.SpecDir, lockTimeout)
+	if err != nil {
+		return fmt.Errorf("acquire spec lock: %w", err)
+	}
+	defer lock.Release()
+	_, _, err = specs.Sync(o.Layout)
+	return err
 }
 
 func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner, worker, tester *agents.Agent, skillNames []string) error {
