@@ -1,4 +1,4 @@
-// Package specs manages the entelecheia spec directory: STATUS.md (source of
+// Package specs manages the diadoche spec directory: STATUS.md (source of
 // truth for task status) and QUEUE.md (work queue for the current run), plus
 // discovery of new task spec files (spec/NNN_<slug>.md).
 package specs
@@ -27,9 +27,9 @@ type Row struct {
 	Status string
 }
 
-// Layout is the set of paths entelecheia reads/writes for a given project root.
+// Layout is the set of paths diadoche reads/writes for a given project root.
 type Layout struct {
-	Root       string // <project>/.claude/entelecheia
+	Root       string // <project>/.claude/diadoche
 	SpecDir    string // <root>/spec
 	StatusPath string // <root>/spec/STATUS.md
 	QueuePath  string // <root>/spec/QUEUE.md
@@ -38,7 +38,7 @@ type Layout struct {
 }
 
 func NewLayout(projectDir string) Layout {
-	root := filepath.Join(projectDir, ".claude", "entelecheia")
+	root := filepath.Join(projectDir, ".claude", "diadoche")
 	specDir := filepath.Join(root, "spec")
 	return Layout{
 		Root:       root,
@@ -66,12 +66,12 @@ func (l Layout) Ensure() error {
 // taskFileRe matches spec/NNN_<slug>.md and spec/NNN-<slug>.md.
 var taskFileRe = regexp.MustCompile(`^(\d+)[_-](.+)\.md$`)
 
-// generatedRe matches slugs produced by entelecheia itself, which are not
+// generatedRe matches slugs produced by diadoche itself, which are not
 // user-authored task specs: NNN_IMPL_PLAN.md and NNN_REVIEW_<M>.md.
 var generatedRe = regexp.MustCompile(`(?i)^(IMPL_PLAN|REVIEW_\d+)$`)
 
 // DiscoverTaskFiles lists user-authored task spec filenames in specDir,
-// excluding STATUS.md, QUEUE.md and entelecheia-generated files.
+// excluding STATUS.md, QUEUE.md and diadoche-generated files.
 func DiscoverTaskFiles(specDir string) ([]string, error) {
 	entries, err := os.ReadDir(specDir)
 	if errors.Is(err, os.ErrNotExist) {

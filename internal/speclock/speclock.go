@@ -1,5 +1,5 @@
 // Package speclock provides a simple interprocess advisory lock over the
-// .claude/entelecheia/spec directory, so the main loop (reading the
+// .claude/diadoche/spec directory, so the main loop (reading the
 // directory and STATUS.md/QUEUE.md) and the preprocessor (writing new task
 // spec files into the same directory from a separate process) never observe
 // each other's half-finished writes.

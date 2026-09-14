@@ -1,7 +1,7 @@
 // Package skills resolves which .claude/skills subfolders are relevant to a
 // run, based on --langs/--frameworks. The actual skill content is consumed by
 // the nested claude CLI process itself (standard Claude Code skill
-// discovery); entelecheia only needs to tell agents which ones apply.
+// discovery); diadoche only needs to tell agents which ones apply.
 package skills
 
 import (

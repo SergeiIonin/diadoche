@@ -1,6 +1,6 @@
-// Package preprocessor implements entelecheia's --preprocess mode: split a
+// Package preprocessor implements diadoche's --preprocess mode: split a
 // "raw", possibly multi-part user task file into atomic task spec files
-// under .claude/entelecheia/spec. It is deliberately independent from the
+// under .claude/diadoche/spec. It is deliberately independent from the
 // main orchestrator loop — it only writes new spec files and exits; it never
 // starts work on the tasks it creates, to avoid racing the main loop.
 package preprocessor
@@ -14,10 +14,10 @@ import (
 	"strings"
 	"time"
 
-	"entelecheia/internal/agents"
-	"entelecheia/internal/config"
-	"entelecheia/internal/speclock"
-	"entelecheia/internal/specs"
+	"diadoche/internal/agents"
+	"diadoche/internal/config"
+	"diadoche/internal/speclock"
+	"diadoche/internal/specs"
 )
 
 // lockTimeout bounds how long --preprocess waits for the spec directory
@@ -73,7 +73,7 @@ func Run(ctx context.Context, cfg config.Config) error {
 	if _, err := runner.Run(ctx, cfg.Dir, agent, prompt); err != nil {
 		return fmt.Errorf("preprocessor agent: %w", err)
 	}
-	logger.Printf("preprocessing done; task work is NOT started — run entelecheia normally to pick up the new specs")
+	logger.Printf("preprocessing done; task work is NOT started — run diadoche normally to pick up the new specs")
 	return nil
 }
 

@@ -1,4 +1,4 @@
-// Package config parses entelecheia's CLI flags.
+// Package config parses diadoche's CLI flags.
 package config
 
 import (
@@ -13,7 +13,7 @@ const (
 	MaxIter     = 8
 )
 
-// Config holds all runtime settings for a single entelecheia run.
+// Config holds all runtime settings for a single diadoche run.
 type Config struct {
 	Dir        string
 	Iter       int
@@ -35,15 +35,15 @@ func (c Config) TaskPath() string {
 
 // Parse parses CLI args (excluding argv[0]) into a Config.
 func Parse(args []string) (*Config, error) {
-	fs := flag.NewFlagSet("entelecheia", flag.ContinueOnError)
-	dir := fs.String("dir", ".", "project root directory (must contain .claude/entelecheia)")
+	fs := flag.NewFlagSet("diadoche", flag.ContinueOnError)
+	dir := fs.String("dir", ".", "project root directory (must contain .claude/diadoche)")
 	iter := fs.Int("ITER", DefaultIter, fmt.Sprintf("max iterations per task (1-%d)", MaxIter))
 	langs := fs.String("langs", "", "comma-separated languages, matched against .claude/skills subfolders")
 	frameworks := fs.String("frameworks", "", "comma-separated frameworks, matched against .claude/skills subfolders")
 	dryRun := fs.Bool("dry-run", false, "log what would be sent to each agent instead of invoking the claude CLI")
 	claudeBin := fs.String("claude-bin", "claude", "path to the claude CLI binary")
 	preprocess := fs.Bool("preprocess", false, "split a raw task file into atomic task specs and exit, instead of running the main loop")
-	task := fs.String("task", "", "path to the raw task file for --preprocess, e.g. .claude/entelecheia/spec/raw/foo.md")
+	task := fs.String("task", "", "path to the raw task file for --preprocess, e.g. .claude/diadoche/spec/raw/foo.md")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err

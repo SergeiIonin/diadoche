@@ -1,7 +1,7 @@
-// Package agents loads entelecheia agent definitions (.claude/agents/*.md)
+// Package agents loads diadoche agent definitions (.claude/agents/*.md)
 // and runs them as independent "claude --dangerously-skip-permissions"
 // subprocesses. Editing an agent's model or prompt only touches these
-// markdown files, never the entelecheia binary.
+// markdown files, never the diadoche binary.
 package agents
 
 import (

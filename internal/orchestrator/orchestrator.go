@@ -1,4 +1,4 @@
-// Package orchestrator runs entelecheia's main loop: sync the spec queue,
+// Package orchestrator runs diadoche's main loop: sync the spec queue,
 // then for each queued task run planner -> worker -> tester for up to
 // cfg.Iter iterations, until the tester marks the task DONE in STATUS.md or
 // the iteration budget is exhausted (FAILED).
@@ -13,11 +13,11 @@ import (
 	"strings"
 	"time"
 
-	"entelecheia/internal/agents"
-	"entelecheia/internal/config"
-	"entelecheia/internal/skills"
-	"entelecheia/internal/speclock"
-	"entelecheia/internal/specs"
+	"diadoche/internal/agents"
+	"diadoche/internal/config"
+	"diadoche/internal/skills"
+	"diadoche/internal/speclock"
+	"diadoche/internal/specs"
 )
 
 // lockTimeout bounds how long the main loop waits for the spec directory
