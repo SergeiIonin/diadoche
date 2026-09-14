@@ -6,10 +6,12 @@ package specs
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -183,8 +185,11 @@ func WriteQueue(path string, items []string) error {
 }
 
 // Sync discovers new task spec files that aren't in STATUS.md yet, appends
-// them as QUEUED rows, and (re)builds QUEUE.md: new tasks plus any task left
-// QUEUED or IN_PROGRESS by a previous, interrupted run.
+// them as QUEUED rows, and rebuilds QUEUE.md from scratch: every row still
+// QUEUED or IN_PROGRESS (new tasks, and any left mid-flight by a previous,
+// interrupted run), ordered by ascending task number — so a restart always
+// resumes with the lowest-numbered pending task first, regardless of what
+// order rows happen to sit in STATUS.md or the previous QUEUE.md.
 func Sync(l Layout) (rows []Row, queue []string, err error) {
 	if err = l.Ensure(); err != nil {
 		return
@@ -202,36 +207,48 @@ func Sync(l Layout) (rows []Row, queue []string, err error) {
 	if err != nil {
 		return
 	}
-
-	queue, _ = ReadQueue(l.QueuePath)
-	queued := map[string]bool{}
-	for _, q := range queue {
-		queued[q] = true
-	}
-	for _, r := range rows {
-		if (r.Status == StatusQueued || r.Status == StatusInProgress) && !queued[r.Spec] {
-			queue = append(queue, r.Spec)
-			queued[r.Spec] = true
-		}
-	}
-
 	for _, f := range files {
 		if known[f] {
 			continue
 		}
 		rows = append(rows, Row{Num: TaskNumber(f), Spec: f, Status: StatusQueued})
 		known[f] = true
-		if !queued[f] {
-			queue = append(queue, f)
-			queued[f] = true
-		}
 	}
 
 	if err = WriteStatus(l.StatusPath, rows); err != nil {
 		return
 	}
+	queue = pendingQueue(rows)
 	err = WriteQueue(l.QueuePath, queue)
 	return
+}
+
+// pendingQueue returns the specs of every QUEUED/IN_PROGRESS row in rows,
+// sorted ascending by numeric task number (rows whose Num isn't a plain
+// integer sort after all that are, in their original relative order).
+func pendingQueue(rows []Row) []string {
+	type pending struct {
+		num  int
+		spec string
+	}
+	var items []pending
+	for _, r := range rows {
+		if r.Status != StatusQueued && r.Status != StatusInProgress {
+			continue
+		}
+		n, err := strconv.Atoi(r.Num)
+		if err != nil {
+			n = math.MaxInt
+		}
+		items = append(items, pending{num: n, spec: r.Spec})
+	}
+	sort.SliceStable(items, func(i, j int) bool { return items[i].num < items[j].num })
+
+	out := make([]string, len(items))
+	for i, it := range items {
+		out[i] = it.spec
+	}
+	return out
 }
 
 // PopQueue removes and returns the first item of QUEUE.md, persisting the

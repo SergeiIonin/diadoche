@@ -25,6 +25,12 @@ import (
 // lock (e.g. held by a concurrent --preprocess run) before giving up.
 const lockTimeout = 2 * time.Minute
 
+// maxConsecutiveFailures bounds how many tasks in a row may fail before Run
+// gives up entirely, instead of burning through the rest of the queue at
+// full speed (e.g. every task failing identically because the underlying
+// `claude` CLI is rate-limited or misconfigured).
+const maxConsecutiveFailures = 3
+
 type Orchestrator struct {
 	Cfg    config.Config
 	Layout specs.Layout
@@ -67,15 +73,15 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		o.Log.Printf("skills in scope: %s", strings.Join(matchedSkills, ", "))
 	}
 
-	planner, err := agents.Load(filepath.Join(o.Layout.AgentsDir, "planner.md"))
+	planner, err := agents.LoadOrDefault(o.Layout.AgentsDir, "planner")
 	if err != nil {
 		return fmt.Errorf("load planner agent: %w", err)
 	}
-	worker, err := agents.Load(filepath.Join(o.Layout.AgentsDir, "worker.md"))
+	worker, err := agents.LoadOrDefault(o.Layout.AgentsDir, "worker")
 	if err != nil {
 		return fmt.Errorf("load worker agent: %w", err)
 	}
-	tester, err := agents.Load(filepath.Join(o.Layout.AgentsDir, "tester.md"))
+	tester, err := agents.LoadOrDefault(o.Layout.AgentsDir, "tester")
 	if err != nil {
 		return fmt.Errorf("load tester agent: %w", err)
 	}
@@ -86,6 +92,7 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		}
 
 		processedAny := false
+		consecutiveFailures := 0
 		for {
 			next, err := specs.PopQueue(o.Layout)
 			if err != nil {
@@ -97,7 +104,13 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			processedAny = true
 			if err := o.processTask(ctx, next, planner, worker, tester, matchedSkills); err != nil {
 				o.Log.Printf("task %s: error: %v", next, err)
+				consecutiveFailures++
+				if consecutiveFailures >= maxConsecutiveFailures {
+					return fmt.Errorf("aborting after %d tasks failed in a row (last: %s): %w", consecutiveFailures, next, err)
+				}
+				continue
 			}
+			consecutiveFailures = 0
 		}
 
 		if !processedAny {
@@ -132,7 +145,7 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 	specPath := filepath.Join(o.Layout.SpecDir, specFile)
 	specContent, err := os.ReadFile(specPath)
 	if err != nil {
-		return fmt.Errorf("read spec file: %w", err)
+		return o.failTask(specFile, fmt.Errorf("read spec file: %w", err))
 	}
 
 	skillsNote := ""
@@ -140,12 +153,22 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 		skillsNote = fmt.Sprintf("\n\nRelevant skills available under .claude/skills: %s. Use them where applicable.", strings.Join(skillNames, ", "))
 	}
 
+	implPlanFile := fmt.Sprintf("%s_IMPL_PLAN.md", num)
+	implPlanPath := filepath.Join(o.Layout.SpecDir, implPlanFile)
+
+	// Resume point after a crash: skip iterations whose review already
+	// exists on disk (planner/worker/tester already ran for them before the
+	// process died) instead of always restarting this task from iteration 1
+	// and burning through the --ITER budget again on work already done.
+	startIter := lastCompletedIteration(o.Layout.SpecDir, num, o.Cfg.Iter) + 1
+	if startIter > 1 {
+		o.Log.Printf("%s: resuming at iteration %d/%d (found review(s) from a previous run)", specFile, startIter, o.Cfg.Iter)
+	}
+
 	done := false
-	for iter := 1; iter <= o.Cfg.Iter; iter++ {
+	for iter := startIter; iter <= o.Cfg.Iter; iter++ {
 		o.Log.Printf("--- %s iteration %d/%d ---", specFile, iter, o.Cfg.Iter)
 
-		implPlanFile := fmt.Sprintf("%s_IMPL_PLAN.md", num)
-		implPlanPath := filepath.Join(o.Layout.SpecDir, implPlanFile)
 		reviewFile := fmt.Sprintf("%s_REVIEW_%d.md", num, iter)
 		reviewPath := filepath.Join(o.Layout.SpecDir, reviewFile)
 
@@ -157,14 +180,28 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 			}
 		}
 
-		plannerPrompt := fmt.Sprintf("Task spec (%s):\n%s\n", specFile, specContent)
-		if priorReview != "" {
-			plannerPrompt += fmt.Sprintf("\nFeedback from the previous review, address every point:\n%s\n", priorReview)
+		// At the exact resume point, an existing plan from before the crash
+		// is reused as-is rather than regenerated — the task's own request.
+		// Every iteration beyond that still asks planner to update the plan
+		// against that iteration's fresh review, as usual.
+		reusingPlan := false
+		if iter == startIter {
+			if b, err := os.ReadFile(implPlanPath); err == nil && strings.TrimSpace(string(b)) != "" {
+				reusingPlan = true
+				o.Log.Printf("%s: reusing existing %s from before the restart", specFile, implPlanFile)
+			}
 		}
-		plannerPrompt += fmt.Sprintf("\nWrite (or update) the implementation plan to %s.%s", implPlanPath, skillsNote)
 
-		if _, err := o.Runner.Run(ctx, o.Cfg.Dir, planner, plannerPrompt); err != nil {
-			return fmt.Errorf("planner: %w", err)
+		if !reusingPlan {
+			plannerPrompt := fmt.Sprintf("Task spec (%s):\n%s\n", specFile, specContent)
+			if priorReview != "" {
+				plannerPrompt += fmt.Sprintf("\nFeedback from the previous review, address every point:\n%s\n", priorReview)
+			}
+			plannerPrompt += fmt.Sprintf("\nWrite (or update) the implementation plan to %s.%s", implPlanPath, skillsNote)
+
+			if _, err := o.Runner.Run(ctx, o.Cfg.Dir, planner, plannerPrompt); err != nil {
+				return o.failTask(specFile, fmt.Errorf("planner: %w", err))
+			}
 		}
 
 		implPlanContent, _ := os.ReadFile(implPlanPath)
@@ -176,7 +213,7 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 		workerPrompt += "\nImplement the plan in this repository." + skillsNote
 
 		if _, err := o.Runner.Run(ctx, o.Cfg.Dir, worker, workerPrompt); err != nil {
-			return fmt.Errorf("worker: %w", err)
+			return o.failTask(specFile, fmt.Errorf("worker: %w", err))
 		}
 
 		testerPrompt := fmt.Sprintf(
@@ -188,12 +225,12 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 		testerPrompt += skillsNote
 
 		if _, err := o.Runner.Run(ctx, o.Cfg.Dir, tester, testerPrompt); err != nil {
-			return fmt.Errorf("tester: %w", err)
+			return o.failTask(specFile, fmt.Errorf("tester: %w", err))
 		}
 
 		status, err := specs.GetStatus(o.Layout, specFile)
 		if err != nil {
-			return err
+			return o.failTask(specFile, err)
 		}
 		if status == specs.StatusDone {
 			done = true
@@ -208,6 +245,35 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 
 	o.Log.Printf("task %s: FAILED after %d iteration(s)", specFile, o.Cfg.Iter)
 	return specs.SetStatus(o.Layout, specFile, specs.StatusFailed)
+}
+
+// lastCompletedIteration returns the highest N in 1..maxIter for which
+// spec/<num>_REVIEW_N.md exists — i.e. the last iteration whose full
+// planner/worker/tester cycle actually ran and got reviewed before this
+// process (or a previous one) stopped. 0 means no iteration completed yet.
+func lastCompletedIteration(specDir, num string, maxIter int) int {
+	last := 0
+	for n := 1; n <= maxIter; n++ {
+		path := filepath.Join(specDir, fmt.Sprintf("%s_REVIEW_%d.md", num, n))
+		if _, err := os.Stat(path); err == nil {
+			last = n
+		}
+	}
+	return last
+}
+
+// failTask marks specFile FAILED (best-effort — a broken STATUS.md write is
+// logged but doesn't shadow the original cause) and returns cause unchanged.
+// Every early return out of processTask's iteration loop must go through
+// this: leaving a task at IN_PROGRESS after an error would make the next
+// sync's crash-recovery logic (meant to resume work a killed process left
+// unfinished) re-queue it forever within this same, still-running process —
+// exactly the tight retry loop that motivated adding this helper.
+func (o *Orchestrator) failTask(specFile string, cause error) error {
+	if err := specs.SetStatus(o.Layout, specFile, specs.StatusFailed); err != nil {
+		o.Log.Printf("task %s: also failed to record FAILED status: %v", specFile, err)
+	}
+	return cause
 }
 
 // commitDone commits everything the planner/worker/tester changed for a

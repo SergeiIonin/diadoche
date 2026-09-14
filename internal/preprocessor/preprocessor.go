@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -41,7 +40,7 @@ func Run(ctx context.Context, cfg config.Config) error {
 		return fmt.Errorf("read raw task file: %w", err)
 	}
 
-	agent, err := agents.Load(filepath.Join(layout.AgentsDir, "preprocessor.md"))
+	agent, err := agents.LoadOrDefault(layout.AgentsDir, "preprocessor")
 	if err != nil {
 		return fmt.Errorf("load preprocessor agent: %w", err)
 	}

@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"strings"
 )
 
 // Runner launches one independent agent turn and returns its combined output.
@@ -45,9 +46,20 @@ func (r CLIRunner) Run(ctx context.Context, workDir string, a *Agent, prompt str
 	cmd.Stderr = &out
 	err := cmd.Run()
 	if err != nil {
-		return out.String(), fmt.Errorf("agent %s: %w", a.Name, err)
+		return out.String(), fmt.Errorf("agent %s: %w: %s", a.Name, err, tail(out.String(), 2000))
 	}
 	return out.String(), nil
+}
+
+// tail returns at most the last n bytes of s, so a failed agent's error
+// message (rate limit, auth, etc.) actually ends up in the logs instead of
+// being lost behind a bare "exit status 1".
+func tail(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= n {
+		return s
+	}
+	return "..." + s[len(s)-n:]
 }
 
 // DryRunRunner logs what would be sent to the agent instead of invoking

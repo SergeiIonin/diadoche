@@ -13,10 +13,12 @@ go build -o diadoche ./cmd/diadoche
 ## Usage
 
 The target project needs a `.claude/diadoche/spec/` folder with task files
-`NNN_<slug>.md` (e.g. `001_add-login.md`) and agents in
-`.claude/agents/{planner,worker,tester,preprocessor}.md` (this repo already
-ships a working default set — copy `.claude/agents` into the target project,
-or run diadoche straight from here).
+`NNN_<slug>.md` (e.g. `001_add-login.md`). Agent prompts for
+planner/worker/tester/preprocessor are built into the `diadoche` binary, so
+it works in any project without extra setup. To customize a prompt or model
+for one project, drop a `.claude/agents/<name>.md` file there (same
+frontmatter format as the built-in ones) — it overrides the built-in default
+for that agent only; every other agent keeps using its built-in prompt.
 
 ```
 diadoche --dir /path/to/project --ITER 3 --langs go,typescript --frameworks gin,next
@@ -78,7 +80,8 @@ preprocessor) are guarded by a `spec/.lock` file lock, so a concurrent
 4. From the 2nd iteration on, planner and worker also get the previous
    `spec/NNN_REVIEW_M.md` in their context.
 
-Agent prompts and models live in `.claude/agents/*.md` (frontmatter `name` /
-`model` / `description` plus a body — the system prompt) — editing them
-never requires rebuilding the diadoche binary.
+Agent prompts and models are built into the binary (frontmatter `name` /
+`model` / `description` plus a body — the system prompt), with per-project
+overrides via `.claude/agents/<name>.md` (same format) — overriding a prompt
+never requires rebuilding diadoche, only changing the built-in default does.
 

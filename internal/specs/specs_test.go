@@ -149,3 +149,46 @@ func TestPopQueueAndSetStatus(t *testing.T) {
 		t.Fatalf("status = %s, want DONE", status)
 	}
 }
+
+// TestSyncOrdersQueueAscendingByNumber guards the restart contract: after a
+// restart, work must resume with the lowest-numbered pending task first,
+// regardless of what order rows happen to sit in STATUS.md (e.g. because
+// tasks were discovered or recovered out of order across several runs).
+func TestSyncOrdersQueueAscendingByNumber(t *testing.T) {
+	dir := t.TempDir()
+	l := NewLayout(dir)
+	if err := l.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Deliberately out of numeric order, and with a DONE row interleaved
+	// that must be excluded from the queue entirely.
+	if err := WriteStatus(l.StatusPath, []Row{
+		{Num: "003", Spec: "003_c.md", Status: StatusInProgress},
+		{Num: "001", Spec: "001_a.md", Status: StatusQueued},
+		{Num: "002", Spec: "002_b.md", Status: StatusDone},
+		{Num: "010", Spec: "010_j.md", Status: StatusQueued},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"003_c.md", "001_a.md", "002_b.md", "010_j.md"} {
+		if err := os.WriteFile(filepath.Join(l.SpecDir, f), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_, queue, err := Sync(l)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{"001_a.md", "003_c.md", "010_j.md"}
+	if len(queue) != len(want) {
+		t.Fatalf("queue = %v, want %v", queue, want)
+	}
+	for i := range want {
+		if queue[i] != want[i] {
+			t.Fatalf("queue = %v, want %v", queue, want)
+		}
+	}
+}

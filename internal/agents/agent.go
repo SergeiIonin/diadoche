@@ -5,9 +5,22 @@
 package agents
 
 import (
+	"embed"
+	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 )
+
+// defaultsFS holds the built-in agent prompts, embedded into the diadoche
+// binary so the tool works out of the box in any project without first
+// copying .claude/agents/*.md into it. A project's own .claude/agents/*.md,
+// when present, always takes precedence — that's how prompts are customized
+// without rebuilding the binary.
+//
+//go:embed defaults/*.md
+var defaultsFS embed.FS
 
 // Agent is one role (planner/worker/tester) as described by a markdown file
 // with YAML-ish frontmatter:
@@ -31,7 +44,28 @@ func Load(path string) (*Agent, error) {
 	if err != nil {
 		return nil, err
 	}
-	content := string(data)
+	return parse(string(data)), nil
+}
+
+// LoadOrDefault loads <agentsDir>/<name>.md if present, and otherwise falls
+// back to the built-in default prompt for <name> embedded in the binary.
+func LoadOrDefault(agentsDir, name string) (*Agent, error) {
+	data, err := os.ReadFile(filepath.Join(agentsDir, name+".md"))
+	if err == nil {
+		return parse(string(data)), nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+
+	data, derr := defaultsFS.ReadFile("defaults/" + name + ".md")
+	if derr != nil {
+		return nil, fmt.Errorf("no %q agent definition in %s and no built-in default", name, agentsDir)
+	}
+	return parse(string(data)), nil
+}
+
+func parse(content string) *Agent {
 	a := &Agent{}
 
 	if strings.HasPrefix(content, "---\n") {
@@ -60,10 +94,10 @@ func Load(path string) (*Agent, error) {
 				}
 			}
 			a.SystemPrompt = strings.TrimSpace(body)
-			return a, nil
+			return a
 		}
 	}
 
 	a.SystemPrompt = strings.TrimSpace(content)
-	return a, nil
+	return a
 }
