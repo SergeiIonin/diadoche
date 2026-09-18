@@ -22,6 +22,17 @@ import (
 //go:embed defaults/*.md
 var defaultsFS embed.FS
 
+// DefaultNames lists every agent diadoche ships a built-in default prompt
+// for, in the order `--initialize` should scaffold them.
+var DefaultNames = []string{"planner", "worker", "tester", "preprocessor"}
+
+// DefaultPromptFile returns the raw bytes of the built-in default agent
+// definition file for name (frontmatter included), for scaffolding a
+// project's .claude/agents/<name>.md via `--initialize`.
+func DefaultPromptFile(name string) ([]byte, error) {
+	return defaultsFS.ReadFile("defaults/" + name + ".md")
+}
+
 // Agent is one role (planner/worker/tester) as described by a markdown file
 // with YAML-ish frontmatter:
 //

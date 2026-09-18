@@ -12,6 +12,21 @@ go build -o diadoche ./cmd/diadoche
 
 ## Usage
 
+To scaffold a new project, run:
+
+```
+diadoche --initialize /path/to/project
+```
+
+This creates `.claude` in that project if it doesn't exist yet (or reuses
+it if it does) and writes everything diadoche needs inside it: an empty
+`.claude/diadoche/spec/STATUS.md`, `.claude/diadoche/spec/raw/` (for
+`--preprocess` input), `.claude/skills/`, and a copy of each built-in agent
+prompt under `.claude/agents/*.md` so they're easy to customize. It never
+overwrites a file that's already there, so re-running it later (e.g. after
+upgrading diadoche) is safe. `--initialize` does only this, then exits —
+no queue sync, no agent invocation.
+
 The target project needs a `.claude/diadoche/spec/` folder with task files
 `NNN_<slug>.md` (e.g. `001_add-login.md`). Agent prompts for
 planner/worker/tester/preprocessor are built into the `diadoche` binary, so
@@ -35,6 +50,9 @@ Flags:
   each agent.
 - `--claude-bin` — path to the `claude` binary (default `claude` on `$PATH`).
 - `--preprocess` + `--task <path>` — preprocessor mode, see below.
+- `--initialize <project-path>` — scaffold `.claude/` in a project and
+  exit; ignores every other flag. See above.
+- `-h` / `-help` / `--help` — print the full man-page-style help and exit.
 
 ## Preprocessor (`--preprocess`)
 
