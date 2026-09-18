@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"diadoche/internal/config"
 	"diadoche/internal/speclock"
 	"diadoche/internal/specs"
+	"diadoche/internal/usage"
 )
 
 // lockTimeout bounds how long --preprocess waits for the spec directory
@@ -44,6 +46,10 @@ func Run(ctx context.Context, cfg config.Config) error {
 	if err != nil {
 		return fmt.Errorf("load preprocessor agent: %w", err)
 	}
+	if err := agents.ApplyModelOverride(agent, cfg.PreprocessorModel); err != nil {
+		return err
+	}
+	logger.Printf("model: preprocessor=%s", agent.Model)
 
 	var runner agents.Runner
 	if cfg.DryRun {
@@ -69,11 +75,50 @@ func Run(ctx context.Context, cfg config.Config) error {
 	prompt := buildPrompt(taskPath, string(rawContent), layout.SpecDir, existing)
 
 	logger.Printf("=== preprocessing %s ===", taskPath)
-	if _, err := runner.Run(ctx, cfg.Dir, agent, prompt); err != nil {
-		return fmt.Errorf("preprocessor agent: %w", err)
+	result, runErr := runner.Run(ctx, cfg.Dir, agent, prompt)
+	recordUsage(logger, layout, cfg.DryRun, taskPath, agent.Model, result)
+	if runErr != nil {
+		return fmt.Errorf("preprocessor agent: %w", runErr)
 	}
 	logger.Printf("preprocessing done; task work is NOT started — run diadoche normally to pick up the new specs")
 	return nil
+}
+
+// recordUsage appends one usage.jsonl line for the preprocessor's single
+// agent call, so its cost shows up alongside planner/worker/tester's in the
+// same log — best-effort and never fatal, same as the main loop's
+// accounting (see orchestrator.recordUsage).
+func recordUsage(logger *log.Logger, layout specs.Layout, dryRun bool, taskPath, model string, result agents.RunResult) {
+	if dryRun {
+		return
+	}
+	w, err := usage.Open(filepath.Join(layout.Root, "usage.jsonl"))
+	if err != nil {
+		logger.Printf("failed to open usage log: %v", err)
+		return
+	}
+	defer w.Close()
+
+	rec := usage.Record{
+		Time:                     time.Now(),
+		Task:                     taskPath,
+		Agent:                    "preprocessor",
+		Model:                    model,
+		InputTokens:              result.Usage.InputTokens,
+		OutputTokens:             result.Usage.OutputTokens,
+		CacheCreationInputTokens: result.Usage.CacheCreationInputTokens,
+		CacheReadInputTokens:     result.Usage.CacheReadInputTokens,
+		CostUSD:                  result.TotalCostUSD,
+		DurationMS:               result.DurationMS,
+		Parsed:                   result.Parsed,
+	}
+	if err := w.Append(rec); err != nil {
+		logger.Printf("failed to write usage record: %v", err)
+		return
+	}
+	if !result.Parsed {
+		logger.Printf("could not parse usage/cost from preprocessor's claude output; recorded a zeroed usage line")
+	}
 }
 
 func buildPrompt(taskPath, rawContent, specDir string, existing []string) string {

@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -14,36 +15,26 @@ import (
 
 	"diadoche/internal/agents"
 	"diadoche/internal/config"
+	"diadoche/internal/gitutil"
 	"diadoche/internal/specs"
 )
 
-// fakeRunner simulates a real planner/worker/tester: the worker writes a
-// file change, and the tester marks the task DONE in STATUS.md, exactly
-// like a real tester agent would via its own tool calls.
-type fakeRunner struct {
-	layout specs.Layout
-	dir    string
-}
+// testAgentModel is the model every test fixture agent definition uses. It
+// must be one agents.KnownModels recognizes, since Orchestrator.Run
+// validates every agent's resolved model before running anything.
+const testAgentModel = "claude-opus-5"
 
-func (r fakeRunner) Run(_ context.Context, workDir string, a *agents.Agent, _ string) (string, error) {
-	switch a.Name {
-	case "worker":
-		if err := os.WriteFile(filepath.Join(workDir, "output.txt"), []byte("done by worker\n"), 0o644); err != nil {
-			return "", err
-		}
-	case "tester":
-		rows, err := specs.ReadStatus(r.layout.StatusPath)
-		if err != nil {
-			return "", err
-		}
-		for i := range rows {
-			rows[i].Status = specs.StatusDone
-		}
-		if err := specs.WriteStatus(r.layout.StatusPath, rows); err != nil {
-			return "", err
+func writeAgentFixtures(t *testing.T, agentsDir string) {
+	t.Helper()
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"planner", "worker", "tester"} {
+		content := "---\nname: " + name + "\nmodel: " + testAgentModel + "\n---\nbe the " + name
+		if err := os.WriteFile(filepath.Join(agentsDir, name+".md"), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
 		}
 	}
-	return "", nil
 }
 
 func requireGit(t *testing.T) {
@@ -53,33 +44,67 @@ func requireGit(t *testing.T) {
 	}
 }
 
-func TestRunCommitsWhenTaskBecomesDone(t *testing.T) {
-	requireGit(t)
-	dir := t.TempDir()
-
+func setTestGitEnv(t *testing.T) {
+	t.Helper()
 	t.Setenv("GIT_AUTHOR_NAME", "diadoche-test")
 	t.Setenv("GIT_AUTHOR_EMAIL", "diadoche-test@example.com")
 	t.Setenv("GIT_COMMITTER_NAME", "diadoche-test")
 	t.Setenv("GIT_COMMITTER_EMAIL", "diadoche-test@example.com")
+}
+
+// validPlanFixture is IMPL_PLAN.md content satisfying implplan's required
+// contract (non-empty Files and Test Command sections).
+const validPlanFixture = "## Files\n- some/file.go\n\n## Test Command\ngo test ./...\n"
+
+// fakeRunner simulates a real planner/worker/tester: the worker writes a
+// file change, and the tester marks the task DONE in STATUS.md, exactly
+// like a real tester agent would via its own tool calls.
+type fakeRunner struct {
+	layout specs.Layout
+	dir    string
+}
+
+func (r fakeRunner) Run(_ context.Context, workDir string, a *agents.Agent, _ string) (agents.RunResult, error) {
+	switch a.Name {
+	case "planner":
+		num := "001"
+		if err := os.WriteFile(filepath.Join(r.layout.SpecDir, num+"_IMPL_PLAN.md"), []byte(validPlanFixture), 0o644); err != nil {
+			return agents.RunResult{}, err
+		}
+	case "worker":
+		if err := os.WriteFile(filepath.Join(workDir, "output.txt"), []byte("done by worker\n"), 0o644); err != nil {
+			return agents.RunResult{}, err
+		}
+	case "tester":
+		rows, err := specs.ReadStatus(r.layout.StatusPath)
+		if err != nil {
+			return agents.RunResult{}, err
+		}
+		for i := range rows {
+			rows[i].Status = specs.StatusDone
+		}
+		if err := specs.WriteStatus(r.layout.StatusPath, rows); err != nil {
+			return agents.RunResult{}, err
+		}
+	}
+	return agents.RunResult{}, nil
+}
+
+func TestRunCommitsWhenTaskBecomesDone(t *testing.T) {
+	requireGit(t)
+	dir := t.TempDir()
+	setTestGitEnv(t)
 
 	layout := specs.NewLayout(dir)
 	if err := layout.Ensure(); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(layout.AgentsDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for _, name := range []string{"planner", "worker", "tester"} {
-		content := "---\nname: " + name + "\nmodel: test-model\n---\nbe the " + name
-		if err := os.WriteFile(filepath.Join(layout.AgentsDir, name+".md"), []byte(content), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
+	writeAgentFixtures(t, layout.AgentsDir)
 	if err := os.WriteFile(filepath.Join(layout.SpecDir, "001_example.md"), []byte("# Example\ndo the thing\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	cfg := config.Config{Dir: dir, Iter: 1}
+	cfg := config.Config{Dir: dir, Iter: 1, MaxDiffBytes: config.DefaultMaxDiffBytes}
 	o := &Orchestrator{
 		Cfg:    cfg,
 		Layout: layout,
@@ -119,11 +144,11 @@ type alwaysFailRunner struct {
 	failOn string
 }
 
-func (r alwaysFailRunner) Run(_ context.Context, _ string, a *agents.Agent, _ string) (string, error) {
+func (r alwaysFailRunner) Run(_ context.Context, _ string, a *agents.Agent, _ string) (agents.RunResult, error) {
 	if a.Name == r.failOn {
-		return "", errors.New("simulated: usage limit reached")
+		return agents.RunResult{}, errors.New("simulated: usage limit reached")
 	}
-	return "", nil
+	return agents.RunResult{}, nil
 }
 
 // TestRunDoesNotLoopForeverOnRepeatedAgentFailures guards against the bug
@@ -137,15 +162,7 @@ func TestRunDoesNotLoopForeverOnRepeatedAgentFailures(t *testing.T) {
 	if err := layout.Ensure(); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(layout.AgentsDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for _, name := range []string{"planner", "worker", "tester"} {
-		content := "---\nname: " + name + "\nmodel: test-model\n---\nbe the " + name
-		if err := os.WriteFile(filepath.Join(layout.AgentsDir, name+".md"), []byte(content), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
+	writeAgentFixtures(t, layout.AgentsDir)
 	for _, f := range []string{"001_a.md", "002_b.md", "003_c.md", "004_d.md"} {
 		if err := os.WriteFile(filepath.Join(layout.SpecDir, f), []byte("# task\n"), 0o644); err != nil {
 			t.Fatal(err)
@@ -205,22 +222,22 @@ func newRecordingRunner(layout specs.Layout) *recordingRunner {
 	return &recordingRunner{layout: layout, calls: map[string]int{}, prompts: map[string]string{}}
 }
 
-func (r *recordingRunner) Run(_ context.Context, _ string, a *agents.Agent, prompt string) (string, error) {
+func (r *recordingRunner) Run(_ context.Context, _ string, a *agents.Agent, prompt string) (agents.RunResult, error) {
 	r.calls[a.Name]++
 	r.prompts[a.Name] = prompt
 	if a.Name == "tester" {
 		rows, err := specs.ReadStatus(r.layout.StatusPath)
 		if err != nil {
-			return "", err
+			return agents.RunResult{}, err
 		}
 		for i := range rows {
 			rows[i].Status = specs.StatusDone
 		}
 		if err := specs.WriteStatus(r.layout.StatusPath, rows); err != nil {
-			return "", err
+			return agents.RunResult{}, err
 		}
 	}
-	return "", nil
+	return agents.RunResult{}, nil
 }
 
 // TestProcessTaskResumesAtCorrectIterationAndReusesPlan simulates a crash
@@ -234,20 +251,12 @@ func TestProcessTaskResumesAtCorrectIterationAndReusesPlan(t *testing.T) {
 	if err := layout.Ensure(); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(layout.AgentsDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for _, name := range []string{"planner", "worker", "tester"} {
-		content := "---\nname: " + name + "\nmodel: test-model\n---\nbe the " + name
-		if err := os.WriteFile(filepath.Join(layout.AgentsDir, name+".md"), []byte(content), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
+	writeAgentFixtures(t, layout.AgentsDir)
 	specFile := "001_example.md"
 	if err := os.WriteFile(filepath.Join(layout.SpecDir, specFile), []byte("# Example\ndo the thing\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(layout.SpecDir, "001_IMPL_PLAN.md"), []byte("existing plan from before the crash"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(layout.SpecDir, "001_IMPL_PLAN.md"), []byte(validPlanFixture), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(layout.SpecDir, "001_REVIEW_1.md"), []byte("needs more work: add X"), 0o644); err != nil {
@@ -289,5 +298,605 @@ func TestProcessTaskResumesAtCorrectIterationAndReusesPlan(t *testing.T) {
 	}
 	if status != specs.StatusDone {
 		t.Fatalf("status = %s, want DONE", status)
+	}
+}
+
+// TestProcessTaskDoesNotReuseAnInvalidPreCrashPlan guards the interaction
+// between the restart/resume logic and the plan-contract validation added
+// in 09_optimize_agents.md: a plan left on disk from before that validation
+// existed (or from a run that somehow skipped it) must not be blindly
+// reused just because it's non-empty.
+func TestProcessTaskDoesNotReuseAnInvalidPreCrashPlan(t *testing.T) {
+	dir := t.TempDir()
+	layout := specs.NewLayout(dir)
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	writeAgentFixtures(t, layout.AgentsDir)
+	if err := os.WriteFile(filepath.Join(layout.SpecDir, "001_example.md"), []byte("# Example\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// No Files/Test Command sections: contract-invalid.
+	if err := os.WriteFile(filepath.Join(layout.SpecDir, "001_IMPL_PLAN.md"), []byte("some old free-form plan"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := newRecordingRunner(layout)
+	o := &Orchestrator{
+		Cfg:    config.Config{Dir: dir, Iter: 3, DryRun: true},
+		Layout: layout,
+		Runner: runner,
+		Log:    log.New(io.Discard, "", 0),
+	}
+	if err := o.Run(context.Background()); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if runner.calls["planner"] == 0 {
+		t.Error("planner should have been called at least once — the pre-existing plan is contract-invalid and must not be reused as-is")
+	}
+}
+
+// ---- model resolution (09_optimize_agents.md, subtask 1) ----
+
+type neverCalledRunner struct{ t *testing.T }
+
+func (r neverCalledRunner) Run(context.Context, string, *agents.Agent, string) (agents.RunResult, error) {
+	r.t.Fatal("Runner.Run must never be called when a model override fails validation at startup")
+	return agents.RunResult{}, nil
+}
+
+func TestRunFailsFastOnUnknownModelOverride(t *testing.T) {
+	dir := t.TempDir()
+	layout := specs.NewLayout(dir)
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	writeAgentFixtures(t, layout.AgentsDir)
+	if err := os.WriteFile(filepath.Join(layout.SpecDir, "001_example.md"), []byte("# Example\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Config{Dir: dir, Iter: 1, DryRun: true, PlannerModel: "not-a-real-model"}
+	o := &Orchestrator{
+		Cfg:    cfg,
+		Layout: layout,
+		Runner: neverCalledRunner{t: t},
+		Log:    log.New(io.Discard, "", 0),
+	}
+
+	if err := o.Run(context.Background()); err == nil {
+		t.Fatal("expected Run to fail on an unknown --planner-model override")
+	}
+}
+
+func TestRunLogsResolvedModels(t *testing.T) {
+	dir := t.TempDir()
+	layout := specs.NewLayout(dir)
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	writeAgentFixtures(t, layout.AgentsDir)
+	if err := os.WriteFile(filepath.Join(layout.SpecDir, "001_example.md"), []byte("# Example\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var logBuf strings.Builder
+	cfg := config.Config{Dir: dir, Iter: 1, DryRun: true, WorkerModel: "claude-sonnet-5"}
+	o := &Orchestrator{
+		Cfg:    cfg,
+		Layout: layout,
+		Runner: newRecordingRunner(layout),
+		Log:    log.New(&logBuf, "", 0),
+	}
+	if err := o.Run(context.Background()); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	got := logBuf.String()
+	if !strings.Contains(got, "models:") || !strings.Contains(got, "planner="+testAgentModel) {
+		t.Errorf("expected log to report resolved planner model; got:\n%s", got)
+	}
+	if !strings.Contains(got, "worker=claude-sonnet-5") {
+		t.Errorf("expected log to report the --worker-model override, got:\n%s", got)
+	}
+}
+
+// ---- usage accounting (09_optimize_agents.md, subtask 2) ----
+
+// usageRunner returns a fixed, fully-parsed RunResult for every call (as if
+// every claude invocation succeeded and its JSON output parsed cleanly),
+// while still driving the task to DONE like fakeRunner.
+type usageRunner struct {
+	layout specs.Layout
+}
+
+func (r usageRunner) Run(_ context.Context, workDir string, a *agents.Agent, _ string) (agents.RunResult, error) {
+	result := agents.RunResult{
+		Usage:        agents.Usage{InputTokens: 10, OutputTokens: 5},
+		TotalCostUSD: 0.001,
+		DurationMS:   1,
+		Parsed:       true,
+	}
+	switch a.Name {
+	case "planner":
+		if err := os.WriteFile(filepath.Join(r.layout.SpecDir, "001_IMPL_PLAN.md"), []byte(validPlanFixture), 0o644); err != nil {
+			return result, err
+		}
+	case "worker":
+		if err := os.WriteFile(filepath.Join(workDir, "output.txt"), []byte("hi\n"), 0o644); err != nil {
+			return result, err
+		}
+	case "tester":
+		rows, err := specs.ReadStatus(r.layout.StatusPath)
+		if err != nil {
+			return result, err
+		}
+		for i := range rows {
+			rows[i].Status = specs.StatusDone
+		}
+		if err := specs.WriteStatus(r.layout.StatusPath, rows); err != nil {
+			return result, err
+		}
+	}
+	return result, nil
+}
+
+func TestRunWritesUsageJSONLAndPrintsSummary(t *testing.T) {
+	requireGit(t)
+	dir := t.TempDir()
+	setTestGitEnv(t)
+
+	layout := specs.NewLayout(dir)
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	writeAgentFixtures(t, layout.AgentsDir)
+	if err := os.WriteFile(filepath.Join(layout.SpecDir, "001_example.md"), []byte("# Example\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var logBuf strings.Builder
+	cfg := config.Config{Dir: dir, Iter: 1, MaxDiffBytes: config.DefaultMaxDiffBytes}
+	o := &Orchestrator{
+		Cfg:    cfg,
+		Layout: layout,
+		Runner: usageRunner{layout: layout},
+		Log:    log.New(&logBuf, "", 0),
+	}
+
+	if err := o.Run(context.Background()); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	usagePath := filepath.Join(layout.Root, "usage.jsonl")
+	data, err := os.ReadFile(usagePath)
+	if err != nil {
+		t.Fatalf("expected %s to exist: %v", usagePath, err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 3 { // planner, worker, tester
+		t.Fatalf("usage.jsonl has %d lines, want 3; content:\n%s", len(lines), data)
+	}
+	for _, line := range lines {
+		var rec struct {
+			Agent      string  `json:"agent"`
+			Task       string  `json:"task"`
+			CostUSD    float64 `json:"cost_usd"`
+			Parsed     bool    `json:"parsed"`
+			DurationMS int64   `json:"duration_ms"`
+		}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("line not valid JSON: %v: %s", err, line)
+		}
+		if !rec.Parsed || rec.CostUSD != 0.001 || rec.Task != "001_example.md" {
+			t.Errorf("unexpected usage record: %+v", rec)
+		}
+	}
+
+	if !strings.Contains(logBuf.String(), "usage summary") {
+		t.Errorf("expected end-of-run log to contain a usage summary; got:\n%s", logBuf.String())
+	}
+}
+
+// unparseableUsageRunner never returns real usage data (Parsed stays
+// false), simulating a claude CLI whose --output-format json output
+// couldn't be read — usage accounting must degrade to a warning, not a
+// failed run.
+type unparseableUsageRunner struct {
+	layout specs.Layout
+}
+
+func (r unparseableUsageRunner) Run(_ context.Context, workDir string, a *agents.Agent, _ string) (agents.RunResult, error) {
+	switch a.Name {
+	case "planner":
+		if err := os.WriteFile(filepath.Join(r.layout.SpecDir, "001_IMPL_PLAN.md"), []byte(validPlanFixture), 0o644); err != nil {
+			return agents.RunResult{}, err
+		}
+	case "worker":
+		if err := os.WriteFile(filepath.Join(workDir, "output.txt"), []byte("hi\n"), 0o644); err != nil {
+			return agents.RunResult{}, err
+		}
+	case "tester":
+		rows, err := specs.ReadStatus(r.layout.StatusPath)
+		if err != nil {
+			return agents.RunResult{}, err
+		}
+		for i := range rows {
+			rows[i].Status = specs.StatusDone
+		}
+		if err := specs.WriteStatus(r.layout.StatusPath, rows); err != nil {
+			return agents.RunResult{}, err
+		}
+	}
+	return agents.RunResult{}, nil // Parsed: false
+}
+
+func TestRunSurvivesUnparseableUsageOutput(t *testing.T) {
+	requireGit(t)
+	dir := t.TempDir()
+	setTestGitEnv(t)
+
+	layout := specs.NewLayout(dir)
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	writeAgentFixtures(t, layout.AgentsDir)
+	if err := os.WriteFile(filepath.Join(layout.SpecDir, "001_example.md"), []byte("# Example\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var logBuf strings.Builder
+	cfg := config.Config{Dir: dir, Iter: 1, MaxDiffBytes: config.DefaultMaxDiffBytes}
+	o := &Orchestrator{
+		Cfg:    cfg,
+		Layout: layout,
+		Runner: unparseableUsageRunner{layout: layout},
+		Log:    log.New(&logBuf, "", 0),
+	}
+
+	if err := o.Run(context.Background()); err != nil {
+		t.Fatalf("Run should not fail just because usage JSON didn't parse: %v", err)
+	}
+	status, err := specs.GetStatus(layout, "001_example.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != specs.StatusDone {
+		t.Fatalf("status = %s, want DONE", status)
+	}
+	if !strings.Contains(logBuf.String(), "could not parse usage") {
+		t.Errorf("expected a warning about unparseable usage; got:\n%s", logBuf.String())
+	}
+
+	data, err := os.ReadFile(filepath.Join(layout.Root, "usage.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(strings.TrimSpace(string(data))) == 0 {
+		t.Error("expected usage.jsonl to still get a (zeroed) line per call")
+	}
+}
+
+// ---- planner IMPL_PLAN.md contract (09_optimize_agents.md, subtask 3) ----
+
+// planContractRunner writes an invalid (missing required sections) plan on
+// its first planner call and a valid one from the second call on, so tests
+// can assert the retry-within-ITER-budget behavior.
+type planContractRunner struct {
+	layout        specs.Layout
+	plannerCalls  int
+	workerCalls   int
+	testerCalls   int
+	alwaysInvalid bool
+}
+
+func (r *planContractRunner) Run(_ context.Context, _ string, a *agents.Agent, _ string) (agents.RunResult, error) {
+	switch a.Name {
+	case "planner":
+		r.plannerCalls++
+		content := validPlanFixture
+		if r.alwaysInvalid || r.plannerCalls == 1 {
+			content = "just some free-form notes, no required sections"
+		}
+		if err := os.WriteFile(filepath.Join(r.layout.SpecDir, "001_IMPL_PLAN.md"), []byte(content), 0o644); err != nil {
+			return agents.RunResult{}, err
+		}
+	case "worker":
+		r.workerCalls++
+	case "tester":
+		r.testerCalls++
+		rows, err := specs.ReadStatus(r.layout.StatusPath)
+		if err != nil {
+			return agents.RunResult{}, err
+		}
+		for i := range rows {
+			rows[i].Status = specs.StatusDone
+		}
+		if err := specs.WriteStatus(r.layout.StatusPath, rows); err != nil {
+			return agents.RunResult{}, err
+		}
+	}
+	return agents.RunResult{}, nil
+}
+
+func TestProcessTaskRetriesPlannerWithinITERBudgetWhenPlanInvalid(t *testing.T) {
+	dir := t.TempDir()
+	layout := specs.NewLayout(dir)
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	writeAgentFixtures(t, layout.AgentsDir)
+	specFile := "001_example.md"
+	if err := os.WriteFile(filepath.Join(layout.SpecDir, specFile), []byte("# Example\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &planContractRunner{layout: layout}
+	o := &Orchestrator{
+		Cfg:    config.Config{Dir: dir, Iter: 3, DryRun: true},
+		Layout: layout,
+		Runner: runner,
+		Log:    log.New(io.Discard, "", 0),
+	}
+	if err := o.Run(context.Background()); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	if runner.plannerCalls != 2 {
+		t.Errorf("plannerCalls = %d, want 2 (one rejected, one accepted)", runner.plannerCalls)
+	}
+	if runner.workerCalls != 1 || runner.testerCalls != 1 {
+		t.Errorf("workerCalls=%d testerCalls=%d, want 1 and 1 (only after the plan became valid)", runner.workerCalls, runner.testerCalls)
+	}
+
+	reviewPath := filepath.Join(layout.SpecDir, "001_REVIEW_1.md")
+	note, err := os.ReadFile(reviewPath)
+	if err != nil {
+		t.Fatalf("expected a contract-violation review to be written to %s: %v", reviewPath, err)
+	}
+	if !strings.Contains(string(note), "Files") || !strings.Contains(string(note), "Test Command") {
+		t.Errorf("expected the rejection note to mention the required sections; got: %s", note)
+	}
+
+	status, err := specs.GetStatus(layout, specFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != specs.StatusDone {
+		t.Fatalf("status = %s, want DONE", status)
+	}
+}
+
+func TestProcessTaskFailsTaskIfPlanNeverBecomesValid(t *testing.T) {
+	dir := t.TempDir()
+	layout := specs.NewLayout(dir)
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	writeAgentFixtures(t, layout.AgentsDir)
+	specFile := "001_example.md"
+	if err := os.WriteFile(filepath.Join(layout.SpecDir, specFile), []byte("# Example\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &planContractRunner{layout: layout, alwaysInvalid: true}
+	o := &Orchestrator{
+		Cfg:    config.Config{Dir: dir, Iter: 2, DryRun: true},
+		Layout: layout,
+		Runner: runner,
+		Log:    log.New(io.Discard, "", 0),
+	}
+	if err := o.Run(context.Background()); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	if runner.workerCalls != 0 || runner.testerCalls != 0 {
+		t.Errorf("workerCalls=%d testerCalls=%d, want 0 and 0 — an invalid plan must never reach worker/tester", runner.workerCalls, runner.testerCalls)
+	}
+	status, err := specs.GetStatus(layout, specFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != specs.StatusFailed {
+		t.Fatalf("status = %s, want FAILED", status)
+	}
+}
+
+// ---- diff-scoped tester (09_optimize_agents.md, subtask 4) ----
+
+// scriptedRunner drives planner/worker/tester through test-supplied
+// callbacks, for scenarios that need real repository side effects (writing
+// specific file contents) beyond what the other fakes offer.
+type scriptedRunner struct {
+	layout           specs.Layout
+	onPlanner        func(specDir string) error
+	onWorker         func(dir string) error
+	testerCalls      int
+	testerPrompts    []string
+	markDoneOnTester bool
+}
+
+func (r *scriptedRunner) Run(_ context.Context, dir string, a *agents.Agent, prompt string) (agents.RunResult, error) {
+	switch a.Name {
+	case "planner":
+		if r.onPlanner != nil {
+			if err := r.onPlanner(r.layout.SpecDir); err != nil {
+				return agents.RunResult{}, err
+			}
+		}
+	case "worker":
+		if r.onWorker != nil {
+			if err := r.onWorker(dir); err != nil {
+				return agents.RunResult{}, err
+			}
+		}
+	case "tester":
+		r.testerCalls++
+		r.testerPrompts = append(r.testerPrompts, prompt)
+		if r.markDoneOnTester {
+			rows, err := specs.ReadStatus(r.layout.StatusPath)
+			if err != nil {
+				return agents.RunResult{}, err
+			}
+			for i := range rows {
+				rows[i].Status = specs.StatusDone
+			}
+			if err := specs.WriteStatus(r.layout.StatusPath, rows); err != nil {
+				return agents.RunResult{}, err
+			}
+		}
+	}
+	return agents.RunResult{}, nil
+}
+
+func writeValidPlan(specDir string) error {
+	return os.WriteFile(filepath.Join(specDir, "001_IMPL_PLAN.md"), []byte(validPlanFixture), 0o644)
+}
+
+func TestProcessTaskSkipsTesterOnEmptyDiff(t *testing.T) {
+	requireGit(t)
+	dir := t.TempDir()
+	setTestGitEnv(t)
+
+	layout := specs.NewLayout(dir)
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	writeAgentFixtures(t, layout.AgentsDir)
+	specFile := "001_example.md"
+	if err := os.WriteFile(filepath.Join(layout.SpecDir, specFile), []byte("# Example\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &scriptedRunner{
+		layout:    layout,
+		onPlanner: writeValidPlan,
+		onWorker:  func(string) error { return nil }, // worker "does nothing": no diff at all
+	}
+	o := &Orchestrator{
+		Cfg:    config.Config{Dir: dir, Iter: 2, MaxDiffBytes: config.DefaultMaxDiffBytes},
+		Layout: layout,
+		Runner: runner,
+		Log:    log.New(io.Discard, "", 0),
+	}
+	if err := o.Run(context.Background()); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	if runner.testerCalls != 0 {
+		t.Errorf("testerCalls = %d, want 0 — an empty diff must never reach tester", runner.testerCalls)
+	}
+	status, err := specs.GetStatus(layout, specFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != specs.StatusFailed {
+		t.Fatalf("status = %s, want FAILED (no iteration could ever pass with an empty diff)", status)
+	}
+}
+
+func TestProcessTaskCallsTesterWithDiffWhenWorkerAddsFile(t *testing.T) {
+	requireGit(t)
+	dir := t.TempDir()
+	setTestGitEnv(t)
+
+	layout := specs.NewLayout(dir)
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	writeAgentFixtures(t, layout.AgentsDir)
+	specFile := "001_example.md"
+	if err := os.WriteFile(filepath.Join(layout.SpecDir, specFile), []byte("# Example\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &scriptedRunner{
+		layout:    layout,
+		onPlanner: writeValidPlan,
+		onWorker: func(dir string) error {
+			return os.WriteFile(filepath.Join(dir, "new_feature.go"), []byte("package main\n"), 0o644)
+		},
+		markDoneOnTester: true,
+	}
+	o := &Orchestrator{
+		Cfg:    config.Config{Dir: dir, Iter: 1, MaxDiffBytes: config.DefaultMaxDiffBytes},
+		Layout: layout,
+		Runner: runner,
+		Log:    log.New(io.Discard, "", 0),
+	}
+	if err := o.Run(context.Background()); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	if runner.testerCalls != 1 {
+		t.Fatalf("testerCalls = %d, want 1", runner.testerCalls)
+	}
+	prompt := runner.testerPrompts[0]
+	if !strings.Contains(prompt, "Untracked files") || !strings.Contains(prompt, "new_feature.go") {
+		t.Errorf("expected tester prompt to list the new untracked file; got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "go test ./...") {
+		t.Errorf("expected tester prompt to carry the plan's test command; got:\n%s", prompt)
+	}
+}
+
+func TestProcessTaskTruncatesOversizedDiffForTester(t *testing.T) {
+	requireGit(t)
+	dir := t.TempDir()
+	setTestGitEnv(t)
+	ctx := context.Background()
+
+	if err := gitutil.EnsureRepo(ctx, dir); err != nil {
+		t.Fatal(err)
+	}
+	initialContent := strings.Repeat("line\n", 50)
+	if err := os.WriteFile(filepath.Join(dir, "big.txt"), []byte(initialContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := gitutil.CommitAll(ctx, dir, "seed big.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	layout := specs.NewLayout(dir)
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	writeAgentFixtures(t, layout.AgentsDir)
+	specFile := "001_example.md"
+	if err := os.WriteFile(filepath.Join(layout.SpecDir, specFile), []byte("# Example\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	const sentinel = "UNIQUE_SENTINEL_XYZ"
+	runner := &scriptedRunner{
+		layout:    layout,
+		onPlanner: writeValidPlan, // plan's Files list is "some/file.go" — never big.txt
+		onWorker: func(dir string) error {
+			return os.WriteFile(filepath.Join(dir, "big.txt"), []byte(sentinel+"\n"+strings.Repeat("changed line\n", 50)), 0o644)
+		},
+		markDoneOnTester: true,
+	}
+	o := &Orchestrator{
+		Cfg:    config.Config{Dir: dir, Iter: 1, MaxDiffBytes: 20}, // tiny threshold: forces truncation
+		Layout: layout,
+		Runner: runner,
+		Log:    log.New(io.Discard, "", 0),
+	}
+	if err := o.Run(ctx); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	if runner.testerCalls != 1 {
+		t.Fatalf("testerCalls = %d, want 1", runner.testerCalls)
+	}
+	prompt := runner.testerPrompts[0]
+	if !strings.Contains(prompt, "exceeded --max-diff-bytes") {
+		t.Errorf("expected tester prompt to note the diff was truncated; got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "big.txt") {
+		t.Errorf("expected the diff --stat summary to still mention big.txt; got:\n%s", prompt)
+	}
+	if strings.Contains(prompt, sentinel) {
+		t.Errorf("expected the full diff body (with the sentinel) to be dropped once truncated; got:\n%s", prompt)
 	}
 }

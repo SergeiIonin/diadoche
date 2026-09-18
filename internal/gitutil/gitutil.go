@@ -9,7 +9,132 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"strings"
 )
+
+// emptyTreeHash is git's well-known empty-tree object hash — content
+// addressed, so it's valid in any repository regardless of history. Used
+// as the diff base for a task that starts before the repo's first commit,
+// where `git rev-parse HEAD` has nothing to resolve.
+const emptyTreeHash = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+func run(ctx context.Context, dir string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = dir
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	err := cmd.Run()
+	return out.String(), err
+}
+
+// BaseCommit returns the commit diadoche should diff a task's changes
+// against: HEAD, or git's empty-tree hash if the repo has no commits yet
+// (a fresh `git init` with nothing committed).
+func BaseCommit(ctx context.Context, dir string) (string, error) {
+	out, err := run(ctx, dir, "rev-parse", "HEAD")
+	if err != nil {
+		return emptyTreeHash, nil
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// DiffSince returns the unified diff of tracked-file changes in dir since
+// base (typically a BaseCommit result).
+func DiffSince(ctx context.Context, dir, base string) (string, error) {
+	out, err := run(ctx, dir, "diff", base)
+	if err != nil {
+		return "", fmt.Errorf("git diff: %w: %s", err, out)
+	}
+	return out, nil
+}
+
+// DiffStatSince returns `git diff --stat` since base — a compact summary
+// used in place of the full diff when it's over a size threshold.
+func DiffStatSince(ctx context.Context, dir, base string) (string, error) {
+	out, err := run(ctx, dir, "diff", "--stat", base)
+	if err != nil {
+		return "", fmt.Errorf("git diff --stat: %w: %s", err, out)
+	}
+	return out, nil
+}
+
+// DiffSinceForFiles returns the unified diff since base, restricted to the
+// given paths — used to keep an oversized diff down to just the files the
+// implementation plan says were meant to change.
+func DiffSinceForFiles(ctx context.Context, dir, base string, files []string) (string, error) {
+	if len(files) == 0 {
+		return "", nil
+	}
+	args := append([]string{"diff", base, "--"}, files...)
+	out, err := run(ctx, dir, args...)
+	if err != nil {
+		return "", fmt.Errorf("git diff (restricted to plan files): %w: %s", err, out)
+	}
+	return out, nil
+}
+
+// excludePathspec builds the `git diff`/`git diff --stat` pathspec that
+// means "everything except excludeDirs" (each a path relative to dir).
+func excludePathspec(excludeDirs []string) []string {
+	var nonEmpty []string
+	for _, d := range excludeDirs {
+		if d != "" {
+			nonEmpty = append(nonEmpty, d)
+		}
+	}
+	if len(nonEmpty) == 0 {
+		return nil
+	}
+	spec := []string{"--", "."}
+	for _, d := range nonEmpty {
+		spec = append(spec, ":(exclude)"+d)
+	}
+	return spec
+}
+
+// DiffSinceExcluding is DiffSince, but excludes everything under each of
+// excludeDirs (paths relative to dir, e.g. ".claude/diadoche",
+// ".claude/agents") — used to keep diadoche's own bookkeeping and agent
+// config files from ever appearing as if they were part of a worker's
+// change.
+func DiffSinceExcluding(ctx context.Context, dir, base string, excludeDirs ...string) (string, error) {
+	args := append([]string{"diff", base}, excludePathspec(excludeDirs)...)
+	out, err := run(ctx, dir, args...)
+	if err != nil {
+		return "", fmt.Errorf("git diff: %w: %s", err, out)
+	}
+	return out, nil
+}
+
+// DiffStatSinceExcluding is DiffStatSince with the same exclusion as
+// DiffSinceExcluding.
+func DiffStatSinceExcluding(ctx context.Context, dir, base string, excludeDirs ...string) (string, error) {
+	args := append([]string{"diff", "--stat", base}, excludePathspec(excludeDirs)...)
+	out, err := run(ctx, dir, args...)
+	if err != nil {
+		return "", fmt.Errorf("git diff --stat: %w: %s", err, out)
+	}
+	return out, nil
+}
+
+// UntrackedFiles returns paths git considers untracked and not ignored
+// (`git ls-files --others --exclude-standard`) — new files a plain `git
+// diff` never reports, but that may still be part of a task's changes.
+func UntrackedFiles(ctx context.Context, dir string) ([]string, error) {
+	out, err := run(ctx, dir, "ls-files", "--others", "--exclude-standard")
+	if err != nil {
+		return nil, fmt.Errorf("git ls-files: %w: %s", err, out)
+	}
+	var files []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			files = append(files, line)
+		}
+	}
+	return files, nil
+}
 
 // EnsureRepo makes sure dir is inside a git working tree, running `git init`
 // in dir if it isn't one yet.

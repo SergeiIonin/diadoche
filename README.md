@@ -52,6 +52,17 @@ Flags:
 - `--preprocess` + `--task <path>` — preprocessor mode, see below.
 - `--initialize <project-path>` — scaffold `.claude/` in a project and
   exit; ignores every other flag. See above.
+- `--planner-model`, `--worker-model`, `--tester-model`,
+  `--preprocessor-model` — override one agent's model. Priority:
+  flag > `DIADOCHE_<AGENT>_MODEL` env var > `model:` in the project's
+  `.claude/agents/<name>.md` > built-in default. Only the model is
+  affected — a `.claude/agents/<name>.md` prompt override still applies
+  regardless of which of the above picked the model. An unrecognized model
+  name is a startup error, before any `claude` process runs. The resolved
+  models are logged once at the start of the run.
+- `--max-diff-bytes` — above this many bytes of raw `git diff`, tester gets
+  `git diff --stat` plus a diff restricted to the plan's file list instead
+  (default 50000). See "Diff-scoped tester" below.
 - `-h` / `-help` / `--help` — print the full man-page-style help and exit.
 
 ## Preprocessor (`--preprocess`)
@@ -88,10 +99,18 @@ preprocessor) are guarded by a `spec/.lock` file lock, so a concurrent
    and pushed onto `spec/QUEUE.md` (this run's work queue).
 2. For each task pulled off the queue, status is set to `IN_PROGRESS`, and
    diadoche runs up to `--ITER` rounds of:
-   - **planner** (model `claude-fable-5-1`) — writes `spec/NNN_IMPL_PLAN.md`;
-   - **worker** (model `claude-opus-5`) — implements the plan in the repo;
-   - **tester** (model `claude-opus-5`) — writes `spec/NNN_REVIEW_M.md` and,
-     if the task is genuinely done, sets `spec/STATUS.md` to `DONE` itself.
+   - **planner** (model `claude-opus-5` by default) — writes
+     `spec/NNN_IMPL_PLAN.md`, which must contain a `## Files` section (the
+     exact paths to create/modify) and a `## Test Command` section (how to
+     run this project's tests/linter). If either is missing, the iteration
+     is treated as failed and planner is asked again, still within the same
+     `--ITER` budget.
+   - **worker** (model `claude-opus-5` by default) — implements the plan,
+     working from its `## Files` list instead of re-exploring the repo;
+   - **tester** (model `claude-opus-5` by default) — reviews a `git diff`
+     of the worker's changes (see "Diff-scoped tester" below) plus the plan's
+     test command, writes `spec/NNN_REVIEW_M.md`, and, if the task is
+     genuinely done, sets `spec/STATUS.md` to `DONE` itself.
 3. Once tester marks a task `DONE`, diadoche moves on to the next task in
    the queue. If iterations run out without `DONE`, diadoche itself sets
    `FAILED`.
@@ -102,4 +121,42 @@ Agent prompts and models are built into the binary (frontmatter `name` /
 `model` / `description` plus a body — the system prompt), with per-project
 overrides via `.claude/agents/<name>.md` (same format) — overriding a prompt
 never requires rebuilding diadoche, only changing the built-in default does.
+
+## Model selection
+
+Each agent's model is resolved in this order, first match wins:
+
+1. `--<agent>-model` flag
+2. `DIADOCHE_<AGENT>_MODEL` environment variable
+3. `model:` field in the project's `.claude/agents/<name>.md`, if any
+4. the agent's built-in default
+
+This only ever picks the model — a `.claude/agents/<name>.md` prompt
+override (its body, not its `model:` field) still applies regardless of
+which of the above set the model. An unrecognized model name is a startup
+error, before any `claude` process runs, and the resolved models are logged
+once at the start of the run.
+
+## Diff-scoped tester
+
+Before a task's first iteration, diadoche records the current commit (or,
+before the repo's first-ever commit, git's empty-tree hash) as that task's
+diff base. Before each tester call it computes `git diff <base>` plus any
+untracked files since that base — excluding `.claude/diadoche/` and
+`.claude/agents/`, diadoche's own bookkeeping/config, so those never look
+like part of the worker's change.
+
+- An empty diff (and no untracked files) means tester is **not called at
+  all** — the iteration is immediately treated as unsuccessful.
+- A diff over `--max-diff-bytes` is replaced with `git diff --stat` plus a
+  diff restricted to the files listed in the plan's `## Files` section.
+
+## Usage accounting
+
+Every agent call's model, token usage (input/output/cache) and cost — parsed
+from the `claude` CLI's `--output-format json` result — is appended as one
+JSON line to `.claude/diadoche/usage.jsonl`, along with the task, agent
+name, iteration and duration. A line that couldn't be parsed is still
+recorded (zeroed) and logs a warning; usage accounting never fails the run.
+Once a run finishes, a summary (overall, by agent, by task) is printed.
 

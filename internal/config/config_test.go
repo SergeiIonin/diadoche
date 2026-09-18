@@ -98,3 +98,83 @@ func TestParseInvalidFlagDoesNotPrintFullManPage(t *testing.T) {
 		t.Fatalf("an unrelated bad flag should not report ErrHelp, got: %v", err)
 	}
 }
+
+func TestParseModelFlagsSetOverrides(t *testing.T) {
+	cfg, err := Parse([]string{
+		"--planner-model", "claude-sonnet-5",
+		"--worker-model", "claude-haiku-4-5-20251001",
+		"--tester-model", "claude-fable-5-1",
+		"--preprocessor-model", "claude-opus-5",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PlannerModel != "claude-sonnet-5" {
+		t.Errorf("PlannerModel = %q", cfg.PlannerModel)
+	}
+	if cfg.WorkerModel != "claude-haiku-4-5-20251001" {
+		t.Errorf("WorkerModel = %q", cfg.WorkerModel)
+	}
+	if cfg.TesterModel != "claude-fable-5-1" {
+		t.Errorf("TesterModel = %q", cfg.TesterModel)
+	}
+	if cfg.PreprocessorModel != "claude-opus-5" {
+		t.Errorf("PreprocessorModel = %q", cfg.PreprocessorModel)
+	}
+}
+
+func TestParseModelEnvVarsApplyWhenFlagAbsent(t *testing.T) {
+	t.Setenv("DIADOCHE_PLANNER_MODEL", "claude-sonnet-5")
+	cfg, err := Parse(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PlannerModel != "claude-sonnet-5" {
+		t.Fatalf("PlannerModel = %q, want claude-sonnet-5 from env", cfg.PlannerModel)
+	}
+}
+
+func TestParseModelFlagTakesPriorityOverEnvVar(t *testing.T) {
+	t.Setenv("DIADOCHE_PLANNER_MODEL", "claude-sonnet-5")
+	cfg, err := Parse([]string{"--planner-model", "claude-opus-5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PlannerModel != "claude-opus-5" {
+		t.Fatalf("PlannerModel = %q, want flag value claude-opus-5 to win over env", cfg.PlannerModel)
+	}
+}
+
+func TestParseNoModelOverrideLeavesFieldEmpty(t *testing.T) {
+	cfg, err := Parse(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PlannerModel != "" || cfg.WorkerModel != "" || cfg.TesterModel != "" || cfg.PreprocessorModel != "" {
+		t.Fatalf("expected all model overrides empty by default, got %+v", cfg)
+	}
+}
+
+func TestParseMaxDiffBytesDefaultAndOverride(t *testing.T) {
+	cfg, err := Parse(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxDiffBytes != DefaultMaxDiffBytes {
+		t.Fatalf("MaxDiffBytes = %d, want default %d", cfg.MaxDiffBytes, DefaultMaxDiffBytes)
+	}
+
+	cfg, err = Parse([]string{"--max-diff-bytes", "1000"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxDiffBytes != 1000 {
+		t.Fatalf("MaxDiffBytes = %d, want 1000", cfg.MaxDiffBytes)
+	}
+}
+
+func TestParseMaxDiffBytesRejectsNegative(t *testing.T) {
+	if _, err := Parse([]string{"--max-diff-bytes", "-1"}); err == nil {
+		t.Fatal("expected an error for a negative --max-diff-bytes")
+	}
+}

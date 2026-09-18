@@ -14,6 +14,13 @@ import (
 const (
 	DefaultIter = 3
 	MaxIter     = 8
+
+	// DefaultMaxDiffBytes bounds the raw `git diff` handed to tester before
+	// diadoche falls back to `git diff --stat` plus a diff restricted to the
+	// files the implementation plan says were meant to change. Kept modest
+	// on purpose — this whole flag exists to cut token spend, so the
+	// default should actually cut it on anything but a small change.
+	DefaultMaxDiffBytes = 50_000
 )
 
 // ErrHelp is returned by Parse when the user asked for help (-h, -help or
@@ -29,8 +36,11 @@ const helpName = `NAME
 
 const helpSynopsis = `SYNOPSIS
     diadoche [--dir <path>] [--ITER <n>] [--langs <list>] [--frameworks <list>]
-             [--dry-run] [--claude-bin <path>]
+             [--dry-run] [--claude-bin <path>] [--max-diff-bytes <n>]
+             [--planner-model <name>] [--worker-model <name>]
+             [--tester-model <name>]
     diadoche --preprocess --task <path> [--dir <path>] [--claude-bin <path>]
+             [--preprocessor-model <name>]
     diadoche --initialize <project-path>
     diadoche -h | -help | --help
 
@@ -65,6 +75,30 @@ const helpDescription = `DESCRIPTION
     implementation plan and reviews already on disk instead of redoing
     completed work.
 
+    spec/NNN_IMPL_PLAN.md must contain two sections, with these exact
+    headings: "## Files" (every path to create or modify) and
+    "## Test Command" (how to run this project's tests/linter). worker
+    then works strictly from that file list instead of re-exploring the
+    repository, and tester is given a git diff (see DIFF SCOPE below)
+    plus that test command instead of the whole repository. If planner's
+    output is missing either section, the iteration is treated as failed
+    and planner is asked again, still within the same --ITER budget.
+
+    Each agent call's model, token usage and cost (parsed from the claude
+    CLI's --output-format json result) is appended as one JSON line to
+    spec/../usage.jsonl (i.e. .claude/diadoche/usage.jsonl), and a summary
+    (overall, by agent, by task) is printed once the run finishes. A line
+    that couldn't be parsed is still recorded (zeroed) and logs a warning
+    — usage accounting never fails the run.
+
+    DIFF SCOPE: before a task's first iteration, diadoche records the
+    current commit (or, pre-first-commit, git's empty-tree hash) as that
+    task's diff base. Before each tester call it computes the diff (plus
+    any untracked files) since that base. An empty diff means tester is
+    not called at all — the iteration is immediately unsuccessful. A diff
+    over --max-diff-bytes is replaced with 'git diff --stat' plus a diff
+    restricted to the files listed in "## Files" of the plan.
+
 `
 
 const helpModes = `MODES
@@ -87,6 +121,20 @@ const helpModes = `MODES
         Never overwrites a file that's already there, so it's safe to run
         again later (e.g. after upgrading diadoche). Does only this, then
         exits immediately — every other flag is ignored.
+
+`
+
+const helpModels = `MODEL SELECTION
+    Each agent's model is resolved in this order, first match wins:
+        1. --<agent>-model flag
+        2. DIADOCHE_<AGENT>_MODEL environment variable
+        3. model: field in the project's .claude/agents/<name>.md, if any
+        4. the agent's built-in default
+
+    This only ever picks the model; a .claude/agents/<name>.md prompt
+    override (its body, not its model: field) still applies regardless of
+    which of the above set the model. An unrecognized model name is a
+    startup error, before any claude process runs.
 
 `
 
@@ -115,6 +163,10 @@ FILES
         Optional skill folders; matched against --langs/--frameworks and
         mentioned to the agents when relevant.
 
+    <project>/.claude/diadoche/usage.jsonl
+        One JSON line per agent call: time, task, agent, iteration, model,
+        token counts, cost (USD), duration.
+
 `
 
 const helpExamples = `EXAMPLES
@@ -132,6 +184,10 @@ const helpExamples = `EXAMPLES
 
     Scaffold a brand new project:
         diadoche --initialize /path/to/project
+
+    Save cost by running worker on a cheaper model:
+        diadoche --dir /path/to/project --worker-model claude-sonnet-5
+        DIADOCHE_WORKER_MODEL=claude-sonnet-5 diadoche --dir /path/to/project
 `
 
 // Config holds all runtime settings for a single diadoche run.
@@ -145,6 +201,21 @@ type Config struct {
 	Preprocess bool
 	Task       string
 	Initialize string
+
+	// MaxDiffBytes bounds the raw diff handed to tester (subtask 4 of
+	// 09_optimize_agents.md); see DefaultMaxDiffBytes.
+	MaxDiffBytes int
+
+	// PlannerModel, WorkerModel, TesterModel, PreprocessorModel are model
+	// overrides resolved from --<agent>-model (if set) else
+	// DIADOCHE_<AGENT>_MODEL (if set); empty means "no override — use
+	// whatever LoadOrDefault picks up from .claude/agents/<name>.md or the
+	// built-in default". Applied via agents.ApplyModelOverride, which is
+	// also where the final model name is validated.
+	PlannerModel      string
+	WorkerModel       string
+	TesterModel       string
+	PreprocessorModel string
 }
 
 // TaskPath resolves --task relative to --dir, unless it's already absolute.
@@ -170,6 +241,11 @@ func Parse(args []string) (*Config, error) {
 	preprocess := fs.Bool("preprocess", false, "split a raw task file into atomic task specs and exit, instead of running the main loop")
 	task := fs.String("task", "", "path to the raw task file for --preprocess, e.g. .claude/diadoche/spec/raw/foo.md")
 	initialize := fs.String("initialize", "", "scaffold .claude/ in the given project path and exit, doing nothing else")
+	maxDiffBytes := fs.Int("max-diff-bytes", DefaultMaxDiffBytes, "above this many bytes of raw `git diff`, tester gets `git diff --stat` plus a diff restricted to the plan's file list instead")
+	plannerModel := fs.String("planner-model", "", "override the planner agent's model (else $DIADOCHE_PLANNER_MODEL, else .claude/agents/planner.md, else built-in default)")
+	workerModel := fs.String("worker-model", "", "override the worker agent's model (else $DIADOCHE_WORKER_MODEL, else .claude/agents/worker.md, else built-in default)")
+	testerModel := fs.String("tester-model", "", "override the tester agent's model (else $DIADOCHE_TESTER_MODEL, else .claude/agents/tester.md, else built-in default)")
+	preprocessorModel := fs.String("preprocessor-model", "", "override the preprocessor agent's model (else $DIADOCHE_PREPROCESSOR_MODEL, else .claude/agents/preprocessor.md, else built-in default)")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -193,16 +269,36 @@ func Parse(args []string) (*Config, error) {
 		return nil, fmt.Errorf("--preprocess requires --task <path to raw task file>")
 	}
 
+	if *maxDiffBytes < 0 {
+		return nil, fmt.Errorf("--max-diff-bytes must be >= 0, got %d", *maxDiffBytes)
+	}
+
 	return &Config{
-		Dir:        *dir,
-		Iter:       *iter,
-		Langs:      splitCSV(*langs),
-		Frameworks: splitCSV(*frameworks),
-		DryRun:     *dryRun,
-		ClaudeBin:  *claudeBin,
-		Preprocess: *preprocess,
-		Task:       *task,
+		Dir:               *dir,
+		Iter:              *iter,
+		Langs:             splitCSV(*langs),
+		Frameworks:        splitCSV(*frameworks),
+		DryRun:            *dryRun,
+		ClaudeBin:         *claudeBin,
+		Preprocess:        *preprocess,
+		Task:              *task,
+		MaxDiffBytes:      *maxDiffBytes,
+		PlannerModel:      resolveModelOverride(*plannerModel, "DIADOCHE_PLANNER_MODEL"),
+		WorkerModel:       resolveModelOverride(*workerModel, "DIADOCHE_WORKER_MODEL"),
+		TesterModel:       resolveModelOverride(*testerModel, "DIADOCHE_TESTER_MODEL"),
+		PreprocessorModel: resolveModelOverride(*preprocessorModel, "DIADOCHE_PREPROCESSOR_MODEL"),
 	}, nil
+}
+
+// resolveModelOverride implements the flag > environment variable priority
+// for one agent's model override: a non-empty flag value always wins; only
+// when the flag was left at its default ("") does the environment variable
+// apply. Returns "" (no override) if neither is set.
+func resolveModelOverride(flagVal, envName string) string {
+	if strings.TrimSpace(flagVal) != "" {
+		return flagVal
+	}
+	return strings.TrimSpace(os.Getenv(envName))
 }
 
 // printHelp writes the full man-page-style help text to w, including the
@@ -213,6 +309,7 @@ func printHelp(fs *flag.FlagSet, w io.Writer) {
 	fmt.Fprint(w, helpSynopsis)
 	fmt.Fprint(w, helpDescription)
 	fmt.Fprint(w, helpModes)
+	fmt.Fprint(w, helpModels)
 	fmt.Fprint(w, helpFlagsHeader)
 	fs.SetOutput(w)
 	fs.PrintDefaults()
