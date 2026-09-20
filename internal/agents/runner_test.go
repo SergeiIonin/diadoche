@@ -2,7 +2,12 @@ package agents
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseUsageJSONExtractsUsageAndCost(t *testing.T) {
@@ -45,6 +50,54 @@ func TestParseUsageJSONFailsOnEmptyOutput(t *testing.T) {
 	_, _, ok := parseUsageJSON([]byte(""))
 	if ok {
 		t.Fatal("expected ok=false for empty output")
+	}
+}
+
+// sleepyClaudeStub writes a shell script standing in for `claude`: it
+// ignores every argument (so it works regardless of what CLIRunner passes)
+// and sleeps for sleepSeconds before printing a well-formed JSON result.
+func sleepyClaudeStub(t *testing.T, sleepSeconds int) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fake-claude.sh")
+	script := "#!/bin/sh\nsleep " + strconv.Itoa(sleepSeconds) + "\necho '{\"total_cost_usd\":0.01,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}'\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestCLIRunnerKillsCallExceedingMaxCallDuration(t *testing.T) {
+	stub := sleepyClaudeStub(t, 5)
+	r := CLIRunner{Bin: stub, MaxCallDuration: 150 * time.Millisecond}
+	a := &Agent{Name: "worker", Model: "claude-opus-5"}
+
+	start := time.Now()
+	_, err := r.Run(context.Background(), t.TempDir(), a, "do the thing")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected an error when the call exceeds MaxCallDuration")
+	}
+	if !strings.Contains(err.Error(), "--max-call-minutes") {
+		t.Errorf("expected error to mention --max-call-minutes, got: %v", err)
+	}
+	if elapsed >= 4*time.Second {
+		t.Fatalf("Run took %v — the stub's 5s sleep was not actually killed by the timeout", elapsed)
+	}
+}
+
+func TestCLIRunnerNoTimeoutWhenMaxCallDurationUnset(t *testing.T) {
+	stub := sleepyClaudeStub(t, 0)
+	r := CLIRunner{Bin: stub} // MaxCallDuration zero value: no limit
+	a := &Agent{Name: "worker", Model: "claude-opus-5"}
+
+	result, err := r.Run(context.Background(), t.TempDir(), a, "do the thing")
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if !result.Parsed || result.TotalCostUSD != 0.01 {
+		t.Fatalf("unexpected result: %+v", result)
 	}
 }
 

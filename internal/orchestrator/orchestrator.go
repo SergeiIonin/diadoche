@@ -46,7 +46,7 @@ func New(cfg config.Config) *Orchestrator {
 	if cfg.DryRun {
 		runner = agents.DryRunRunner{Log: logger}
 	} else {
-		runner = agents.CLIRunner{Bin: cfg.ClaudeBin}
+		runner = agents.CLIRunner{Bin: cfg.ClaudeBin, MaxCallDuration: time.Duration(cfg.MaxCallMinutes) * time.Minute}
 	}
 	return &Orchestrator{
 		Cfg:    cfg,
@@ -268,6 +268,9 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 			if err != nil {
 				return o.failTask(specFile, fmt.Errorf("planner: %w", err))
 			}
+			if err := o.checkCallCost("planner", result); err != nil {
+				return o.failTask(specFile, err)
+			}
 
 			planBytes, _ := os.ReadFile(implPlanPath)
 			if !implplan.HasRequiredSections(string(planBytes)) {
@@ -301,6 +304,9 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 		o.recordUsage(uw, specFile, "worker", iter, worker.Model, workerResult)
 		if err != nil {
 			return o.failTask(specFile, fmt.Errorf("worker: %w", err))
+		}
+		if err := o.checkCallCost("worker", workerResult); err != nil {
+			return o.failTask(specFile, err)
 		}
 
 		testCommand := implplan.TestCommand(plan)
@@ -363,8 +369,15 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 			return o.failTask(specFile, err)
 		}
 		if status == specs.StatusDone {
+			// A task that just reached DONE is never failed for cost after
+			// the fact — that would throw away completed work for no
+			// benefit, since there's no further spend left to prevent this
+			// iteration was the last call regardless.
 			done = true
 			break
+		}
+		if err := o.checkCallCost("tester", testerResult); err != nil {
+			return o.failTask(specFile, err)
 		}
 	}
 
@@ -375,6 +388,21 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 
 	o.Log.Printf("task %s: FAILED after %d iteration(s)", specFile, o.Cfg.Iter)
 	return specs.SetStatus(o.Layout, specFile, specs.StatusFailed)
+}
+
+// checkCallCost enforces --max-call-cost: if result carries a parsed cost
+// over the configured cap, the task fails right there instead of spending
+// on another agent/iteration. Cost is only known once a call has already
+// returned, so this can only stop *further* spend, never the call it's
+// checking — --max-call-minutes is what bounds an individual call.
+func (o *Orchestrator) checkCallCost(agentName string, result agents.RunResult) error {
+	if o.Cfg.MaxCallCostUSD <= 0 || !result.Parsed {
+		return nil
+	}
+	if result.TotalCostUSD > o.Cfg.MaxCallCostUSD {
+		return fmt.Errorf("%s call cost $%.4f, exceeding --max-call-cost=$%.4f", agentName, result.TotalCostUSD, o.Cfg.MaxCallCostUSD)
+	}
+	return nil
 }
 
 // recordUsage appends one usage.jsonl line for a single agent call. A nil

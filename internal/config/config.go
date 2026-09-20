@@ -38,7 +38,8 @@ const helpSynopsis = `SYNOPSIS
     diadoche [--dir <path>] [--ITER <n>] [--langs <list>] [--frameworks <list>]
              [--dry-run] [--claude-bin <path>] [--max-diff-bytes <n>]
              [--planner-model <name>] [--worker-model <name>]
-             [--tester-model <name>]
+             [--tester-model <name>] [--max-call-minutes <n>]
+             [--max-call-cost <usd>]
     diadoche --preprocess --task <path> [--dir <path>] [--claude-bin <path>]
              [--preprocessor-model <name>]
     diadoche --initialize <project-path>
@@ -138,6 +139,25 @@ const helpModels = `MODEL SELECTION
 
 `
 
+const helpCallBudget = `PER-CALL BUDGET
+    --max-call-minutes and --max-call-cost cap a single planner/worker/
+    tester call, so one runaway agent (stuck exploring, or retrying its own
+    nested claude invocations) can't quietly burn the whole account usage
+    window before diadoche notices. Both are 0 (no limit) by default.
+
+    --max-call-minutes kills the claude process once a call runs longer
+    than this; the iteration is then treated as failed, same as any other
+    agent error. This is the only one of the two that can actually stop
+    money being spent mid-call.
+
+    --max-call-cost is checked only after a call returns — cost is only
+    known once the claude CLI's JSON result comes back, so this cannot
+    preempt an in-flight call. If the call's cost exceeds it, the task is
+    failed right away instead of continuing to the next agent/iteration,
+    so you find out immediately rather than after the fact.
+
+`
+
 const helpFlagsHeader = `FLAGS
 
 `
@@ -216,6 +236,22 @@ type Config struct {
 	WorkerModel       string
 	TesterModel       string
 	PreprocessorModel string
+
+	// MaxCallMinutes, when > 0, kills a single agent call if it runs longer
+	// than this many minutes — caps a runaway call (stuck in its own long
+	// tool-call loop) at a bounded cost instead of letting it run until an
+	// external limit (e.g. the account's usage window) stops it. 0 = no
+	// limit (default): a new safety feature, off by default so it can
+	// never unexpectedly kill a legitimately long-running call on upgrade.
+	MaxCallMinutes int
+
+	// MaxCallCostUSD, when > 0, fails the task if a single agent call's
+	// cost exceeds it. Checked only after a call returns (cost is only
+	// known once the claude CLI's JSON result comes back), so unlike
+	// MaxCallMinutes it cannot preempt the spend — it can only stop the
+	// task from continuing once a call has already turned out to be far
+	// more expensive than expected. 0 = no limit (default).
+	MaxCallCostUSD float64
 }
 
 // TaskPath resolves --task relative to --dir, unless it's already absolute.
@@ -246,6 +282,8 @@ func Parse(args []string) (*Config, error) {
 	workerModel := fs.String("worker-model", "", "override the worker agent's model (else $DIADOCHE_WORKER_MODEL, else .claude/agents/worker.md, else built-in default)")
 	testerModel := fs.String("tester-model", "", "override the tester agent's model (else $DIADOCHE_TESTER_MODEL, else .claude/agents/tester.md, else built-in default)")
 	preprocessorModel := fs.String("preprocessor-model", "", "override the preprocessor agent's model (else $DIADOCHE_PREPROCESSOR_MODEL, else .claude/agents/preprocessor.md, else built-in default)")
+	maxCallMinutes := fs.Int("max-call-minutes", 0, "kill a single agent call if it runs longer than this many minutes (0 = no limit)")
+	maxCallCost := fs.Float64("max-call-cost", 0, "fail the task if a single agent call's cost in USD exceeds this — checked after the call returns, so it cannot preempt the spend (0 = no limit)")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -272,6 +310,12 @@ func Parse(args []string) (*Config, error) {
 	if *maxDiffBytes < 0 {
 		return nil, fmt.Errorf("--max-diff-bytes must be >= 0, got %d", *maxDiffBytes)
 	}
+	if *maxCallMinutes < 0 {
+		return nil, fmt.Errorf("--max-call-minutes must be >= 0, got %d", *maxCallMinutes)
+	}
+	if *maxCallCost < 0 {
+		return nil, fmt.Errorf("--max-call-cost must be >= 0, got %g", *maxCallCost)
+	}
 
 	return &Config{
 		Dir:               *dir,
@@ -287,6 +331,8 @@ func Parse(args []string) (*Config, error) {
 		WorkerModel:       resolveModelOverride(*workerModel, "DIADOCHE_WORKER_MODEL"),
 		TesterModel:       resolveModelOverride(*testerModel, "DIADOCHE_TESTER_MODEL"),
 		PreprocessorModel: resolveModelOverride(*preprocessorModel, "DIADOCHE_PREPROCESSOR_MODEL"),
+		MaxCallMinutes:    *maxCallMinutes,
+		MaxCallCostUSD:    *maxCallCost,
 	}, nil
 }
 
@@ -310,6 +356,7 @@ func printHelp(fs *flag.FlagSet, w io.Writer) {
 	fmt.Fprint(w, helpDescription)
 	fmt.Fprint(w, helpModes)
 	fmt.Fprint(w, helpModels)
+	fmt.Fprint(w, helpCallBudget)
 	fmt.Fprint(w, helpFlagsHeader)
 	fs.SetOutput(w)
 	fs.PrintDefaults()

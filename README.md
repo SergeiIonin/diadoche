@@ -63,6 +63,10 @@ Flags:
 - `--max-diff-bytes` — above this many bytes of raw `git diff`, tester gets
   `git diff --stat` plus a diff restricted to the plan's file list instead
   (default 50000). See "Diff-scoped tester" below.
+- `--max-call-minutes` — kill a single agent call if it runs longer than
+  this many minutes (default 0 = no limit). See "Per-call budget" below.
+- `--max-call-cost` — fail the task if a single agent call's cost (USD)
+  exceeds this (default 0 = no limit). See "Per-call budget" below.
 - `-h` / `-help` / `--help` — print the full man-page-style help and exit.
 
 ## Preprocessor (`--preprocess`)
@@ -136,6 +140,26 @@ override (its body, not its `model:` field) still applies regardless of
 which of the above set the model. An unrecognized model name is a startup
 error, before any `claude` process runs, and the resolved models are logged
 once at the start of the run.
+
+## Per-call budget
+
+`--max-call-minutes` and `--max-call-cost` cap a single planner/worker/
+tester call, so one runaway agent (stuck exploring, or retrying its own
+nested `claude` invocations — e.g. a task whose worker step itself runs an
+eval script that calls `claude`) can't quietly burn the whole account usage
+window before diadoche notices. Both are `0` (no limit) by default, so
+upgrading never silently kills a call that used to be allowed to run long.
+
+- `--max-call-minutes` kills the `claude` process once a call runs longer
+  than this; the iteration is then treated as failed, same as any other
+  agent error. This is the only one of the two that can actually stop money
+  being spent mid-call.
+- `--max-call-cost` is checked only *after* a call returns — cost is only
+  known once the `claude` CLI's JSON result comes back, so it cannot
+  preempt an in-flight call. If the call's cost exceeds it, the task fails
+  right away instead of continuing to the next agent/iteration — except a
+  tester call that already reached `DONE` is never retroactively failed
+  over cost, since there's nothing left to prevent and the work is real.
 
 ## Diff-scoped tester
 

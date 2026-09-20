@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -51,6 +52,13 @@ type Runner interface {
 // error messages and RunResult.Output.
 type CLIRunner struct {
 	Bin string // defaults to "claude"
+
+	// MaxCallDuration, when positive, kills the claude process if a single
+	// call runs longer than this (--max-call-minutes) — a runaway call
+	// (stuck in its own long tool-call loop) is capped at a bounded cost
+	// instead of running until an external limit (e.g. the account's usage
+	// window) stops it. Zero/negative means no limit.
+	MaxCallDuration time.Duration
 }
 
 func (r CLIRunner) Run(ctx context.Context, workDir string, a *Agent, prompt string) (RunResult, error) {
@@ -68,7 +76,14 @@ func (r CLIRunner) Run(ctx context.Context, workDir string, a *Agent, prompt str
 	}
 	args = append(args, "--output-format", "json", "-p", prompt)
 
-	cmd := exec.CommandContext(ctx, bin, args...)
+	callCtx := ctx
+	if r.MaxCallDuration > 0 {
+		var cancel context.CancelFunc
+		callCtx, cancel = context.WithTimeout(ctx, r.MaxCallDuration)
+		defer cancel()
+	}
+
+	cmd := exec.CommandContext(callCtx, bin, args...)
 	cmd.Dir = workDir
 
 	var stdout, stderr bytes.Buffer
@@ -91,6 +106,9 @@ func (r CLIRunner) Run(ctx context.Context, workDir string, a *Agent, prompt str
 	}
 
 	if runErr != nil {
+		if r.MaxCallDuration > 0 && errors.Is(callCtx.Err(), context.DeadlineExceeded) {
+			return result, fmt.Errorf("agent %s: call killed after exceeding --max-call-minutes=%s", a.Name, r.MaxCallDuration)
+		}
 		return result, fmt.Errorf("agent %s: %w: %s", a.Name, runErr, tail(combined, 2000))
 	}
 	return result, nil

@@ -89,3 +89,30 @@ func TestRunWritesUsageRecordWhenNotDryRun(t *testing.T) {
 		t.Errorf("unexpected usage.jsonl content: %s", data)
 	}
 }
+
+func TestRunFailsWhenCallExceedsMaxCallCost(t *testing.T) {
+	dir := t.TempDir()
+	writeAgentFixture(t, specs.NewLayout(dir).AgentsDir, "preprocessor", "claude-opus-5")
+	taskPath := filepath.Join(dir, "raw.md")
+	if err := os.WriteFile(taskPath, []byte("do several things"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stub := filepath.Join(dir, "fake-claude.sh")
+	script := "#!/bin/sh\necho '{\"total_cost_usd\":5.00,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}'\n"
+	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Config{Dir: dir, Task: "raw.md", ClaudeBin: stub, MaxCallCostUSD: 1}
+	if err := Run(context.Background(), cfg); err == nil {
+		t.Fatal("expected Run to fail when the call's cost exceeds --max-call-cost")
+	}
+}
+
+// --max-call-minutes has minute granularity, too coarse to exercise a real
+// kill-on-timeout here without a slow (near-a-minute) test; that mechanism
+// is covered directly in internal/agents.TestCLIRunnerKillsCallExceedingMaxCallDuration.
+// This package only wires cfg.MaxCallMinutes into CLIRunner.MaxCallDuration
+// (see Run), and TestRunWritesUsageRecordWhenNotDryRun already exercises
+// that wiring at its zero value (no limit).

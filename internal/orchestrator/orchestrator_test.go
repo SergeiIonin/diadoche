@@ -714,20 +714,27 @@ type scriptedRunner struct {
 	testerCalls      int
 	testerPrompts    []string
 	markDoneOnTester bool
+
+	// plannerCost/workerCost/testerCost, when non-zero, are returned as a
+	// Parsed RunResult's TotalCostUSD for the matching agent's call — lets
+	// a test drive --max-call-cost for one agent without affecting others.
+	plannerCost, workerCost, testerCost float64
 }
 
 func (r *scriptedRunner) Run(_ context.Context, dir string, a *agents.Agent, prompt string) (agents.RunResult, error) {
+	cost := map[string]float64{"planner": r.plannerCost, "worker": r.workerCost, "tester": r.testerCost}[a.Name]
+	result := agents.RunResult{TotalCostUSD: cost, Parsed: cost != 0}
 	switch a.Name {
 	case "planner":
 		if r.onPlanner != nil {
 			if err := r.onPlanner(r.layout.SpecDir); err != nil {
-				return agents.RunResult{}, err
+				return result, err
 			}
 		}
 	case "worker":
 		if r.onWorker != nil {
 			if err := r.onWorker(dir); err != nil {
-				return agents.RunResult{}, err
+				return result, err
 			}
 		}
 	case "tester":
@@ -736,17 +743,17 @@ func (r *scriptedRunner) Run(_ context.Context, dir string, a *agents.Agent, pro
 		if r.markDoneOnTester {
 			rows, err := specs.ReadStatus(r.layout.StatusPath)
 			if err != nil {
-				return agents.RunResult{}, err
+				return result, err
 			}
 			for i := range rows {
 				rows[i].Status = specs.StatusDone
 			}
 			if err := specs.WriteStatus(r.layout.StatusPath, rows); err != nil {
-				return agents.RunResult{}, err
+				return result, err
 			}
 		}
 	}
-	return agents.RunResult{}, nil
+	return result, nil
 }
 
 func writeValidPlan(specDir string) error {
@@ -898,5 +905,96 @@ func TestProcessTaskTruncatesOversizedDiffForTester(t *testing.T) {
 	}
 	if strings.Contains(prompt, sentinel) {
 		t.Errorf("expected the full diff body (with the sentinel) to be dropped once truncated; got:\n%s", prompt)
+	}
+}
+
+// ---- per-call budget (--max-call-minutes / --max-call-cost) ----
+
+func TestProcessTaskFailsTaskWhenWorkerCallExceedsMaxCallCost(t *testing.T) {
+	requireGit(t)
+	dir := t.TempDir()
+	setTestGitEnv(t)
+
+	layout := specs.NewLayout(dir)
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	writeAgentFixtures(t, layout.AgentsDir)
+	specFile := "001_example.md"
+	if err := os.WriteFile(filepath.Join(layout.SpecDir, specFile), []byte("# Example\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &scriptedRunner{
+		layout:     layout,
+		onPlanner:  writeValidPlan,
+		onWorker:   func(dir string) error { return os.WriteFile(filepath.Join(dir, "x.txt"), []byte("x"), 0o644) },
+		workerCost: 10, // worker's call "costs" $10
+	}
+	o := &Orchestrator{
+		Cfg:    config.Config{Dir: dir, Iter: 3, MaxDiffBytes: config.DefaultMaxDiffBytes, MaxCallCostUSD: 1},
+		Layout: layout,
+		Runner: runner,
+		Log:    log.New(io.Discard, "", 0),
+	}
+	if err := o.Run(context.Background()); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	// worker's $10 call trips the $1 cap before tester is ever reached, and
+	// the task fails right away instead of burning iteration 2's budget too.
+	if runner.testerCalls != 0 {
+		t.Errorf("testerCalls = %d, want 0 — the cost cap should stop the task before tester runs", runner.testerCalls)
+	}
+	status, err := specs.GetStatus(layout, specFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != specs.StatusFailed {
+		t.Fatalf("status = %s, want FAILED", status)
+	}
+}
+
+func TestProcessTaskDoesNotFailATaskThatReachedDoneEvenIfTesterCallWasExpensive(t *testing.T) {
+	requireGit(t)
+	dir := t.TempDir()
+	setTestGitEnv(t)
+
+	layout := specs.NewLayout(dir)
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	writeAgentFixtures(t, layout.AgentsDir)
+	specFile := "001_example.md"
+	if err := os.WriteFile(filepath.Join(layout.SpecDir, specFile), []byte("# Example\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &scriptedRunner{
+		layout:           layout,
+		onPlanner:        writeValidPlan,
+		onWorker:         func(dir string) error { return os.WriteFile(filepath.Join(dir, "x.txt"), []byte("x"), 0o644) },
+		markDoneOnTester: true,
+		testerCost:       10, // tester's call "costs" $10; planner/worker stay cheap
+	}
+	o := &Orchestrator{
+		Cfg:    config.Config{Dir: dir, Iter: 1, MaxDiffBytes: config.DefaultMaxDiffBytes, MaxCallCostUSD: 1},
+		Layout: layout,
+		Runner: runner,
+		Log:    log.New(io.Discard, "", 0),
+	}
+	if err := o.Run(context.Background()); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	// planner/worker are cheap and pass unnoticed, so the task reaches
+	// tester, which marks it DONE — an expensive-but-successful tester call
+	// must not retroactively fail a task that just completed.
+	status, err := specs.GetStatus(layout, specFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != specs.StatusDone {
+		t.Fatalf("status = %s, want DONE (completed work must not be discarded over cost after the fact)", status)
 	}
 }

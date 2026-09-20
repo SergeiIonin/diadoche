@@ -55,7 +55,7 @@ func Run(ctx context.Context, cfg config.Config) error {
 	if cfg.DryRun {
 		runner = agents.DryRunRunner{Log: logger}
 	} else {
-		runner = agents.CLIRunner{Bin: cfg.ClaudeBin}
+		runner = agents.CLIRunner{Bin: cfg.ClaudeBin, MaxCallDuration: time.Duration(cfg.MaxCallMinutes) * time.Minute}
 	}
 
 	// Held for the whole agent turn: the agent may write several files over
@@ -79,6 +79,9 @@ func Run(ctx context.Context, cfg config.Config) error {
 	recordUsage(logger, layout, cfg.DryRun, taskPath, agent.Model, result)
 	if runErr != nil {
 		return fmt.Errorf("preprocessor agent: %w", runErr)
+	}
+	if cfg.MaxCallCostUSD > 0 && result.Parsed && result.TotalCostUSD > cfg.MaxCallCostUSD {
+		return fmt.Errorf("preprocessor call cost $%.4f, exceeding --max-call-cost=$%.4f", result.TotalCostUSD, cfg.MaxCallCostUSD)
 	}
 	logger.Printf("preprocessing done; task work is NOT started — run diadoche normally to pick up the new specs")
 	return nil

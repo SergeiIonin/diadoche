@@ -178,3 +178,38 @@ func TestParseMaxDiffBytesRejectsNegative(t *testing.T) {
 		t.Fatal("expected an error for a negative --max-diff-bytes")
 	}
 }
+
+func TestParseCallBudgetFlagsDefaultToDisabled(t *testing.T) {
+	cfg, err := Parse(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxCallMinutes != 0 {
+		t.Errorf("MaxCallMinutes = %d, want 0 (disabled by default)", cfg.MaxCallMinutes)
+	}
+	if cfg.MaxCallCostUSD != 0 {
+		t.Errorf("MaxCallCostUSD = %v, want 0 (disabled by default)", cfg.MaxCallCostUSD)
+	}
+}
+
+func TestParseCallBudgetFlagsSetValues(t *testing.T) {
+	cfg, err := Parse([]string{"--max-call-minutes", "20", "--max-call-cost", "5.5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxCallMinutes != 20 {
+		t.Errorf("MaxCallMinutes = %d, want 20", cfg.MaxCallMinutes)
+	}
+	if cfg.MaxCallCostUSD != 5.5 {
+		t.Errorf("MaxCallCostUSD = %v, want 5.5", cfg.MaxCallCostUSD)
+	}
+}
+
+func TestParseCallBudgetFlagsRejectNegative(t *testing.T) {
+	if _, err := Parse([]string{"--max-call-minutes", "-1"}); err == nil {
+		t.Fatal("expected an error for a negative --max-call-minutes")
+	}
+	if _, err := Parse([]string{"--max-call-cost", "-1"}); err == nil {
+		t.Fatal("expected an error for a negative --max-call-cost")
+	}
+}
