@@ -152,7 +152,7 @@ func WriteStatus(path string, rows []Row) error {
 	for _, r := range rows {
 		fmt.Fprintf(&b, "| %s | %s | %s |\n", r.Num, r.Spec, r.Status)
 	}
-	return os.WriteFile(path, []byte(b.String()), 0o644)
+	return writeFileAtomic(path, []byte(b.String()))
 }
 
 func ReadQueue(path string) ([]string, error) {
@@ -181,7 +181,31 @@ func WriteQueue(path string, items []string) error {
 	for _, it := range items {
 		fmt.Fprintf(&b, "- %s\n", it)
 	}
-	return os.WriteFile(path, []byte(b.String()), 0o644)
+	return writeFileAtomic(path, []byte(b.String()))
+}
+
+// writeFileAtomic replaces path with data via a temp file + rename, so a
+// diadoche process killed mid-write (e.g. by diadoche-restarter on a usage
+// limit) never leaves STATUS.md/QUEUE.md truncated — an empty STATUS.md
+// would silently forget which tasks are already DONE.
+func writeFileAtomic(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name()) // no-op once renamed
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 // Sync discovers new task spec files that aren't in STATUS.md yet, appends
