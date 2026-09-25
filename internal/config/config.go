@@ -208,6 +208,10 @@ const helpExamples = `EXAMPLES
     Save cost by running worker on a cheaper model:
         diadoche --dir /path/to/project --worker-model claude-sonnet-5
         DIADOCHE_WORKER_MODEL=claude-sonnet-5 diadoche --dir /path/to/project
+
+    Keep going across claude usage-limit windows (restarts diadoche when
+    the window reopens; see diadoche-restarter --help):
+        diadoche-restarter -- --dir /path/to/project --ITER 5
 `
 
 // Config holds all runtime settings for a single diadoche run.

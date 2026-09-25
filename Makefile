@@ -1,5 +1,7 @@
 BINARY  := diadoche
 CMD     := ./cmd/diadoche
+RESTARTER     := diadoche-restarter
+RESTARTER_CMD := ./cmd/diadoche-restarter
 PKGS    := ./...
 
 .PHONY: all
@@ -8,6 +10,7 @@ all: fmt vet test build
 .PHONY: build
 build:
 	go build -trimpath -o $(BINARY) $(CMD)
+	go build -trimpath -o $(RESTARTER) $(RESTARTER_CMD)
 
 .PHONY: run
 run: build
@@ -15,7 +18,7 @@ run: build
 
 .PHONY: install
 install:
-	go install $(CMD)
+	go install $(CMD) $(RESTARTER_CMD)
 
 .PHONY: test
 test:
@@ -62,14 +65,14 @@ check: fmt-check vet test
 
 .PHONY: clean
 clean:
-	rm -f $(BINARY) coverage.out
+	rm -f $(BINARY) $(RESTARTER) coverage.out
 
 .PHONY: help
 help:
 	@echo "Targets:"
-	@echo "  build        build the $(BINARY) binary"
+	@echo "  build        build the $(BINARY) and $(RESTARTER) binaries"
 	@echo "  run          build and run $(BINARY) (pass flags via ARGS=...)"
-	@echo "  install      go install the $(BINARY) binary"
+	@echo "  install      go install the $(BINARY) and $(RESTARTER) binaries"
 	@echo "  test         run tests"
 	@echo "  test-verbose run tests with -v"
 	@echo "  cover        run tests with coverage report"

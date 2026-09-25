@@ -8,7 +8,10 @@ processes, until a task becomes `DONE` (or iterations run out).
 
 ```
 go build -o diadoche ./cmd/diadoche
+go build -o diadoche-restarter ./cmd/diadoche-restarter
 ```
+
+(or just `make build`, which builds both).
 
 ## Usage
 
@@ -184,3 +187,43 @@ name, iteration and duration. A line that couldn't be parsed is still
 recorded (zeroed) and logs a warning; usage accounting never fails the run.
 Once a run finishes, a summary (overall, by agent, by task) is printed.
 
+## Restarting after usage limits (`diadoche-restarter`)
+
+`diadoche-restarter` runs diadoche and brings it back once the claude
+account's usage window reopens:
+
+```
+diadoche-restarter -- --dir /path/to/project --ITER 5
+```
+
+Everything after `--` is passed to diadoche unchanged. The restarter
+passes diadoche's output through and watches it for the claude CLI's
+usage-limit error (`You've hit your session limit · resets 7pm
+(Europe/Moscow)`, or the legacy `usage limit reached|<epoch>`). When it
+sees one, it:
+
+1. stops diadoche and any claude call still running right away, so
+   diadoche doesn't go on to fail the rest of the queue against an
+   exhausted account;
+2. removes every task that isn't `DONE` from `spec/STATUS.md`. Otherwise
+   the next run would see the interrupted task as `FAILED` and never pick
+   it up. The next sync re-adds those tasks as `QUEUED`, and each one
+   resumes from the plan and reviews already on disk;
+3. sleeps until the reset time from the error message plus
+   `--reset-buffer`, or `--fallback-wait` if the message has no reset time.
+   It re-checks the wall clock every 30s, so a Mac that slept through the
+   reset time restarts within 30s of waking up;
+4. starts diadoche again with the same flags.
+
+Only a usage-limit error triggers a restart. For any other exit, the
+restarter exits with diadoche's own exit status. Spend limits and team
+budgets are not restarted, because waiting doesn't lift them.
+
+Flags:
+
+- `--diadoche-bin`: the diadoche binary (default: the `diadoche` next to
+  `diadoche-restarter`, else `diadoche` on `$PATH`).
+- `--reset-buffer`: extra wait after the reported reset time (default `2m`).
+- `--fallback-wait`: wait when the reset time can't be parsed (default `30m`).
+- `--max-restarts`: give up after this many restarts (default `0` =
+  unlimited).
