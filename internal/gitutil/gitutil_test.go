@@ -216,3 +216,47 @@ func TestDiffSinceAndUntrackedFilesReflectWorkerChanges(t *testing.T) {
 		t.Fatalf("expected restricted diff to mention a.txt, got %q", restricted)
 	}
 }
+
+func TestParkAndRestoreBeforeFirstCommit(t *testing.T) {
+	requireGit(t)
+	setTestGitEnv(t)
+	dir := t.TempDir()
+	ctx := context.Background()
+	if err := EnsureRepo(ctx, dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sub", "a[1].txt"), []byte("a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base, _ := BaseCommit(ctx, dir)
+
+	paths, err := ChangedPathsExcluding(ctx, dir, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 1 || paths[0] != "sub/a[1].txt" {
+		t.Fatalf("changed paths = %v", paths)
+	}
+	commit, err := ParkPaths(ctx, dir, base, "parked", "park", paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, _ := run(ctx, dir, "rev-list", "--count", commit); strings.TrimSpace(out) != "1" {
+		t.Errorf("parked commit should be parentless, rev-list --count = %q", out)
+	}
+	if err := RestorePaths(ctx, dir, base, paths); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "sub")); !os.IsNotExist(err) {
+		t.Errorf("sub/ should be gone after restoring to the empty tree, stat err = %v", err)
+	}
+	if out, _ := run(ctx, dir, "symbolic-ref", "-q", "HEAD"); strings.TrimSpace(out) == "refs/heads/parked" {
+		t.Error("parking must not switch branches")
+	}
+	if _, err := ParkPaths(ctx, dir, base, "parked", "again", paths); err == nil {
+		t.Error("ParkPaths must never overwrite an existing branch")
+	}
+}

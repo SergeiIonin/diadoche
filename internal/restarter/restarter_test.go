@@ -16,7 +16,7 @@ import (
 	"diadoche/internal/specs"
 )
 
-func TestResetStatusKeepsOnlyDone(t *testing.T) {
+func TestResetStatusKeepsOnlyDoneAndParkedFailed(t *testing.T) {
 	l := specs.NewLayout(t.TempDir())
 	if err := l.Ensure(); err != nil {
 		t.Fatal(err)
@@ -26,8 +26,14 @@ func TestResetStatusKeepsOnlyDone(t *testing.T) {
 		{Num: "002", Spec: "002_b.md", Status: specs.StatusFailed},
 		{Num: "003", Spec: "003_c.md", Status: specs.StatusInProgress},
 		{Num: "004", Spec: "004_d.md", Status: specs.StatusQueued},
+		{Num: "005", Spec: "005_e.md", Status: specs.StatusFailed},
 	}
 	if err := specs.WriteStatus(l.StatusPath, rows); err != nil {
+		t.Fatal(err)
+	}
+	// 005 FAILED for real and was parked; 002 was only marked FAILED by the
+	// interruption, so it must be re-queued.
+	if err := os.WriteFile(filepath.Join(l.SpecDir, "005_FAILED.md"), []byte("parked"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	leftover := filepath.Join(l.SpecDir, ".QUEUE.md.tmp123")
@@ -46,8 +52,8 @@ func TestResetStatusKeepsOnlyDone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].Spec != "001_a.md" {
-		t.Errorf("STATUS.md rows = %+v, want only 001_a.md", got)
+	if len(got) != 2 || got[0].Spec != "001_a.md" || got[1].Spec != "005_e.md" {
+		t.Errorf("STATUS.md rows = %+v, want only 001_a.md and 005_e.md", got)
 	}
 	if _, err := os.Stat(leftover); !os.IsNotExist(err) {
 		t.Errorf("interrupted-write temp file not cleaned up: %v", err)

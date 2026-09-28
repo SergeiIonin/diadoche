@@ -6,6 +6,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"diadoche/internal/speclock"
 	"diadoche/internal/specs"
 	"diadoche/internal/usage"
+	"diadoche/internal/usagelimit"
 )
 
 // lockTimeout bounds how long the main loop waits for the spec directory
@@ -130,6 +132,11 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			processedAny = true
 			if err := o.processTask(ctx, next, planner, worker, tester, matchedSkills, uw); err != nil {
 				o.Log.Printf("task %s: error: %v", next, err)
+				var fatal *fatalError
+				if errors.As(err, &fatal) {
+					o.printUsageSummary(uw)
+					return fatal.err
+				}
 				consecutiveFailures++
 				if consecutiveFailures >= maxConsecutiveFailures {
 					o.printUsageSummary(uw)
@@ -172,15 +179,55 @@ func (o *Orchestrator) syncQueueLocked() error {
 
 func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner, worker, tester *agents.Agent, skillNames []string, uw *usage.Writer) error {
 	o.Log.Printf("=== task %s ===", specFile)
+	num := specs.TaskNumber(specFile)
+
+	var ws *workspace
+	if !o.Cfg.DryRun {
+		var err error
+		ws, err = o.prepareWorkspace(ctx, specFile, num)
+		if err != nil {
+			return &fatalError{err}
+		}
+	}
+
 	if err := specs.SetStatus(o.Layout, specFile, specs.StatusInProgress); err != nil {
 		return err
 	}
 
-	num := specs.TaskNumber(specFile)
+	done, cause := o.runIterations(ctx, specFile, num, ws, planner, worker, tester, skillNames, uw)
+	if cause != nil && usagelimit.Mentions(cause.Error()) {
+		// Not a failure: the account's usage window ran out. Nothing is
+		// parked and the task stays IN_PROGRESS, so the next run (e.g. by
+		// diadoche-restarter once the window reopens) resumes it with its
+		// changes still in the working tree.
+		o.Log.Printf("task %s: interrupted by a claude usage limit; leaving it IN_PROGRESS with its changes in place", specFile)
+		return &fatalError{cause}
+	}
+	if done {
+		o.Log.Printf("task %s: DONE", specFile)
+		if ws != nil {
+			ws.removeBaseFile()
+		}
+		return o.commitDone(ctx, specFile)
+	}
+	if cause == nil {
+		o.Log.Printf("task %s: FAILED after %d iteration(s)", specFile, o.Cfg.Iter)
+	}
+	if err := o.failTask(ctx, specFile, num, ws, cause); err != nil {
+		return &fatalError{fmt.Errorf("task %s: park FAILED changes: %w", specFile, err)}
+	}
+	return cause
+}
+
+// runIterations runs up to cfg.Iter planner/worker/tester rounds for one
+// task. done reports whether tester marked the task DONE; a non-nil err is
+// why the task was cut short (an agent error, --max-call-cost, ...). Both
+// false and nil means the iteration budget ran out.
+func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, ws *workspace, planner, worker, tester *agents.Agent, skillNames []string, uw *usage.Writer) (done bool, err error) {
 	specPath := filepath.Join(o.Layout.SpecDir, specFile)
 	specContent, err := os.ReadFile(specPath)
 	if err != nil {
-		return o.failTask(specFile, fmt.Errorf("read spec file: %w", err))
+		return false, fmt.Errorf("read spec file: %w", err)
 	}
 
 	skillsNote := ""
@@ -191,30 +238,6 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 	implPlanFile := fmt.Sprintf("%s_IMPL_PLAN.md", num)
 	implPlanPath := filepath.Join(o.Layout.SpecDir, implPlanFile)
 
-	// The commit this task's changes are diffed against for tester (see
-	// below). Recomputed fresh on every processTask call rather than
-	// persisted to disk: since diadoche only ever commits a task's own
-	// changes once it reaches DONE (commitDone), any commits that land
-	// between a crash and a restart belong to other tasks and become part
-	// of the new HEAD — so `git diff <fresh HEAD>` still isolates exactly
-	// this task's own (still-uncommitted) changes.
-	//
-	// excludeDirs are o.Layout.Root and o.Layout.AgentsDir, relative to
-	// o.Cfg.Dir (normally ".claude/diadoche" and ".claude/agents") —
-	// diadoche's own bookkeeping and agent-config files live there, and
-	// worker is never asked to touch them, so they're excluded from every
-	// diff/untracked-file computation below to keep them from showing up as
-	// if they were part of the worker's own change.
-	var base string
-	var excludeDirs []string
-	if !o.Cfg.DryRun {
-		base, err = gitutil.BaseCommit(ctx, o.Cfg.Dir)
-		if err != nil {
-			return o.failTask(specFile, fmt.Errorf("git base commit: %w", err))
-		}
-		excludeDirs = relExcludeDirs(o.Cfg.Dir, o.Layout.Root, o.Layout.AgentsDir)
-	}
-
 	// Resume point after a crash: skip iterations whose review already
 	// exists on disk (planner/worker/tester already ran for them before the
 	// process died) instead of always restarting this task from iteration 1
@@ -224,7 +247,6 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 		o.Log.Printf("%s: resuming at iteration %d/%d (found review(s) from a previous run)", specFile, startIter, o.Cfg.Iter)
 	}
 
-	done := false
 	for iter := startIter; iter <= o.Cfg.Iter; iter++ {
 		o.Log.Printf("--- %s iteration %d/%d ---", specFile, iter, o.Cfg.Iter)
 
@@ -266,10 +288,10 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 			result, err := o.Runner.Run(ctx, o.Cfg.Dir, planner, plannerPrompt)
 			o.recordUsage(uw, specFile, "planner", iter, planner.Model, result)
 			if err != nil {
-				return o.failTask(specFile, fmt.Errorf("planner: %w", err))
+				return false, fmt.Errorf("planner: %w", err)
 			}
 			if err := o.checkCallCost("planner", result); err != nil {
-				return o.failTask(specFile, err)
+				return false, err
 			}
 
 			planBytes, _ := os.ReadFile(implPlanPath)
@@ -281,7 +303,7 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 						"both sections in full, using exactly these headings.",
 					implPlanFile, implplan.FilesHeading, implplan.TestCommandHeading)
 				if err := os.WriteFile(reviewPath, []byte(note), 0o644); err != nil {
-					return o.failTask(specFile, fmt.Errorf("write plan-contract review: %w", err))
+					return false, fmt.Errorf("write plan-contract review: %w", err)
 				}
 				o.Log.Printf("%s iteration %d: %s is missing the required Files/Test Command sections; retrying planner next iteration", specFile, iter, implPlanFile)
 				continue
@@ -290,7 +312,7 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 
 		implPlanBytes, err := os.ReadFile(implPlanPath)
 		if err != nil {
-			return o.failTask(specFile, fmt.Errorf("read impl plan: %w", err))
+			return false, fmt.Errorf("read impl plan: %w", err)
 		}
 		plan := string(implPlanBytes)
 
@@ -303,10 +325,10 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 		workerResult, err := o.Runner.Run(ctx, o.Cfg.Dir, worker, workerPrompt)
 		o.recordUsage(uw, specFile, "worker", iter, worker.Model, workerResult)
 		if err != nil {
-			return o.failTask(specFile, fmt.Errorf("worker: %w", err))
+			return false, fmt.Errorf("worker: %w", err)
 		}
 		if err := o.checkCallCost("worker", workerResult); err != nil {
-			return o.failTask(specFile, err)
+			return false, err
 		}
 
 		testCommand := implplan.TestCommand(plan)
@@ -314,15 +336,15 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 		diffForTester := "[dry-run] diff computation skipped"
 		diffNote := ""
 		if !o.Cfg.DryRun {
-			diff, err := gitutil.DiffSinceExcluding(ctx, o.Cfg.Dir, base, excludeDirs...)
+			diff, err := gitutil.DiffSinceExcluding(ctx, o.Cfg.Dir, ws.base, ws.exclude...)
 			if err != nil {
-				return o.failTask(specFile, fmt.Errorf("git diff: %w", err))
+				return false, fmt.Errorf("git diff: %w", err)
 			}
 			untrackedAll, err := gitutil.UntrackedFiles(ctx, o.Cfg.Dir)
 			if err != nil {
-				return o.failTask(specFile, fmt.Errorf("git ls-files: %w", err))
+				return false, fmt.Errorf("git ls-files: %w", err)
 			}
-			untracked := excludeUnder(untrackedAll, excludeDirs)
+			untracked := excludeUnder(untrackedAll, ws.exclude)
 
 			if strings.TrimSpace(diff) == "" && len(untracked) == 0 {
 				o.Log.Printf("%s iteration %d: empty diff after worker, skipping tester (iteration unsuccessful)", specFile, iter)
@@ -330,13 +352,13 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 			}
 
 			if len(diff) > o.Cfg.MaxDiffBytes {
-				stat, err := gitutil.DiffStatSinceExcluding(ctx, o.Cfg.Dir, base, excludeDirs...)
+				stat, err := gitutil.DiffStatSinceExcluding(ctx, o.Cfg.Dir, ws.base, ws.exclude...)
 				if err != nil {
-					return o.failTask(specFile, fmt.Errorf("git diff --stat: %w", err))
+					return false, fmt.Errorf("git diff --stat: %w", err)
 				}
-				restricted, err := gitutil.DiffSinceForFiles(ctx, o.Cfg.Dir, base, implplan.Files(plan))
+				restricted, err := gitutil.DiffSinceForFiles(ctx, o.Cfg.Dir, ws.base, implplan.Files(plan))
 				if err != nil {
-					return o.failTask(specFile, fmt.Errorf("git diff for plan files: %w", err))
+					return false, fmt.Errorf("git diff for plan files: %w", err)
 				}
 				diffForTester = stat + "\n\n" + restricted
 				diffNote = fmt.Sprintf(" (exceeded --max-diff-bytes=%d; showing `git diff --stat` plus the diff restricted to the plan's %s list)", o.Cfg.MaxDiffBytes, implplan.FilesHeading)
@@ -361,33 +383,26 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 		testerResult, err := o.Runner.Run(ctx, o.Cfg.Dir, tester, testerPrompt)
 		o.recordUsage(uw, specFile, "tester", iter, tester.Model, testerResult)
 		if err != nil {
-			return o.failTask(specFile, fmt.Errorf("tester: %w", err))
+			return false, fmt.Errorf("tester: %w", err)
 		}
 
 		status, err := specs.GetStatus(o.Layout, specFile)
 		if err != nil {
-			return o.failTask(specFile, err)
+			return false, err
 		}
 		if status == specs.StatusDone {
 			// A task that just reached DONE is never failed for cost after
 			// the fact — that would throw away completed work for no
 			// benefit, since there's no further spend left to prevent this
 			// iteration was the last call regardless.
-			done = true
-			break
+			return true, nil
 		}
 		if err := o.checkCallCost("tester", testerResult); err != nil {
-			return o.failTask(specFile, err)
+			return false, err
 		}
 	}
 
-	if done {
-		o.Log.Printf("task %s: DONE", specFile)
-		return o.commitDone(ctx, specFile)
-	}
-
-	o.Log.Printf("task %s: FAILED after %d iteration(s)", specFile, o.Cfg.Iter)
-	return specs.SetStatus(o.Layout, specFile, specs.StatusFailed)
+	return false, nil
 }
 
 // checkCallCost enforces --max-call-cost: if result carries a parsed cost
@@ -486,20 +501,6 @@ func lastCompletedIteration(specDir, num string, maxIter int) int {
 		}
 	}
 	return last
-}
-
-// failTask marks specFile FAILED (best-effort — a broken STATUS.md write is
-// logged but doesn't shadow the original cause) and returns cause unchanged.
-// Every early return out of processTask's iteration loop must go through
-// this: leaving a task at IN_PROGRESS after an error would make the next
-// sync's crash-recovery logic (meant to resume work a killed process left
-// unfinished) re-queue it forever within this same, still-running process —
-// exactly the tight retry loop that motivated adding this helper.
-func (o *Orchestrator) failTask(specFile string, cause error) error {
-	if err := specs.SetStatus(o.Layout, specFile, specs.StatusFailed); err != nil {
-		o.Log.Printf("task %s: also failed to record FAILED status: %v", specFile, err)
-	}
-	return cause
 }
 
 // commitDone commits everything the planner/worker/tester changed for a

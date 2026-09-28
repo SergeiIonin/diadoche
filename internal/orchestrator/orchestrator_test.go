@@ -137,8 +137,8 @@ func TestRunCommitsWhenTaskBecomesDone(t *testing.T) {
 	}
 }
 
-// alwaysFailRunner simulates a systemic failure (e.g. a usage-limited claude
-// CLI): every call for the named agent errors out, exactly like
+// alwaysFailRunner simulates a systemic failure (e.g. a misconfigured
+// claude CLI): every call for the named agent errors out, exactly like
 // exec.Command returning a non-zero exit.
 type alwaysFailRunner struct {
 	failOn string
@@ -146,7 +146,7 @@ type alwaysFailRunner struct {
 
 func (r alwaysFailRunner) Run(_ context.Context, _ string, a *agents.Agent, _ string) (agents.RunResult, error) {
 	if a.Name == r.failOn {
-		return agents.RunResult{}, errors.New("simulated: usage limit reached")
+		return agents.RunResult{}, errors.New("simulated: claude exited with status 1")
 	}
 	return agents.RunResult{}, nil
 }

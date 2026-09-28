@@ -39,7 +39,7 @@ const helpSynopsis = `SYNOPSIS
              [--dry-run] [--claude-bin <path>] [--max-diff-bytes <n>]
              [--planner-model <name>] [--worker-model <name>]
              [--tester-model <name>] [--max-call-minutes <n>]
-             [--max-call-cost <usd>]
+             [--max-call-cost <usd>] [--allow-dirty]
     diadoche --preprocess --task <path> [--dir <path>] [--claude-bin <path>]
              [--preprocessor-model <name>]
     diadoche --initialize <project-path>
@@ -99,6 +99,25 @@ const helpDescription = `DESCRIPTION
     not called at all — the iteration is immediately unsuccessful. A diff
     over --max-diff-bytes is replaced with 'git diff --stat' plus a diff
     restricted to the files listed in "## Files" of the plan.
+
+    FAILED TASKS: every task starts from a clean working tree. When a task
+    becomes FAILED (iterations exhausted, an agent error, --max-call-cost),
+    its changes since the diff base (outside .claude/diadoche/ and
+    .claude/agents/) are committed to a new branch
+    diadoche/failed/<NNN>-<slug> without switching branches, then reverted
+    in the working tree. The task's bookkeeping (plan, reviews, STATUS.md,
+    ...) is committed to the current branch as "diadoche: FAILED <spec>",
+    and spec/<NNN>_FAILED.md names the branch and how to bring the changes
+    back. A usage-limit error is not a failure: nothing is parked, the task
+    stays IN_PROGRESS and diadoche exits, so diadoche-restarter can resume
+    it later with its changes in place.
+
+    Before a task starts from scratch, diadoche refuses to run if the
+    working tree already has uncommitted changes outside .claude/diadoche/
+    and .claude/agents/ (they would otherwise be parked with the task's
+    own). --allow-dirty skips this check; such files are then never
+    parked. A task resumed after a restart keeps its own changes and the
+    diff base recorded in spec/<NNN>_BASE at its first start.
 
 `
 
@@ -183,6 +202,15 @@ FILES
         Optional skill folders; matched against --langs/--frameworks and
         mentioned to the agents when relevant.
 
+    <project>/.claude/diadoche/spec/NNN_BASE
+        The diff base commit of a task in progress (plus, with
+        --allow-dirty, the files that were already dirty when it started).
+        Removed once the task is DONE or parked.
+
+    <project>/.claude/diadoche/spec/NNN_FAILED.md
+        Written when a task FAILED: the branch its changes were parked on,
+        their diff --stat, the last review, and how to restore them.
+
     <project>/.claude/diadoche/usage.jsonl
         One JSON line per agent call: time, task, agent, iteration, model,
         token counts, cost (USD), duration.
@@ -256,6 +284,11 @@ type Config struct {
 	// task from continuing once a call has already turned out to be far
 	// more expensive than expected. 0 = no limit (default).
 	MaxCallCostUSD float64
+
+	// AllowDirty lets a task start even though the working tree already
+	// has uncommitted changes outside diadoche's own directories. Those
+	// files are then left alone when a FAILED task is parked.
+	AllowDirty bool
 }
 
 // TaskPath resolves --task relative to --dir, unless it's already absolute.
@@ -287,6 +320,7 @@ func Parse(args []string) (*Config, error) {
 	testerModel := fs.String("tester-model", "", "override the tester agent's model (else $DIADOCHE_TESTER_MODEL, else .claude/agents/tester.md, else built-in default)")
 	preprocessorModel := fs.String("preprocessor-model", "", "override the preprocessor agent's model (else $DIADOCHE_PREPROCESSOR_MODEL, else .claude/agents/preprocessor.md, else built-in default)")
 	maxCallMinutes := fs.Int("max-call-minutes", 0, "kill a single agent call if it runs longer than this many minutes (0 = no limit)")
+	allowDirty := fs.Bool("allow-dirty", false, "start a task even if the working tree already has uncommitted changes; those files are never parked when the task FAILS")
 	maxCallCost := fs.Float64("max-call-cost", 0, "fail the task if a single agent call's cost in USD exceeds this — checked after the call returns, so it cannot preempt the spend (0 = no limit)")
 
 	if err := fs.Parse(args); err != nil {
@@ -337,6 +371,7 @@ func Parse(args []string) (*Config, error) {
 		PreprocessorModel: resolveModelOverride(*preprocessorModel, "DIADOCHE_PREPROCESSOR_MODEL"),
 		MaxCallMinutes:    *maxCallMinutes,
 		MaxCallCostUSD:    *maxCallCost,
+		AllowDirty:        *allowDirty,
 	}, nil
 }
 

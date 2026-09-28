@@ -5,14 +5,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
-)
 
-// limitRe matches the claude CLI's "account usage window exhausted"
-// messages, in both the current wording ("You've hit your session limit ·
-// resets 7pm (Europe/Moscow)", "You've hit your weekly limit · resets
-// Oct 7, 5pm (...)") and the legacy one ("Claude AI usage limit
-// reached|1759770000").
-var limitRe = regexp.MustCompile(`(?i)you[’']ve hit your (?:[\w’'-]+ )*?limit|usage limit reached|session limit reached|weekly limit reached`)
+	"diadoche/internal/usagelimit"
+)
 
 // epochRe extracts a reset time given as a unix timestamp: the legacy
 // "usage limit reached|<epoch>" format, or a resets_at/resetsAt field.
@@ -24,22 +19,9 @@ var tzRe = regexp.MustCompile(`^(.*?)\s*\(([^)]*)\)\s*$`)
 // inRe matches a relative reset time: "in 2h 30m", "in 45m", "in 3h".
 var inRe = regexp.MustCompile(`^in\s+(?:(\d+)\s*d)?\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?$`)
 
-// IsLimitLine reports whether line is a claude usage-limit error. The line
-// must also mention "error" (diadoche's own "task X: error: ..." log line,
-// or the claude CLI's `"is_error":true` JSON), so an agent that merely
-// talks about limits in a successful answer never triggers a restart.
-// Spend limits and shared budgets are excluded: waiting doesn't lift them.
-func IsLimitLine(line string) bool {
-	m := limitRe.FindString(line)
-	if m == "" {
-		return false
-	}
-	lower := strings.ToLower(m)
-	if strings.Contains(lower, "spend") || strings.Contains(lower, "budget") {
-		return false
-	}
-	return strings.Contains(strings.ToLower(line), "error")
-}
+// IsLimitLine reports whether line is a claude usage-limit error; see
+// usagelimit.IsLimitLine.
+func IsLimitLine(line string) bool { return usagelimit.IsLimitLine(line) }
 
 // ParseResetTime extracts the moment the usage window reopens from a limit
 // line (see IsLimitLine). ok is false when the line carries no reset time

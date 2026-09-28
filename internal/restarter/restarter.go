@@ -230,7 +230,9 @@ func sleepUntil(ctx context.Context, wake time.Time, now func() time.Time, poll 
 
 // ResetStatus removes every row but DONE ones from STATUS.md, returning the
 // removed specs. The next diadoche run's sync re-adds those task files as
-// QUEUED, and resumes each one from the plan/reviews already on disk.
+// QUEUED, and resumes each one from the plan/reviews already on disk. A
+// FAILED task whose changes diadoche already parked (it has a
+// spec/<NNN>_FAILED.md) genuinely failed, so it's kept as is.
 func ResetStatus(l specs.Layout) ([]string, error) {
 	lock, err := speclock.Acquire(l.SpecDir, lockTimeout)
 	if err != nil {
@@ -253,7 +255,7 @@ func ResetStatus(l specs.Layout) ([]string, error) {
 	var kept []specs.Row
 	var removed []string
 	for _, row := range rows {
-		if row.Status == specs.StatusDone {
+		if row.Status == specs.StatusDone || row.Status == specs.StatusFailed && parked(l, row.Spec) {
 			kept = append(kept, row)
 		} else {
 			removed = append(removed, row.Spec)
@@ -263,6 +265,12 @@ func ResetStatus(l specs.Layout) ([]string, error) {
 		return nil, nil
 	}
 	return removed, specs.WriteStatus(l.StatusPath, kept)
+}
+
+// parked reports whether diadoche parked specFile's changes when it FAILED.
+func parked(l specs.Layout, specFile string) bool {
+	_, err := os.Stat(filepath.Join(l.SpecDir, specs.TaskNumber(specFile)+"_FAILED.md"))
+	return err == nil
 }
 
 // lineWatcher passes everything written to it straight through to out,

@@ -13,6 +13,8 @@ func TestDiscoverTaskFilesExcludesGenerated(t *testing.T) {
 		"01-legacy-style.md",
 		"001_IMPL_PLAN.md",
 		"001_REVIEW_1.md",
+		"001_FAILED.md",
+		"001_BASE",
 		"STATUS.md",
 		"QUEUE.md",
 		"notes.txt",

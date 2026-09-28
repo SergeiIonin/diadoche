@@ -70,6 +70,9 @@ Flags:
   this many minutes (default 0 = no limit). See "Per-call budget" below.
 - `--max-call-cost` — fail the task if a single agent call's cost (USD)
   exceeds this (default 0 = no limit). See "Per-call budget" below.
+- `--allow-dirty` — start a task even if the working tree already has
+  uncommitted changes; those files are never parked if the task fails. See
+  "FAILED tasks" below.
 - `-h` / `-help` / `--help` — print the full man-page-style help and exit.
 
 ## Preprocessor (`--preprocess`)
@@ -120,7 +123,8 @@ preprocessor) are guarded by a `spec/.lock` file lock, so a concurrent
      genuinely done, sets `spec/STATUS.md` to `DONE` itself.
 3. Once tester marks a task `DONE`, diadoche moves on to the next task in
    the queue. If iterations run out without `DONE`, diadoche itself sets
-   `FAILED`.
+   `FAILED` and parks the task's changes on a side branch (see "FAILED
+   tasks" below).
 4. From the 2nd iteration on, planner and worker also get the previous
    `spec/NNN_REVIEW_M.md` in their context.
 
@@ -166,9 +170,11 @@ upgrading never silently kills a call that used to be allowed to run long.
 
 ## Diff-scoped tester
 
-Before a task's first iteration, diadoche records the current commit (or,
-before the repo's first-ever commit, git's empty-tree hash) as that task's
-diff base. Before each tester call it computes `git diff <base>` plus any
+When a task first starts, diadoche records the current commit (or, before
+the repo's first-ever commit, git's empty-tree hash) as that task's diff
+base, in `spec/NNN_BASE`. A task resumed after a restart reads its base
+back from there instead of taking the current HEAD. The file is removed
+once the task is `DONE` or parked. Before each tester call it computes `git diff <base>` plus any
 untracked files since that base — excluding `.claude/diadoche/` and
 `.claude/agents/`, diadoche's own bookkeeping/config, so those never look
 like part of the worker's change.
@@ -177,6 +183,47 @@ like part of the worker's change.
   all** — the iteration is immediately treated as unsuccessful.
 - A diff over `--max-diff-bytes` is replaced with `git diff --stat` plus a
   diff restricted to the files listed in the plan's `## Files` section.
+
+## FAILED tasks
+
+Every task starts from a clean working tree, and the work of a failed task
+isn't lost. When a task becomes `FAILED` (iterations ran out, an agent call
+errored, `--max-call-cost` was exceeded, ...), diadoche parks its changes:
+
+1. Every change since the task's diff base (modified, deleted and new
+   non-ignored files), except `.claude/diadoche/` and `.claude/agents/`, is
+   committed to a new branch `diadoche/failed/<NNN>-<slug>`, created from
+   the diff base. The commit is built in a temporary index, so the current
+   branch, HEAD and the index stay where they are. If that branch name is
+   taken (the task failed before), a `-2`, `-3`, ... suffix is added.
+2. Those files are reverted in the working tree: modified and deleted ones
+   are restored, new ones are removed.
+3. `spec/NNN_FAILED.md` is written: the reason, the branch name, the
+   `git diff --stat` of what was parked, the last review, and how to bring
+   the changes back (`git checkout diadoche/failed/... -- <paths>`, or
+   `git merge diadoche/failed/...`).
+4. The task's bookkeeping (plan, reviews, `_FAILED.md`, `STATUS.md`,
+   `QUEUE.md`, `usage.jsonl`) is committed to the current branch as
+   `diadoche: FAILED <spec>`, so history records the attempt without the
+   failed code.
+
+If the task changed no code, no branch is created, and `_FAILED.md` says
+so. Parking logs one line with the branch name and the number of files.
+
+A claude usage-limit error is not a failure. Nothing is parked: the task
+stays `IN_PROGRESS` with its changes in the working tree, and diadoche
+exits, so `diadoche-restarter` (or the next manual run) resumes it.
+
+Before a task starts from scratch, diadoche checks the working tree. If
+there are uncommitted changes outside `.claude/diadoche/` and
+`.claude/agents/`, it doesn't start the task and exits with an error that
+lists the files: if the task failed, they would be parked along with the
+task's own. Commit or stash them, or pass `--allow-dirty`. With
+`--allow-dirty`, the files that were already changed before the task
+started are never parked or reverted, so only the task's own changes are
+parked. A task resumed after a restart (it has a `spec/NNN_BASE`, a plan or
+reviews on disk) skips the check, because the changes in the tree are its
+own.
 
 ## Usage accounting
 
@@ -205,9 +252,10 @@ sees one, it:
 1. stops diadoche and any claude call still running right away, so
    diadoche doesn't go on to fail the rest of the queue against an
    exhausted account;
-2. removes every task that isn't `DONE` from `spec/STATUS.md`. Otherwise
-   the next run would see the interrupted task as `FAILED` and never pick
-   it up. The next sync re-adds those tasks as `QUEUED`, and each one
+2. removes every task that isn't `DONE` from `spec/STATUS.md`, except
+   `FAILED` tasks that diadoche already parked (they have a
+   `spec/NNN_FAILED.md`). Otherwise the next run could see the interrupted
+   task as `FAILED` and never pick it up. The next sync re-adds those tasks as `QUEUED`, and each one
    resumes from the plan and reviews already on disk;
 3. sleeps until the reset time from the error message plus
    `--reset-buffer`, or `--fallback-wait` if the message has no reset time.

@@ -1,6 +1,7 @@
-// Package gitutil provides the minimal git operations diadoche needs to
-// commit a task's changes once it's DONE: making sure a repo exists, and
-// staging + committing whatever the worker/tester agents changed.
+// Package gitutil provides the minimal git operations diadoche needs:
+// making sure a repo exists, diffing a task's changes against its base,
+// committing them once the task is DONE, and parking them on a side branch
+// once it FAILED.
 package gitutil
 
 import (
@@ -8,7 +9,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -186,6 +190,202 @@ func CommitAll(ctx context.Context, dir, message string) error {
 	commit.Stderr = &commitOut
 	if err := commit.Run(); err != nil {
 		return fmt.Errorf("git commit: %w: %s", err, commitOut.String())
+	}
+	return nil
+}
+
+// runEnv is run with extra environment variables on top of the current
+// process's environment.
+func runEnv(ctx context.Context, dir string, env []string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), env...)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	err := cmd.Run()
+	return out.String(), err
+}
+
+// literalPathspecs makes git treat every path argument as a literal file
+// name, so a path containing glob characters ("[", "*") never matches more
+// than itself.
+const literalPathspecs = "GIT_LITERAL_PATHSPECS=1"
+
+// splitNUL splits `-z` output into its non-empty fields.
+func splitNUL(out string) []string {
+	var fields []string
+	for f := range strings.SplitSeq(out, "\x00") {
+		if f != "" {
+			fields = append(fields, f)
+		}
+	}
+	return fields
+}
+
+// ChangedPathsExcluding returns every path whose working-tree state
+// differs from base — modified, deleted, and new (untracked, not ignored)
+// files — except those under excludeDirs, sorted and deduplicated.
+func ChangedPathsExcluding(ctx context.Context, dir, base string, excludeDirs ...string) ([]string, error) {
+	spec := excludePathspec(excludeDirs)
+	diffArgs := append([]string{"diff", "--name-only", "--no-renames", "-z", base}, spec...)
+	diffOut, err := run(ctx, dir, diffArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("git diff --name-only: %w: %s", err, diffOut)
+	}
+	lsArgs := append([]string{"ls-files", "--others", "--exclude-standard", "-z"}, spec...)
+	lsOut, err := run(ctx, dir, lsArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("git ls-files: %w: %s", err, lsOut)
+	}
+	seen := map[string]bool{}
+	var paths []string
+	for _, p := range append(splitNUL(diffOut), splitNUL(lsOut)...) {
+		if !seen[p] {
+			seen[p] = true
+			paths = append(paths, p)
+		}
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+// BranchExists reports whether refs/heads/<branch> exists.
+func BranchExists(ctx context.Context, dir, branch string) bool {
+	_, err := run(ctx, dir, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
+	return err == nil
+}
+
+// ParkPaths commits the working-tree state of paths on top of base into a
+// new branch, and returns the new commit. It never touches HEAD, the
+// current branch, the index or the working tree: the commit is built in a
+// temporary index and written with `git commit-tree`. A base of git's
+// empty tree (no commits yet) yields a parentless commit.
+func ParkPaths(ctx context.Context, dir, base, branch, message string, paths []string) (string, error) {
+	tmpDir, err := os.MkdirTemp("", "diadoche-park-")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(tmpDir)
+	env := []string{"GIT_INDEX_FILE=" + filepath.Join(tmpDir, "index"), literalPathspecs}
+
+	if out, err := runEnv(ctx, dir, env, "read-tree", base); err != nil {
+		return "", fmt.Errorf("git read-tree: %w: %s", err, out)
+	}
+	addArgs := append([]string{"add", "-A", "--"}, paths...)
+	if out, err := runEnv(ctx, dir, env, addArgs...); err != nil {
+		return "", fmt.Errorf("git add (temporary index): %w: %s", err, out)
+	}
+	treeOut, err := runEnv(ctx, dir, env, "write-tree")
+	if err != nil {
+		return "", fmt.Errorf("git write-tree: %w: %s", err, treeOut)
+	}
+	commitArgs := []string{"commit-tree", strings.TrimSpace(treeOut), "-m", message}
+	if base != emptyTreeHash {
+		commitArgs = append(commitArgs, "-p", base)
+	}
+	commitOut, err := run(ctx, dir, commitArgs...)
+	if err != nil {
+		return "", fmt.Errorf("git commit-tree: %w: %s", err, commitOut)
+	}
+	commit := strings.TrimSpace(commitOut)
+	if out, err := run(ctx, dir, "update-ref", "refs/heads/"+branch, commit, ""); err != nil {
+		return "", fmt.Errorf("git update-ref %s: %w: %s", branch, err, out)
+	}
+	return commit, nil
+}
+
+// RestorePaths brings paths back to their state in base (a commit, or git's
+// empty tree), in both the index and the working tree: paths that exist in
+// base are checked out from it,
+// the rest (files new since base) are unstaged and deleted, along with any
+// directories that deleting them left empty.
+func RestorePaths(ctx context.Context, dir, base string, paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	env := []string{literalPathspecs}
+	lsArgs := append([]string{"ls-tree", "-r", "-z", "--name-only", base, "--"}, paths...)
+	lsOut, err := runEnv(ctx, dir, env, lsArgs...)
+	if err != nil {
+		return fmt.Errorf("git ls-tree: %w: %s", err, lsOut)
+	}
+	inBase := map[string]bool{}
+	for _, p := range splitNUL(lsOut) {
+		inBase[p] = true
+	}
+	var existing, added []string
+	for _, p := range paths {
+		if inBase[p] {
+			existing = append(existing, p)
+		} else {
+			added = append(added, p)
+		}
+	}
+
+	if len(existing) > 0 {
+		args := append([]string{"checkout", base, "--"}, existing...)
+		if out, err := runEnv(ctx, dir, env, args...); err != nil {
+			return fmt.Errorf("git checkout %s: %w: %s", base, err, out)
+		}
+	}
+	if len(added) > 0 {
+		args := append([]string{"rm", "-q", "--cached", "--ignore-unmatch", "--"}, added...)
+		if out, err := runEnv(ctx, dir, env, args...); err != nil {
+			return fmt.Errorf("git rm --cached: %w: %s", err, out)
+		}
+		for _, p := range added {
+			full := filepath.Join(dir, filepath.FromSlash(p))
+			if err := os.Remove(full); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			removeEmptyParents(dir, filepath.Dir(full))
+		}
+	}
+	return nil
+}
+
+// removeEmptyParents deletes d and its ancestors, up to but excluding
+// root, for as long as they're empty.
+func removeEmptyParents(root, d string) {
+	root = filepath.Clean(root)
+	for d = filepath.Clean(d); d != root && strings.HasPrefix(d, root+string(filepath.Separator)); d = filepath.Dir(d) {
+		if os.Remove(d) != nil { // fails on a non-empty directory
+			return
+		}
+	}
+}
+
+// DiffStat returns `git diff --stat from to`.
+func DiffStat(ctx context.Context, dir, from, to string) (string, error) {
+	out, err := run(ctx, dir, "diff", "--stat", from, to)
+	if err != nil {
+		return "", fmt.Errorf("git diff --stat: %w: %s", err, out)
+	}
+	return out, nil
+}
+
+// CommitPaths stages every change under paths and commits only those paths
+// with message, leaving anything else that happens to be staged out of the
+// commit. It is not an error if there is nothing to commit — that's a
+// no-op.
+func CommitPaths(ctx context.Context, dir, message string, paths ...string) error {
+	addArgs := append([]string{"add", "-A", "--"}, paths...)
+	if out, err := run(ctx, dir, addArgs...); err != nil {
+		return fmt.Errorf("git add: %w: %s", err, out)
+	}
+	diffArgs := append([]string{"diff", "--cached", "--quiet", "--"}, paths...)
+	_, err := run(ctx, dir, diffArgs...)
+	if err == nil {
+		return nil // nothing staged under paths
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		return fmt.Errorf("git diff --cached: %w", err)
+	}
+	commitArgs := append([]string{"commit", "-q", "-m", message, "--"}, paths...)
+	if out, err := run(ctx, dir, commitArgs...); err != nil {
+		return fmt.Errorf("git commit: %w: %s", err, out)
 	}
 	return nil
 }

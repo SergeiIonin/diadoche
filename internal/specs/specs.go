@@ -69,8 +69,9 @@ func (l Layout) Ensure() error {
 var taskFileRe = regexp.MustCompile(`^(\d+)[_-](.+)\.md$`)
 
 // generatedRe matches slugs produced by diadoche itself, which are not
-// user-authored task specs: NNN_IMPL_PLAN.md and NNN_REVIEW_<M>.md.
-var generatedRe = regexp.MustCompile(`(?i)^(IMPL_PLAN|REVIEW_\d+)$`)
+// user-authored task specs: NNN_IMPL_PLAN.md, NNN_REVIEW_<M>.md and
+// NNN_FAILED.md.
+var generatedRe = regexp.MustCompile(`(?i)^(IMPL_PLAN|REVIEW_\d+|FAILED)$`)
 
 // DiscoverTaskFiles lists user-authored task spec filenames in specDir,
 // excluding STATUS.md, QUEUE.md and diadoche-generated files.
