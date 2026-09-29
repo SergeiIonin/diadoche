@@ -112,3 +112,25 @@ func TestDryRunRunnerReturnsUnparsedZeroResult(t *testing.T) {
 		t.Fatal("expected DryRunRunner's result to never report Parsed=true")
 	}
 }
+
+func TestRunResultSummaryReportsTokensAndCost(t *testing.T) {
+	r := RunResult{
+		Usage:        Usage{InputTokens: 100, OutputTokens: 50, CacheCreationInputTokens: 10, CacheReadInputTokens: 5},
+		TotalCostUSD: 0.1234,
+		DurationMS:   61_400,
+		Parsed:       true,
+	}
+	got := r.Summary()
+	for _, want := range []string{"took 1m1s", "tokens: 165", "in=100", "out=50", "cache_write=10", "cache_read=5", "$0.1234"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Summary() missing %q; got: %s", want, got)
+		}
+	}
+}
+
+func TestRunResultSummaryUnparsed(t *testing.T) {
+	got := RunResult{DurationMS: 2000}.Summary()
+	if !strings.Contains(got, "tokens: unknown") {
+		t.Errorf("Summary() = %q, want it to report unknown tokens", got)
+	}
+}

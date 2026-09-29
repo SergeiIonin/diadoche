@@ -998,3 +998,75 @@ func TestProcessTaskDoesNotFailATaskThatReachedDoneEvenIfTesterCallWasExpensive(
 		t.Fatalf("status = %s, want DONE (completed work must not be discarded over cost after the fact)", status)
 	}
 }
+
+// fixedUsageRunner reports a fixed, parseable usage for every call.
+type fixedUsageRunner struct{}
+
+func (fixedUsageRunner) Run(context.Context, string, *agents.Agent, string) (agents.RunResult, error) {
+	return agents.RunResult{
+		Usage:        agents.Usage{InputTokens: 100, OutputTokens: 20},
+		TotalCostUSD: 0.01,
+		DurationMS:   1000,
+		Parsed:       true,
+	}, nil
+}
+
+func TestRunAgentLogsStartAndTokensWithIterationTally(t *testing.T) {
+	var buf strings.Builder
+	o := &Orchestrator{
+		Cfg:    config.Config{Iter: 3},
+		Runner: fixedUsageRunner{},
+		Log:    log.New(&buf, "", 0),
+	}
+	call := agentCall{specFile: "001_x.md", iter: 2, tally: &iterationTally{}}
+
+	for _, name := range []string{"planner", "worker"} {
+		if _, err := o.runAgent(context.Background(), call, &agents.Agent{Name: name, Model: "m"}, "p"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	out := buf.String()
+	for _, want := range []string{
+		"001_x.md iter 2/3: [planner] started (model=m)",
+		"001_x.md iter 2/3: [planner] finished",
+		"tokens: 120",
+		"iteration so far: 120 tokens, $0.0100",
+		"001_x.md iter 2/3: [worker] started",
+		"iteration so far: 240 tokens, $0.0200",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log missing %q; got:\n%s", want, out)
+		}
+	}
+}
+
+// slowRunner takes d to return, long enough for several heartbeats.
+type slowRunner struct{ d time.Duration }
+
+func (r slowRunner) Run(context.Context, string, *agents.Agent, string) (agents.RunResult, error) {
+	time.Sleep(r.d)
+	return agents.RunResult{}, nil
+}
+
+func TestRunAgentLogsHeartbeatWhileAgentRuns(t *testing.T) {
+	var buf strings.Builder
+	o := &Orchestrator{
+		Cfg:               config.Config{Iter: 1},
+		Runner:            slowRunner{d: 120 * time.Millisecond},
+		Log:               log.New(&buf, "", 0),
+		HeartbeatInterval: 20 * time.Millisecond,
+	}
+	call := agentCall{specFile: "001_x.md", iter: 1, tally: &iterationTally{}}
+	if _, err := o.runAgent(context.Background(), call, &agents.Agent{Name: "worker"}, "p"); err != nil {
+		t.Fatal(err)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "001_x.md iter 1/1: [worker] still running") {
+		t.Fatalf("expected a heartbeat line; got:\n%s", out)
+	}
+	if strings.LastIndex(out, "still running") > strings.Index(out, "[worker] finished") {
+		t.Fatalf("heartbeat logged after the agent finished; got:\n%s", out)
+	}
+}

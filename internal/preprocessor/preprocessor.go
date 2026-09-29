@@ -75,8 +75,14 @@ func Run(ctx context.Context, cfg config.Config) error {
 	prompt := buildPrompt(taskPath, string(rawContent), layout.SpecDir, existing)
 
 	logger.Printf("=== preprocessing %s ===", taskPath)
+	logger.Printf("[preprocessor] started (model=%s)", agent.Model)
 	result, runErr := runner.Run(ctx, cfg.Dir, agent, prompt)
 	recordUsage(logger, layout, cfg.DryRun, taskPath, agent.Model, result)
+	outcome := "finished"
+	if runErr != nil {
+		outcome = "failed"
+	}
+	logger.Printf("[preprocessor] %s — %s", outcome, result.Summary())
 	if runErr != nil {
 		return fmt.Errorf("preprocessor agent: %w", runErr)
 	}

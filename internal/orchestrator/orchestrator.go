@@ -35,11 +35,19 @@ const lockTimeout = 2 * time.Minute
 // `claude` CLI is rate-limited or misconfigured).
 const maxConsecutiveFailures = 3
 
+// defaultHeartbeatInterval is how often a still-running agent turn is
+// reported in the log when Orchestrator.HeartbeatInterval is unset.
+const defaultHeartbeatInterval = time.Minute
+
 type Orchestrator struct {
 	Cfg    config.Config
 	Layout specs.Layout
 	Runner agents.Runner
 	Log    *log.Logger
+
+	// HeartbeatInterval is how often runAgent logs that an agent is still
+	// running; zero means defaultHeartbeatInterval.
+	HeartbeatInterval time.Duration
 }
 
 func New(cfg config.Config) *Orchestrator {
@@ -249,6 +257,7 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 
 	for iter := startIter; iter <= o.Cfg.Iter; iter++ {
 		o.Log.Printf("--- %s iteration %d/%d ---", specFile, iter, o.Cfg.Iter)
+		call := agentCall{specFile: specFile, iter: iter, uw: uw, tally: &iterationTally{}}
 
 		reviewFile := fmt.Sprintf("%s_REVIEW_%d.md", num, iter)
 		reviewPath := filepath.Join(o.Layout.SpecDir, reviewFile)
@@ -285,8 +294,7 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 			}
 			plannerPrompt += fmt.Sprintf("\nWrite (or update) the implementation plan to %s.%s", implPlanPath, skillsNote)
 
-			result, err := o.Runner.Run(ctx, o.Cfg.Dir, planner, plannerPrompt)
-			o.recordUsage(uw, specFile, "planner", iter, planner.Model, result)
+			result, err := o.runAgent(ctx, call, planner, plannerPrompt)
 			if err != nil {
 				return false, fmt.Errorf("planner: %w", err)
 			}
@@ -322,8 +330,7 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 		}
 		workerPrompt += "\nImplement the plan in this repository." + skillsNote
 
-		workerResult, err := o.Runner.Run(ctx, o.Cfg.Dir, worker, workerPrompt)
-		o.recordUsage(uw, specFile, "worker", iter, worker.Model, workerResult)
+		workerResult, err := o.runAgent(ctx, call, worker, workerPrompt)
 		if err != nil {
 			return false, fmt.Errorf("worker: %w", err)
 		}
@@ -380,8 +387,7 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 			specFile, specContent, implPlanFile, plan, testCommand, diffNote, diffForTester, reviewPath, specFile, o.Layout.StatusPath)
 		testerPrompt += skillsNote
 
-		testerResult, err := o.Runner.Run(ctx, o.Cfg.Dir, tester, testerPrompt)
-		o.recordUsage(uw, specFile, "tester", iter, tester.Model, testerResult)
+		testerResult, err := o.runAgent(ctx, call, tester, testerPrompt)
 		if err != nil {
 			return false, fmt.Errorf("tester: %w", err)
 		}
@@ -403,6 +409,80 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 	}
 
 	return false, nil
+}
+
+// agentCall is where in the loop one agent turn happens: which task and
+// iteration it belongs to, where its usage is recorded, and the running
+// token/cost tally of the iteration it's part of.
+type agentCall struct {
+	specFile string
+	iter     int
+	uw       *usage.Writer
+	tally    *iterationTally
+}
+
+// iterationTally sums the parsed usage of every agent turn in one
+// iteration, so each turn's log line can also show the iteration so far.
+type iterationTally struct {
+	tokens  int
+	costUSD float64
+}
+
+// runAgent runs one agent turn, logging which agent is starting and, once
+// it returns, how long it took and how many tokens/dollars it spent —
+// alone and together with the iteration's earlier turns — then records it
+// to usage.jsonl.
+func (o *Orchestrator) runAgent(ctx context.Context, c agentCall, a *agents.Agent, prompt string) (agents.RunResult, error) {
+	prefix := fmt.Sprintf("%s iter %d/%d: [%s]", c.specFile, c.iter, o.Cfg.Iter, a.Name)
+	o.Log.Printf("%s started (model=%s)", prefix, a.Model)
+
+	stopHeartbeat := o.startHeartbeat(prefix)
+	result, err := o.Runner.Run(ctx, o.Cfg.Dir, a, prompt)
+	stopHeartbeat()
+	o.recordUsage(c.uw, c.specFile, a.Name, c.iter, a.Model, result)
+
+	if result.Parsed {
+		c.tally.tokens += result.Usage.Total()
+		c.tally.costUSD += result.TotalCostUSD
+	}
+	outcome := "finished"
+	if err != nil {
+		outcome = "failed"
+	}
+	o.Log.Printf("%s %s — %s | iteration so far: %d tokens, $%.4f",
+		prefix, outcome, result.Summary(), c.tally.tokens, c.tally.costUSD)
+	return result, err
+}
+
+// startHeartbeat logs "<prefix> still running (<elapsed>)" every
+// HeartbeatInterval until the returned stop func is called, so a long agent
+// turn is visibly alive rather than looking hung. stop waits for the
+// heartbeat goroutine to exit, so nothing is logged after it returns.
+func (o *Orchestrator) startHeartbeat(prefix string) (stop func()) {
+	interval := o.HeartbeatInterval
+	if interval <= 0 {
+		interval = defaultHeartbeatInterval
+	}
+	start := time.Now()
+	done := make(chan struct{})
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				o.Log.Printf("%s still running (%s)", prefix, time.Since(start).Round(time.Second))
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		<-exited
+	}
 }
 
 // checkCallCost enforces --max-call-cost: if result carries a parsed cost

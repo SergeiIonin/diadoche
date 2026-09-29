@@ -36,6 +36,25 @@ type RunResult struct {
 	Parsed       bool
 }
 
+// Total is every token the turn consumed: input, output and both kinds of
+// prompt-cache traffic.
+func (u Usage) Total() int {
+	return u.InputTokens + u.OutputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens
+}
+
+// Summary renders the turn's duration, token breakdown and cost as one
+// human-readable log fragment. Tokens/cost are reported as unknown when
+// the claude JSON result couldn't be parsed (e.g. --dry-run).
+func (r RunResult) Summary() string {
+	d := (time.Duration(r.DurationMS) * time.Millisecond).Round(time.Second)
+	if !r.Parsed {
+		return fmt.Sprintf("took %s, tokens: unknown", d)
+	}
+	u := r.Usage
+	return fmt.Sprintf("took %s, tokens: %d (in=%d out=%d cache_write=%d cache_read=%d), cost $%.4f",
+		d, u.Total(), u.InputTokens, u.OutputTokens, u.CacheCreationInputTokens, u.CacheReadInputTokens, r.TotalCostUSD)
+}
+
 // Runner launches one independent agent turn and returns its combined
 // output plus, when parseable, its resource usage.
 type Runner interface {
