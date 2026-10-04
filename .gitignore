@@ -2,3 +2,8 @@
 /diadoche-restarter
 README_RU.md
 .DS_Store
+
+# Russian-language local files (dev task specs, local agent overrides, report)
+/.claude/tasks/
+/.claude/agents/
+/REPORT.md
