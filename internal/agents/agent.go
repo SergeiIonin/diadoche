@@ -29,8 +29,9 @@ import (
 var defaultsFS embed.FS
 
 // DefaultNames lists every agent diadoche ships a built-in default prompt
-// for, in the order `--initialize` should scaffold them.
-var DefaultNames = []string{"planner", "worker", "tester", "preprocessor"}
+// for, in the order `--initialize` should scaffold them. adr-writer is the
+// agent of the optional --adr step.
+var DefaultNames = []string{"planner", "worker", "tester", "preprocessor", "adr-writer"}
 
 // DefaultPromptFile returns the raw bytes of the built-in default agent
 // definition file for name (frontmatter included), for scaffolding a

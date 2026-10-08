@@ -62,7 +62,7 @@ Flags:
 - `--initialize <project-path>` — scaffold `.claude/` in a project and
   exit; ignores every other flag. See above.
 - `--planner-model`, `--worker-model`, `--tester-model`,
-  `--preprocessor-model` — override one agent's model. Priority:
+  `--preprocessor-model`, `--adr-model` — override one agent's model. Priority:
   flag > `DIADOCHE_<AGENT>_MODEL` env var > `model:` in the project's
   `.claude/agents/<name>.md` > built-in default. Only the model is
   affected — a `.claude/agents/<name>.md` prompt override still applies
@@ -128,6 +128,11 @@ Flags:
 - `--escalation-model <name>` — model of planner and worker in the
   escalated iteration (else `DIADOCHE_ESCALATION_MODEL`, else
   `claude-fable-5-1`); validated at startup.
+- `--adr` — after a task is DONE and merged, turn its `## Decisions` into
+  architecture decision records under `docs/adr/` (off by default). See
+  "ADR step" below.
+- `--adr-model` — the `adr-writer` agent's model (also
+  `DIADOCHE_ADR_MODEL`; see "Model selection").
 - `-h` / `-help` / `--help` — print the full man-page-style help and exit.
 
 ## On-task-done hooks (`--on-task-done`)
@@ -155,6 +160,57 @@ Each command's output is kept as `on-task-done-<N>.stdout`/`.stderr` in the
 task's run directory (at most 1 MiB each). Changes the hooks leave in the
 repository (outside `.claude/diadoche`) are committed as
 `diadoche: on-task-done for <NNN>-<slug>`; no changes, no commit.
+
+## ADR step (`--adr`)
+
+Agents remember nothing between tasks, so a decision only survives as a file.
+With `--adr`, every task that is DONE and merged gets its decisions — the
+`## Decisions` worker reported, i.e. its `decisions.json` — written down as
+architecture decision records under `docs/adr/` in the repository root.
+
+The step is a built-in task-done handler: same trigger as the
+`--on-task-done` hooks, run first (the hooks then see the new ADRs), and,
+like them, never a task failure — a failure rolls `docs/adr/` back and the
+task's row says `DONE: adr step failed (...)`. Its changes are part of the
+same `diadoche: on-task-done for <NNN>-<slug>` commit.
+
+- A task without decisions (an empty or `none` section) skips the step
+  entirely: no agent call, no file, no cost.
+- Otherwise the `adr-writer` agent (built-in default `claude-sonnet-5-5`)
+  gets the decisions, the task's diff against its base commit and the current
+  index, and writes one ADR per decision as `docs/adr/TMP<k>-<slug>.md`
+  (`k` = the decision's position), titled `# TMP<k>. <Title>`.
+- diadoche, not the agent, assigns the numbers: the next free ones after the
+  existing ADRs, which are never renumbered. It renames the files to
+  `docs/adr/NNNN-<slug>.md` and replaces the `TMP<k>` references.
+- A decision that reverses an existing ADR changes only that ADR's status
+  line, to `Status: Superseded by NNNN`; any other edit the agent makes to an
+  existing ADR is undone (and logged).
+- `docs/adr/README.md` — a table of number, title, status and summary — is
+  rebuilt by diadoche from the ADR files, never by the agent.
+- The project's `CLAUDE.md` (created if missing) gets, once, the line
+  `Project architecture decisions live in docs/adr/README.md. Before planning, read the index and open the ADRs relevant to the task.`
+  — no links to individual ADRs.
+- The call is recorded in `usage.jsonl` (iteration 0) and `run.log`, its
+  output kept as `iter-0-adr-writer.stdout`/`.stderr` in the task's run
+  directory.
+  `--dry-run` calls no agent and writes nothing.
+
+Each ADR looks like this:
+
+```
+# 0004. Merge without squash
+
+Status: Accepted
+Date: 2026-10-08
+Summary: Merge task branches with a merge commit instead of squashing.
+Task: [014_merges.md](../../.claude/diadoche/spec/014_merges.md)
+
+## Context
+## Decision
+## Alternatives considered
+## Consequences
+```
 
 ## Failure policy (`--on-fail`)
 
@@ -306,7 +362,9 @@ runs — and so is an explicitly empty one: `--planner-model ""`,
 field all fail the run rather than quietly falling back to a default.
 
 Built-in defaults: planner `claude-opus-5-5`, worker `claude-opus-5-5`,
-tester `claude-sonnet-5-5`, preprocessor `claude-opus-5`.
+tester `claude-sonnet-5-5`, preprocessor `claude-opus-5`, adr-writer
+`claude-sonnet-5-5` (`--adr-model` / `DIADOCHE_ADR_MODEL`; resolved and
+validated whenever it is set, even without `--adr`).
 
 ## Per-call budget
 
@@ -672,6 +730,7 @@ Every run (except `--dry-run`) gets its own directory
     ├── iter-<N>-REVIEW.md         copy of the review of iteration N
     ├── iter-<N>-<agent>.stdout    raw stdout of the call (claude's JSON reply)
     ├── iter-<N>-<agent>.stderr    raw stderr of the call
+    ├── iter-0-adr-writer.stdout   raw output (and .stderr) of the --adr step's agent call
     ├── final.diff                 the task's changes against its base commit
     └── decisions.json             decisions worker reported in the DONE iteration
                                    (JSON array of {title, context, decision, alternatives})

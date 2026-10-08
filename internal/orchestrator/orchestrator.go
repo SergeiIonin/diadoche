@@ -42,8 +42,10 @@
 //
 // After a DONE task is merged (or committed in place), the --on-task-done
 // hooks run (see hooks.go): diadoche's one extension point for the moment a
-// task is genuinely finished. A failing hook is a warning, never a task or
-// run failure.
+// task is genuinely finished. With --adr the built-in ADR step runs first
+// at the same point (see adr.go), turning the task's decisions into
+// docs/adr/ records through the adr-writer agent. A failing hook or ADR
+// step is a warning, never a task or run failure.
 //
 // A planner or worker that can't decide an open question alone writes it
 // to QUESTIONS.md and, when the decision isn't reversible, ends its answer
@@ -162,6 +164,10 @@ type Orchestrator struct {
 	// splitter is the preprocessor agent of --on-fail split; built by Run
 	// when the chain contains split.
 	splitter *agents.Agent
+
+	// adrWriter is the adr-writer agent of the ADR step, loaded by
+	// loadAgents when --adr is on or its model is overridden; nil otherwise.
+	adrWriter *agents.Agent
 
 	// simulate is for tests only: run the whole loop like a real run but
 	// without git, usage.jsonl, run-state.json or run artifacts — what
@@ -370,6 +376,8 @@ func (o *Orchestrator) Run(ctx context.Context) (err error) {
 
 // loadAgents resolves the skills in scope, loads planner, worker and tester
 // with their models, and gives all three the run's shared prompt prefix.
+// When the ADR step needs it, adr-writer is loaded the same way into
+// o.adrWriter.
 func (o *Orchestrator) loadAgents() (planner, worker, tester *agents.Agent, err error) {
 	matchedSkills, err := skills.Resolve(o.Layout.SkillsDir, o.Cfg.Langs, o.Cfg.Frameworks)
 	if err != nil {
@@ -400,7 +408,24 @@ func (o *Orchestrator) loadAgents() (planner, worker, tester *agents.Agent, err 
 	if err := agents.ResolveModel(tester, o.Cfg.TesterModel); err != nil {
 		return nil, nil, nil, err
 	}
-	o.Log.Printf("models: planner=%s worker=%s tester=%s", planner.ModelDescription(), worker.ModelDescription(), tester.ModelDescription())
+	// adr-writer is resolved whenever its model is set, even without
+	// --adr, so a bad --adr-model/DIADOCHE_ADR_MODEL fails at startup.
+	o.adrWriter = nil
+	if o.Cfg.ADR || o.Cfg.ADRModel.IsSet() {
+		adrWriter, err := agents.LoadOrDefault(o.Layout.AgentsDir, "adr-writer")
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("load adr-writer agent: %w", err)
+		}
+		if err := agents.ResolveModel(adrWriter, o.Cfg.ADRModel); err != nil {
+			return nil, nil, nil, err
+		}
+		o.adrWriter = adrWriter
+	}
+	models := fmt.Sprintf("models: planner=%s worker=%s tester=%s", planner.ModelDescription(), worker.ModelDescription(), tester.ModelDescription())
+	if o.Cfg.ADR {
+		models += " adr-writer=" + o.adrWriter.ModelDescription()
+	}
+	o.Log.Print(models)
 
 	// One prefix for the whole run, resolved once and shared byte for byte
 	// by all three agents: that identity is what lets the API's prompt
@@ -412,6 +437,9 @@ func (o *Orchestrator) loadAgents() (planner, worker, tester *agents.Agent, err 
 	}
 	prefix := agents.BuildPrefix(basePrefix, matchedSkills)
 	planner.Prefix, worker.Prefix, tester.Prefix = prefix, prefix, prefix
+	if o.adrWriter != nil {
+		o.adrWriter.Prefix = prefix
+	}
 	o.Log.Printf("prompt prefix: %d bytes (source: %s)", len(prefix), prefixSource)
 	return planner, worker, tester, nil
 }
@@ -557,8 +585,8 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 			status = specs.StatusDone
 		}
 		reason := ""
-		if err == nil && serr == nil && status == specs.StatusDone && ws != nil && !o.offline() && len(o.Cfg.OnTaskDone) > 0 {
-			if o.runTaskDoneHooks(ctx, specFile, num, ws) {
+		if err == nil && serr == nil && status == specs.StatusDone && ws != nil && !o.offline() && o.hasTaskDoneHandlers() {
+			if o.runTaskDoneHooks(ctx, specFile, num, ws, uw) {
 				reason = "on_task_done_failed"
 			}
 		}
@@ -968,10 +996,15 @@ type agentCall struct {
 }
 
 // logPrefix is how a call is named in the log: "<spec> iter i/n: [agent]",
-// or "<spec> on-fail <policy>: [agent]" for a policy's own call.
+// "<spec> on-fail <policy>: [agent]" for a policy's own call, or
+// "<spec>: [agent]" for a call outside the iterations (the ADR step's
+// adr-writer).
 func (c agentCall) logPrefix(iters int, agent string) string {
 	if c.onFail != "" {
 		return fmt.Sprintf("%s on-fail %s: [%s]", c.specFile, c.onFail, agent)
+	}
+	if c.iter == 0 {
+		return fmt.Sprintf("%s: [%s]", c.specFile, agent)
 	}
 	return fmt.Sprintf("%s iter %d/%d: [%s]", c.specFile, c.iter, iters, agent)
 }

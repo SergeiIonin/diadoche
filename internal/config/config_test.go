@@ -703,3 +703,81 @@ func TestParseMakesDirAbsolute(t *testing.T) {
 		t.Errorf("Dir = %q, want absolute %q", cfg.Dir, wd)
 	}
 }
+
+// unsetADRModelEnv clears an ambient DIADOCHE_ADR_MODEL for the test (and
+// restores it afterwards).
+func unsetADRModelEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("DIADOCHE_ADR_MODEL", "placeholder")
+	if err := os.Unsetenv("DIADOCHE_ADR_MODEL"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestParseADRDefaultsOffAndCanBeEnabled(t *testing.T) {
+	unsetADRModelEnv(t)
+	cfg, err := Parse(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ADR || cfg.ADRModel.IsSet() {
+		t.Fatalf("ADR = %v, ADRModel = %+v; want off and no override by default", cfg.ADR, cfg.ADRModel)
+	}
+	cfg, err = Parse([]string{"--adr"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.ADR {
+		t.Fatal("--adr: ADR = false, want true")
+	}
+}
+
+func TestParseADRModelPrecedence(t *testing.T) {
+	unsetADRModelEnv(t)
+	cfg, err := Parse([]string{"--adr-model", "claude-haiku-4-5-20251001"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ADRModel != (agents.ModelOverride{Value: "claude-haiku-4-5-20251001", Source: agents.ModelSourceFlag}) {
+		t.Fatalf("ADRModel = %+v, want the flag value", cfg.ADRModel)
+	}
+
+	t.Setenv("DIADOCHE_ADR_MODEL", "claude-opus-5-5")
+	cfg, err = Parse(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ADRModel != (agents.ModelOverride{Value: "claude-opus-5-5", Source: agents.ModelSourceEnv}) {
+		t.Fatalf("ADRModel = %+v, want the env value", cfg.ADRModel)
+	}
+
+	cfg, err = Parse([]string{"--adr-model", "claude-haiku-4-5-20251001"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ADRModel.Value != "claude-haiku-4-5-20251001" || cfg.ADRModel.Source != agents.ModelSourceFlag {
+		t.Fatalf("ADRModel = %+v, want the flag to beat the env", cfg.ADRModel)
+	}
+}
+
+func TestParseADRModelEmptyIsError(t *testing.T) {
+	unsetADRModelEnv(t)
+	if _, err := Parse([]string{"--adr-model="}); err == nil || !strings.Contains(err.Error(), "--adr-model must not be empty") {
+		t.Errorf("empty --adr-model: err = %v", err)
+	}
+	t.Setenv("DIADOCHE_ADR_MODEL", " ")
+	if _, err := Parse(nil); err == nil || !strings.Contains(err.Error(), "DIADOCHE_ADR_MODEL") {
+		t.Errorf("empty DIADOCHE_ADR_MODEL: err = %v", err)
+	}
+}
+
+func TestParseHelpMentionsADR(t *testing.T) {
+	out := captureStdout(t, func() {
+		_, _ = Parse([]string{"--help"})
+	})
+	for _, want := range []string{"--adr", "--adr-model", "ADR STEP", "DIADOCHE_ADR_MODEL", "docs/adr/NNNN-<slug>.md", "docs/adr/README.md", "adr-writer", "iter-0-adr-writer.stdout"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("help output missing %q", want)
+		}
+	}
+}

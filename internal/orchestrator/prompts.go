@@ -1,8 +1,12 @@
 package orchestrator
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
-// The prompts planner, worker and tester get in each iteration. Both the
+// The prompts planner, worker and tester get in each iteration, and the one
+// adr-writer gets after a DONE task (--adr). Both the
 // real loop (runIterations) and --dry-run (dryrun.go) build them here, so
 // a dry run prints exactly what a real run would send.
 
@@ -79,3 +83,35 @@ const dryRunTestCommand = dryRunPlaceholder + ` the command(s) from the plan's "
 // dryRunDiff stands in for the diff of worker's changes.
 const dryRunDiff = dryRunPlaceholder + " no diff: worker is not called and git is not touched in a dry run. " +
 	"In a real run this is the diff of the worker's changes since the task's base commit."
+
+// adrPromptInput is everything the adr-writer prompt is built from.
+type adrPromptInput struct {
+	specFile  string
+	specLink  string // the spec, relative to docs/adr/
+	date      string // YYYY-MM-DD
+	decisions string // the decisions as JSON
+	diffNote  string // e.g. that the diff was replaced by its --stat; may be empty
+	diff      string
+	index     string // docs/adr/README.md, or a note that there are no ADRs
+	existing  []string
+}
+
+// adrWriterPrompt asks adr-writer to write one TMP<k> ADR per decision of
+// a DONE task.
+func adrWriterPrompt(in adrPromptInput) string {
+	existing := "(none)"
+	if len(in.existing) > 0 {
+		existing = "- docs/adr/" + strings.Join(in.existing, "\n- docs/adr/")
+	}
+	return fmt.Sprintf(
+		"Task spec: %s\nLink to the spec from docs/adr/ (use it as is in the Task: line): %s\nToday's date (use it in the Date: line): %s\n\n"+
+			"Decisions of the task, as JSON (decision k is the k-th element, starting at 1):\n%s\n\n"+
+			"Diff of the task against its base commit%s:\n%s\n\n"+
+			"Current ADR index (docs/adr/README.md):\n%s\n\n"+
+			"Existing ADR files:\n%s\n\n"+
+			"Write one ADR per decision as docs/adr/TMP<k>-<slug>.md with the title \"# TMP<k>. <Title>\". "+
+			"diadoche assigns the real numbers afterwards: never write a real number for a new ADR, and never rename, renumber or delete a file. "+
+			"In an existing ADR that a decision reverses, change only its Status line, to \"Status: Superseded by TMP<k>\"; make no other edit to an existing ADR. "+
+			"Do not write docs/adr/README.md or CLAUDE.md.",
+		in.specFile, in.specLink, in.date, in.decisions, in.diffNote, in.diff, in.index, existing)
+}

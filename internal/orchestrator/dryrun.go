@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"diadoche/internal/adr"
 	"diadoche/internal/agents"
 	"diadoche/internal/config"
 	"diadoche/internal/onfail"
@@ -25,12 +26,13 @@ import (
 // It changes nothing: no STATUS.md, QUEUE.md or spec/ file is written (not
 // even the spec directory or its lock), no usage.jsonl, run-state.json or
 // run artifacts, and git is never touched. No status changes, no plan
-// validation, no failure counting. The --on-task-done hooks are only
-// listed per task, never run, and the --on-fail chain is only named: no
-// policy is applied and no status changes. No answer is inspected for
-// NEEDS_HUMAN and nothing writes QUESTIONS.md; with --resume-waiting the
-// WAITING tasks are walked too (their prompts carry their questions and
-// answers), but they stay WAITING.
+// validation, no failure counting. The --on-task-done hooks and the --adr
+// step are only listed per task, never run: adr-writer is not called. The
+// --on-fail chain is only named: no policy is applied and no status
+// changes. No answer is inspected for NEEDS_HUMAN and nothing writes
+// QUESTIONS.md; with --resume-waiting the WAITING tasks are walked too
+// (their prompts carry their questions and answers), but they stay
+// WAITING.
 func (o *Orchestrator) dryRun(ctx context.Context) error {
 	planner, worker, tester, err := o.loadAgents()
 	if err != nil {
@@ -62,12 +64,15 @@ func (o *Orchestrator) dryRun(ctx context.Context) error {
 		o.Log.Printf("dry-run: a real run would run each task in its own git worktree under %s; the dry run shows %s as the work dir",
 			o.relPath(filepath.Join(o.Layout.Root, worktreesDirName)), o.Cfg.Dir)
 	}
-	if len(o.Cfg.OnFail) > 0 {
-		o.Log.Printf("dry-run: a task not DONE after --ITER would get --on-fail %s (escalation model %s); the dry run applies none",
-			strings.Join(o.Cfg.OnFail, ","), cmp.Or(o.Cfg.EscalationModel.Value, onfail.DefaultEscalationModel))
+	if o.Cfg.ADR {
+		o.Log.Printf("dry-run: --adr: adr-writer (%s) would turn each DONE task's decisions into %s/", o.adrWriter.ModelDescription(), adr.Dir)
 	}
 	if len(o.Cfg.OnTaskDone) > 0 {
 		o.Log.Printf("dry-run: on-task-done hooks: %d, timeout %s each", len(o.Cfg.OnTaskDone), cmp.Or(o.Cfg.HookTimeout, config.DefaultHookTimeout))
+	}
+	if len(o.Cfg.OnFail) > 0 {
+		o.Log.Printf("dry-run: a task not DONE after --ITER would get --on-fail %s (escalation model %s); the dry run applies none",
+			strings.Join(o.Cfg.OnFail, ","), cmp.Or(o.Cfg.EscalationModel.Value, onfail.DefaultEscalationModel))
 	}
 
 	for _, specFile := range queue {
@@ -103,6 +108,9 @@ func (o *Orchestrator) dryRun(ctx context.Context) error {
 			if _, err := o.Runner.Run(ctx, o.Cfg.Dir, c.agent, c.prompt); err != nil {
 				return fmt.Errorf("dry-run: %s for %s: %w", c.agent.Name, specFile, err)
 			}
+		}
+		if o.Cfg.ADR {
+			o.Log.Printf("[dry-run] once %s is DONE and merged, would run the ADR step", taskID(specFile, num))
 		}
 		for i, command := range o.Cfg.OnTaskDone {
 			o.Log.Printf("[dry-run] once %s is DONE and merged, would run on-task-done hook %d: %s", taskID(specFile, num), i+1, command)

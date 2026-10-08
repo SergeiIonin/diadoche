@@ -112,6 +112,7 @@ func TestBuiltinDefaultModels(t *testing.T) {
 		"worker":       "claude-opus-5-5",
 		"tester":       "claude-sonnet-5-5",
 		"preprocessor": "claude-opus-5",
+		"adr-writer":   "claude-sonnet-5-5",
 	}
 	for name, model := range want {
 		a, err := LoadOrDefault(t.TempDir(), name)

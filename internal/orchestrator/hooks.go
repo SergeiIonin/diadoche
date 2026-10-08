@@ -9,6 +9,11 @@ package orchestrator
 // non-zero exit or a timeout is a warning, recorded in run.log and as the
 // reason of the task's (still DONE) STATUS.md row. Whatever the hooks leave
 // changed in the repository is committed separately.
+//
+// The hooks are one kind of task-done handler; the other is the built-in
+// ADR step (--adr, see adr.go), which runs first, so the hooks already see
+// its docs/adr/. All handlers share the trigger, the warning-only failure
+// rule and the one on-task-done commit.
 
 import (
 	"bytes"
@@ -27,6 +32,7 @@ import (
 	"diadoche/internal/gitutil"
 	"diadoche/internal/runlog"
 	"diadoche/internal/specs"
+	"diadoche/internal/usage"
 )
 
 // maxHookOutputBytes caps each of a hook's stdout and stderr as kept in the
@@ -171,55 +177,123 @@ func (o *Orchestrator) runHook(ctx context.Context, n int, command, dir string, 
 	return res, outBuf.Bytes(), errBuf.Bytes()
 }
 
-// runTaskDoneHooks runs every --on-task-done command for specFile, a task
-// that is DONE and merged, in the order given, then commits whatever they
-// changed as "diadoche: on-task-done for <task-id>". Nothing here can fail
-// the task or the run: a failed hook (or hook commit) is logged, written to
-// run.log and recorded as the reason of the task's DONE row in STATUS.md.
-// failed reports whether that happened.
-func (o *Orchestrator) runTaskDoneHooks(ctx context.Context, specFile, num string, ws *workspace) (failed bool) {
+// taskDoneInput is what a task-done handler works on.
+type taskDoneInput struct {
+	specFile, num string
+	ws            *workspace
+	uw            *usage.Writer
+	// root is the absolute repository root, where the merge landed.
+	root string
+	// env is the hooks' DIADOCHE_* environment; nil without hooks.
+	env []string
+}
+
+// handlerOutcome is how a task-done handler ended: an empty fragment is
+// success; otherwise fragment is the STATUS.md reason fragment, in
+// diadoche's own words, and err an optional detail for the log only.
+type handlerOutcome struct {
+	fragment string
+	err      error
+}
+
+// taskDoneHandler is one step run once a task is DONE and merged.
+type taskDoneHandler struct {
+	// name is the handler in log lines and fragments ("on-task-done hook 1").
+	name string
+	// what is its run.log warning id ("on-task-done-1").
+	what string
+	run  func(ctx context.Context, in taskDoneInput) handlerOutcome
+}
+
+// hasTaskDoneHandlers reports whether a DONE task has anything to run.
+func (o *Orchestrator) hasTaskDoneHandlers() bool {
+	return o.Cfg.ADR || len(o.Cfg.OnTaskDone) > 0
+}
+
+// taskDoneHandlers are the handlers in the order they run: the built-in
+// ADR step (with --adr), then every --on-task-done command as given.
+func (o *Orchestrator) taskDoneHandlers() []taskDoneHandler {
+	var hs []taskDoneHandler
+	if o.Cfg.ADR {
+		hs = append(hs, taskDoneHandler{name: "adr step", what: "adr", run: func(ctx context.Context, in taskDoneInput) handlerOutcome {
+			return o.runADRStep(ctx, in.specFile, in.num, in.ws, in.uw)
+		}})
+	}
+	for i, command := range o.Cfg.OnTaskDone {
+		n := i + 1
+		hs = append(hs, taskDoneHandler{
+			name: fmt.Sprintf("on-task-done hook %d", n),
+			what: fmt.Sprintf("on-task-done-%d", n),
+			run: func(ctx context.Context, in taskDoneInput) handlerOutcome {
+				return o.runShellHook(ctx, in, n, command)
+			},
+		})
+	}
+	return hs
+}
+
+// runShellHook runs the n-th --on-task-done command and keeps its output.
+func (o *Orchestrator) runShellHook(ctx context.Context, in taskDoneInput, n int, command string) handlerOutcome {
+	specFile, num := in.specFile, in.num
+	o.Log.Printf("task %s: on-task-done hook %d: running %q", specFile, n, command)
+	o.event(specFile, 0, "", "on_task_done_start", runlog.F("n", n))
+	res, stdout, stderr := o.runHook(ctx, n, command, in.root, in.env)
+	o.saveArtifact(specFile, num, fmt.Sprintf("on-task-done-%d.stdout", n), stdout)
+	o.saveArtifact(specFile, num, fmt.Sprintf("on-task-done-%d.stderr", n), stderr)
+	o.event(specFile, 0, "", "on_task_done", runlog.F("n", n), runlog.F("exit", res.exitCode),
+		runlog.F("duration", res.duration.Round(time.Millisecond)), runlog.F("result", res.outcome()))
+	if res.ok() {
+		o.Log.Printf("task %s: on-task-done hook %d finished in %s", specFile, n, res.duration.Round(time.Millisecond))
+		return handlerOutcome{}
+	}
+	return handlerOutcome{fragment: res.failure(), err: res.err}
+}
+
+// runTaskDoneHooks runs every task-done handler for specFile, a task that
+// is DONE and merged — the ADR step, then the --on-task-done commands in
+// the order given — then commits whatever they changed as
+// "diadoche: on-task-done for <task-id>". Nothing here can fail the task or
+// the run: a failed handler (or the commit) is logged, written to run.log
+// and recorded as the reason of the task's DONE row in STATUS.md. failed
+// reports whether that happened.
+func (o *Orchestrator) runTaskDoneHooks(ctx context.Context, specFile, num string, ws *workspace, uw *usage.Writer) (failed bool) {
 	id := taskID(specFile, num)
 	root, err := filepath.Abs(o.Cfg.Dir)
 	if err != nil {
 		root = o.Cfg.Dir
 	}
-	env, err := o.hookEnv(specFile, num, ws)
-	if err != nil {
-		o.Log.Printf("warning: task %s: couldn't read the spec for DIADOCHE_TASK_TITLE: %v", specFile, err)
-		o.event(specFile, 0, "", "warning", runlog.F("what", "on-task-done env"), runlog.F("error", "spec unreadable"))
+	in := taskDoneInput{specFile: specFile, num: num, ws: ws, uw: uw, root: root}
+	if len(o.Cfg.OnTaskDone) > 0 {
+		env, err := o.hookEnv(specFile, num, ws)
+		if err != nil {
+			o.Log.Printf("warning: task %s: couldn't read the spec for DIADOCHE_TASK_TITLE: %v", specFile, err)
+			o.event(specFile, 0, "", "warning", runlog.F("what", "on-task-done env"), runlog.F("error", "spec unreadable"))
+		}
+		in.env = env
 	}
 
 	var fragments []string
-	for i, command := range o.Cfg.OnTaskDone {
-		n := i + 1
+	for _, h := range o.taskDoneHandlers() {
 		if ctx.Err() != nil {
-			o.Log.Printf("warning: task %s: interrupted; skipping on-task-done hook %d and later ones", specFile, n)
-			fragments = append(fragments, fmt.Sprintf("on-task-done hook %d skipped (interrupted)", n))
+			o.Log.Printf("warning: task %s: interrupted; skipping %s and later ones", specFile, h.name)
+			fragments = append(fragments, fmt.Sprintf("%s skipped (interrupted)", h.name))
 			break
 		}
-		o.Log.Printf("task %s: on-task-done hook %d: running %q", specFile, n, command)
-		o.event(specFile, 0, "", "on_task_done_start", runlog.F("n", n))
-		res, stdout, stderr := o.runHook(ctx, n, command, root, env)
-		o.saveArtifact(specFile, num, fmt.Sprintf("on-task-done-%d.stdout", n), stdout)
-		o.saveArtifact(specFile, num, fmt.Sprintf("on-task-done-%d.stderr", n), stderr)
-		o.event(specFile, 0, "", "on_task_done", runlog.F("n", n), runlog.F("exit", res.exitCode),
-			runlog.F("duration", res.duration.Round(time.Millisecond)), runlog.F("result", res.outcome()))
-		if res.ok() {
-			o.Log.Printf("task %s: on-task-done hook %d finished in %s", specFile, n, res.duration.Round(time.Millisecond))
+		out := h.run(ctx, in)
+		if out.fragment == "" {
 			continue
 		}
-		fragment := res.failure()
-		if res.err != nil {
-			o.Log.Printf("warning: task %s: %s: %v", specFile, fragment, res.err)
+		if out.err != nil {
+			o.Log.Printf("warning: task %s: %s: %v", specFile, out.fragment, out.err)
 		} else {
-			o.Log.Printf("warning: task %s: %s", specFile, fragment)
+			o.Log.Printf("warning: task %s: %s", specFile, out.fragment)
 		}
-		o.event(specFile, 0, "", "warning", runlog.F("what", fmt.Sprintf("on-task-done-%d", n)), runlog.F("error", fragment))
-		fragments = append(fragments, fragment)
+		o.event(specFile, 0, "", "warning", runlog.F("what", h.what), runlog.F("error", out.fragment))
+		fragments = append(fragments, out.fragment)
 	}
 
-	// Even after a cancelled ctx: what the hooks changed must not be left
-	// lying around in the main tree.
+	// Even after a cancelled ctx: what the handlers changed must not be
+	// left lying around in the main tree.
 	committed, err := gitutil.CommitAllExcluding(context.WithoutCancel(ctx), o.Cfg.Dir,
 		"diadoche: on-task-done for "+id, relExcludeDirs(o.Cfg.Dir, o.Layout.Root)...)
 	switch {

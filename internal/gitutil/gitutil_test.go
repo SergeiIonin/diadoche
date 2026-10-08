@@ -710,3 +710,38 @@ func TestApplyCommitAbortsOnConflict(t *testing.T) {
 		t.Errorf("tree not clean after abort:\n%s", st)
 	}
 }
+
+func TestDiffBetweenExcluding(t *testing.T) {
+	dir := newCommittedRepo(t)
+	ctx := context.Background()
+	from := git(t, dir, "rev-parse", "HEAD")
+	writeTestFile(t, filepath.Join(dir, "code.txt"), "new code\n")
+	writeTestFile(t, filepath.Join(dir, ".claude", "diadoche", "x.md"), "bookkeeping\n")
+	if err := CommitAll(ctx, dir, "change"); err != nil {
+		t.Fatal(err)
+	}
+	to := git(t, dir, "rev-parse", "HEAD")
+	// A later uncommitted change is not part of the diff between commits.
+	writeTestFile(t, filepath.Join(dir, "later.txt"), "later\n")
+	writeTestFile(t, filepath.Join(dir, "a.txt"), "changed later\n")
+
+	diff, err := DiffBetweenExcluding(ctx, dir, from, to, ".claude/diadoche")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(diff, "+new code") {
+		t.Errorf("diff misses the committed change:\n%s", diff)
+	}
+	for _, unwanted := range []string{"bookkeeping", "changed later", "later.txt"} {
+		if strings.Contains(diff, unwanted) {
+			t.Errorf("diff contains %q:\n%s", unwanted, diff)
+		}
+	}
+	stat, err := DiffStatBetweenExcluding(ctx, dir, from, to, ".claude/diadoche")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stat, "code.txt") || strings.Contains(stat, ".claude") {
+		t.Errorf("stat = %q, want code.txt only", stat)
+	}
+}

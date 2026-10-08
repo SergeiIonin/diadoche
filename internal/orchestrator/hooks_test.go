@@ -361,7 +361,7 @@ func TestOnTaskDoneHookCanceledRunSkipsRemainingHooks(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if failed := o.runTaskDoneHooks(ctx, "001_example.md", "001", &workspace{}); !failed {
+	if failed := o.runTaskDoneHooks(ctx, "001_example.md", "001", &workspace{}, nil); !failed {
 		t.Error("skipped hooks should be reported as a failure")
 	}
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {

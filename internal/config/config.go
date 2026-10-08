@@ -82,6 +82,7 @@ const helpSynopsis = `SYNOPSIS
              [--on-task-done <command>]... [--hook-timeout <duration>]
              [--on-fail <list>] [--escalation-model <name>]
              [--resume-waiting]
+             [--adr] [--adr-model <name>]
     diadoche --preprocess --task <path> [--dir <path>] [--claude-bin <path>]
              [--preprocessor-model <name>]
     diadoche --initialize <project-path>
@@ -100,7 +101,9 @@ const helpDescription = `DESCRIPTION
     tester (reviews it and, once the task is genuinely done, marks it DONE
     in spec/STATUS.md). Once the tester marks a task DONE, diadoche commits
     the changes (and, with --worktree, merges them; see WORKTREES below),
-    runs the --on-task-done hooks (see ON-TASK-DONE HOOKS) and moves on to
+    runs the --on-task-done hooks (see ON-TASK-DONE HOOKS) — preceded, with
+    --adr, by the built-in ADR step that turns the task's decisions into
+    docs/adr/ (see ADR STEP) — and moves on to
     the next task; if --ITER rounds run out
     without a DONE verdict, diadoche applies the --on-fail policies (by
     default: one escalated round on a stronger model, then BLOCKED; see
@@ -112,7 +115,8 @@ const helpDescription = `DESCRIPTION
     run goes on with the next task, and --resume-waiting picks it up again
     once answered (see OPEN QUESTIONS AND WAITING).
 
-    Agent prompts and models for planner/worker/tester/preprocessor are
+    Agent prompts and models for planner/worker/tester/preprocessor/
+    adr-writer are
     built into the diadoche binary, so it works in any project without
     extra setup. Drop a .claude/agents/<name>.md file (same frontmatter
     format) into a project to override the built-in prompt/model for that
@@ -291,6 +295,10 @@ const helpModels = `MODEL SELECTION
         2. DIADOCHE_<AGENT>_MODEL environment variable
         3. model: field in the project's .claude/agents/<name>.md, if any
         4. the agent's built-in default
+
+    The agents are planner, worker, tester, preprocessor and adr-writer
+    (--adr-model / DIADOCHE_ADR_MODEL; its model is validated at startup
+    whenever it is set, even without --adr).
 
     This only ever picks the model; a .claude/agents/<name>.md prompt
     override (its body, not its model: field) still applies regardless of
@@ -544,6 +552,42 @@ const helpOnFail = `ON-FAIL POLICIES
 
 `
 
+const helpADR = `ADR STEP
+    --adr (off by default) turns each DONE task's decisions — worker's
+    "## Decisions" section, see decisions.json — into architecture decision
+    records under <project>/docs/adr/. It is a built-in task-done handler:
+    it runs at the same point as the --on-task-done hooks, first, before
+    them (so they see the new ADRs), and like them it never fails the task
+    or the run — a failure is a warning in run.log and in the reason of the
+    task's DONE row ("DONE: adr step failed (adr-writer exit 1)"); whatever
+    it wrote is then rolled back. Its changes go into the same
+    "diadoche: on-task-done for <NNN>-<slug>" commit.
+
+    A task whose decisions are empty or "none" skips the step entirely: no
+    agent call, no file written, no cost. Otherwise diadoche calls the
+    adr-writer agent (model: --adr-model, DIADOCHE_ADR_MODEL,
+    .claude/agents/adr-writer.md, built-in default claude-sonnet-5-5) in
+    the repository root with the decisions, the task's diff against its
+    base commit and the current ADR index. The agent writes one file per
+    decision as docs/adr/TMP<k>-<slug>.md; diadoche then assigns the real
+    numbers (the next free ones, continuing the existing ADRs, which are
+    never renumbered), renames the files to docs/adr/NNNN-<slug>.md and
+    fixes the TMP<k> references. A decision that reverses an existing ADR
+    changes only that ADR's status line, to "Status: Superseded by NNNN";
+    any other edit the agent makes to an existing ADR is dropped.
+    docs/adr/README.md (number, title, status, summary) is rebuilt by
+    diadoche from the ADR files, never by the agent, and the line
+    "Project architecture decisions live in docs/adr/README.md. ..." is
+    added once to the project's CLAUDE.md (created if missing).
+
+    The call is recorded in usage.jsonl (iteration 0) and run.log, its
+    output kept as iter-0-adr-writer.stdout/.stderr in the task's run
+    directory.
+    --dry-run calls no agent and writes nothing; it only says the step
+    would run.
+
+`
+
 const helpFlagsHeader = `FLAGS
 
 `
@@ -579,7 +623,7 @@ FILES
 
     <project>/.claude/agents/<name>.md
         Optional per-project override of a built-in agent's prompt/model
-        (name is one of planner, worker, tester, preprocessor).
+        (name is one of planner, worker, tester, preprocessor, adr-writer).
 
     <project>/.claude/diadoche/prefix.md
         Optional override of the shared prompt prefix all agents get as
@@ -638,7 +682,22 @@ FILES
         its base commit, written whatever its outcome), decisions.json (a
         DONE task's ## Decisions, as JSON) and on-task-done-<N>.stdout and
         .stderr (output of the N-th --on-task-done hook, capped at 1 MiB
-        each).
+        each), iter-0-adr-writer.stdout and .stderr (output of the --adr
+        step's agent call).
+
+    <project>/docs/adr/NNNN-<slug>.md
+        With --adr, one architecture decision record per decision of a DONE
+        task: title, Status (Accepted or Superseded by NNNN), Date,
+        Summary, a link to the task spec, Context, Decision, Alternatives
+        considered, Consequences. Numbered by diadoche.
+
+    <project>/docs/adr/README.md
+        With --adr, the ADR index (number, title, status, summary), rebuilt
+        by diadoche after every ADR step. Do not edit it by hand.
+
+    <project>/CLAUDE.md
+        With --adr, gets one line pointing agents at docs/adr/README.md
+        (added once; the file is created if missing).
 
     <project>/.claude/diadoche/run-state.json
         Where the run is (see SIGNALS AND RESTART STATE): run_id, task
@@ -684,6 +743,9 @@ const helpExamples = `EXAMPLES
     Regenerate the docs after every finished task (committed separately):
         diadoche --dir /path/to/project --on-task-done 'make docs'
 
+    Record every finished task's decisions as ADRs under docs/adr/:
+        diadoche --dir /path/to/project --adr
+
     Keep going across claude usage-limit windows (restarts diadoche when
     the window reopens; see diadoche-restarter --help):
         diadoche-restarter -- --dir /path/to/project --ITER 5
@@ -706,7 +768,8 @@ type Config struct {
 	// a startup error); see DefaultMaxDiffBytes.
 	MaxDiffBytes int
 
-	// PlannerModel, WorkerModel, TesterModel, PreprocessorModel are model
+	// PlannerModel, WorkerModel, TesterModel, PreprocessorModel (and
+	// ADRModel below) are model
 	// overrides resolved from --<agent>-model (if passed) else
 	// DIADOCHE_<AGENT>_MODEL (if set), with Source recording which of the
 	// two it was. The zero value means "no override — use whatever
@@ -807,6 +870,13 @@ type Config struct {
 	// Always set and validated by Parse; the zero value (a Config built by
 	// hand) means the default.
 	EscalationModel agents.ModelOverride
+	// ADR enables the built-in ADR step (--adr): after a task is DONE and
+	// merged, its decisions become docs/adr/ records (see ADR STEP).
+	ADR bool
+
+	// ADRModel is the adr-writer agent's model override, resolved like
+	// PlannerModel and friends from --adr-model / DIADOCHE_ADR_MODEL.
+	ADRModel agents.ModelOverride
 }
 
 // TaskPath resolves --task relative to --dir, unless it's already absolute.
@@ -854,6 +924,8 @@ func Parse(args []string) (*Config, error) {
 	hookTimeout := fs.Duration("hook-timeout", DefaultHookTimeout, "kill an --on-task-done command (and its process group) that runs longer than this")
 	onFailFlag := fs.String("on-fail", onfail.DefaultChain, "comma-separated, ordered policies applied when a task's --ITER iterations run out without DONE: "+strings.Join(onfail.Names, ", ")+"; \"\" marks the task FAILED and parks its changes")
 	escalationModel := fs.String("escalation-model", "", "model of planner and worker in the escalated round of --on-fail escalate (else $DIADOCHE_ESCALATION_MODEL, else "+onfail.DefaultEscalationModel+")")
+	adrOn := fs.Bool("adr", false, "after a task is DONE and merged, turn its ## Decisions into docs/adr/ ADRs via the adr-writer agent; a failure is only a warning")
+	adrModel := fs.String("adr-model", "", "override the adr-writer agent's model (else $DIADOCHE_ADR_MODEL, else .claude/agents/adr-writer.md, else built-in default)")
 	maxCostPerRun := fs.Float64("max-cost-per-run", 0, "stop the run after the current agent call once this run's recorded cost exceeds this many USD; the current task stays pending and diadoche exits non-zero (0 = no limit)")
 
 	if err := fs.Parse(args); err != nil {
@@ -938,6 +1010,10 @@ func Parse(args []string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	adrOverride, err := resolveModelOverride(passed, "adr-model", *adrModel, "DIADOCHE_ADR_MODEL")
+	if err != nil {
+		return nil, err
+	}
 
 	onFail, err := onfail.Parse(*onFailFlag)
 	if err != nil {
@@ -986,6 +1062,8 @@ func Parse(args []string) (*Config, error) {
 		HookTimeout:        *hookTimeout,
 		OnFail:             onFail,
 		EscalationModel:    escalation,
+		ADR:                *adrOn,
+		ADRModel:           adrOverride,
 	}, nil
 }
 
@@ -1057,6 +1135,7 @@ func printHelp(fs *flag.FlagSet, w io.Writer) {
 	fmt.Fprint(w, helpShutdown)
 	fmt.Fprint(w, helpHooks)
 	fmt.Fprint(w, helpOnFail)
+	fmt.Fprint(w, helpADR)
 	fmt.Fprint(w, helpFlagsHeader)
 	fs.SetOutput(w)
 	fs.PrintDefaults()

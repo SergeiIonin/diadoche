@@ -124,6 +124,27 @@ func DiffStatSinceExcluding(ctx context.Context, dir, base string, excludeDirs .
 	return out, nil
 }
 
+// DiffBetweenExcluding is `git diff from to`, the committed change between
+// two commits, with the same exclusion as DiffSinceExcluding.
+func DiffBetweenExcluding(ctx context.Context, dir, from, to string, excludeDirs ...string) (string, error) {
+	args := append([]string{"diff", from, to}, excludePathspec(excludeDirs)...)
+	out, err := run(ctx, dir, args...)
+	if err != nil {
+		return "", fmt.Errorf("git diff: %w: %s", err, out)
+	}
+	return out, nil
+}
+
+// DiffStatBetweenExcluding is DiffBetweenExcluding as `git diff --stat`.
+func DiffStatBetweenExcluding(ctx context.Context, dir, from, to string, excludeDirs ...string) (string, error) {
+	args := append([]string{"diff", "--stat", from, to}, excludePathspec(excludeDirs)...)
+	out, err := run(ctx, dir, args...)
+	if err != nil {
+		return "", fmt.Errorf("git diff --stat: %w: %s", err, out)
+	}
+	return out, nil
+}
+
 // UntrackedFiles returns paths git considers untracked and not ignored
 // (`git ls-files --others --exclude-standard`) — new files a plain `git
 // diff` never reports, but that may still be part of a task's changes.
