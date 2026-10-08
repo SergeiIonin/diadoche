@@ -8,7 +8,6 @@
 package redgreen
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -158,8 +157,16 @@ const waitDelay = 5 * time.Second
 
 // RunCommand runs script with `sh -c` in dir, capturing stdout and stderr
 // together. A timeout > 0 bounds the run; when it expires the shell is
-// killed and TimedOut is set.
+// killed and TimedOut is set. The captured output is unbounded; see
+// RunCommandLimit.
 func RunCommand(ctx context.Context, dir, script string, timeout time.Duration) CommandResult {
+	return RunCommandLimit(ctx, dir, script, timeout, 0)
+}
+
+// RunCommandLimit is RunCommand with the captured output bounded: when
+// maxOutput > 0 only the last maxOutput bytes are kept, and Output is
+// prefixed with a note saying so. maxOutput <= 0 keeps everything.
+func RunCommandLimit(ctx context.Context, dir, script string, timeout time.Duration, maxOutput int) CommandResult {
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
@@ -168,9 +175,9 @@ func RunCommand(ctx context.Context, dir, script string, timeout time.Duration) 
 	cmd := exec.CommandContext(ctx, "sh", "-c", script)
 	cmd.Dir = dir
 	cmd.WaitDelay = waitDelay
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
+	out := &tailBuffer{limit: maxOutput}
+	cmd.Stdout = out
+	cmd.Stderr = out
 	err := cmd.Run()
 
 	res := CommandResult{Output: out.String()}
@@ -188,6 +195,42 @@ func RunCommand(ctx context.Context, dir, script string, timeout time.Duration) 
 		res.Err = err
 	}
 	return res
+}
+
+// tailBuffer is an io.Writer that keeps only the last limit bytes written
+// (everything when limit <= 0). Trimming is lazy — once the buffer holds
+// twice the limit — so writes stay amortised O(n).
+type tailBuffer struct {
+	limit     int
+	buf       []byte
+	truncated bool
+}
+
+func (b *tailBuffer) Write(p []byte) (int, error) {
+	b.buf = append(b.buf, p...)
+	if b.limit > 0 && len(b.buf) > 2*b.limit {
+		b.trim()
+	}
+	return len(p), nil
+}
+
+func (b *tailBuffer) trim() {
+	if b.limit <= 0 || len(b.buf) <= b.limit {
+		return
+	}
+	n := copy(b.buf, b.buf[len(b.buf)-b.limit:])
+	b.buf = b.buf[:n]
+	b.truncated = true
+}
+
+// String returns the kept bytes, prefixed with a truncation note when
+// anything was dropped.
+func (b *tailBuffer) String() string {
+	b.trim()
+	if !b.truncated {
+		return string(b.buf)
+	}
+	return fmt.Sprintf("[output truncated: kept last %d bytes]\n", b.limit) + string(b.buf)
 }
 
 // Tail returns the last n bytes of s, cut on a rune boundary and prefixed

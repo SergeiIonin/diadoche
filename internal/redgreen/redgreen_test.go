@@ -119,3 +119,35 @@ func TestTail(t *testing.T) {
 		t.Errorf("Tail mid-rune = %q, want …b", got)
 	}
 }
+
+func TestTailBuffer(t *testing.T) {
+	b := &tailBuffer{limit: 10}
+	for _, chunk := range []string{"0123456789", "abcdefghij", "ABCDEFGHIJ", "xyz"} {
+		if n, err := b.Write([]byte(chunk)); n != len(chunk) || err != nil {
+			t.Fatalf("Write(%q) = %d, %v", chunk, n, err)
+		}
+	}
+	want := "[output truncated: kept last 10 bytes]\nDEFGHIJxyz"
+	if got := b.String(); got != want || !b.truncated {
+		t.Errorf("String() = %q (truncated %v), want %q", got, b.truncated, want)
+	}
+
+	u := &tailBuffer{}
+	u.Write([]byte(strings.Repeat("a", 100)))
+	if got := u.String(); got != strings.Repeat("a", 100) || u.truncated {
+		t.Errorf("unlimited buffer = %q (truncated %v)", got, u.truncated)
+	}
+}
+
+func TestRunCommandLimit(t *testing.T) {
+	r := RunCommandLimit(context.Background(), t.TempDir(), "i=0; while [ $i -lt 200 ]; do echo line$i; i=$((i+1)); done", 0, 50)
+	if !r.Passed() {
+		t.Fatalf("run: %+v", r)
+	}
+	if !strings.HasPrefix(r.Output, "[output truncated: kept last 50 bytes]\n") || !strings.HasSuffix(r.Output, "line199\n") {
+		t.Errorf("Output = %q, want a truncation note and the last bytes", r.Output)
+	}
+	if body := strings.TrimPrefix(r.Output, "[output truncated: kept last 50 bytes]\n"); len(body) != 50 {
+		t.Errorf("kept %d bytes, want 50", len(body))
+	}
+}
