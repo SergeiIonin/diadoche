@@ -1,8 +1,10 @@
 package specs
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -924,5 +926,303 @@ func TestWaitingDependency(t *testing.T) {
 	}
 	if got, err := WaitingDependency(l, "004_free.md"); err != nil || got != "" {
 		t.Errorf("WaitingDependency over a cycle = %q, %v", got, err)
+	}
+}
+
+// graphLayout writes specs (file name -> content) into a fresh layout and,
+// when rows is non-nil, STATUS.md with them.
+func graphLayout(t *testing.T, specs map[string]string, rows []Row) Layout {
+	t.Helper()
+	l := NewLayout(t.TempDir())
+	if err := l.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	for f, body := range specs {
+		writeSpec(t, filepath.Join(l.SpecDir, f), body)
+	}
+	if rows != nil {
+		if err := WriteStatus(l.StatusPath, rows); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return l
+}
+
+// requireQueue syncs l and checks QUEUE.md and PendingQueue both equal want.
+func requireQueue(t *testing.T, l Layout, want ...string) {
+	t.Helper()
+	pending, err := PendingQueue(l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Sync(l); err != nil {
+		t.Fatal(err)
+	}
+	queue, err := ReadQueue(l.QueuePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(queue, ",") != strings.Join(want, ",") {
+		t.Errorf("QUEUE.md = %v, want %v", queue, want)
+	}
+	if strings.Join(pending, ",") != strings.Join(want, ",") {
+		t.Errorf("PendingQueue = %v, want %v", pending, want)
+	}
+}
+
+func TestDependsOnThreeStates(t *testing.T) {
+	cases := []struct {
+		in       string
+		want     []string
+		declared bool
+	}{
+		{"# T\nno line here\n", nil, false},
+		{"", nil, false},
+		{"Depends-on: none\n", nil, true},
+		{"Depends-on: NONE\n", nil, true},
+		{"Depends-on:\n", nil, true},
+		{"depends-on:   \n", nil, true},
+		{"Depends-on: 004, 7\n", []string{"004", "7"}, true},
+		{"Depends-on: none, 002\n", []string{"002"}, true},
+	}
+	for _, c := range cases {
+		got, declared := DependsOn([]byte(c.in))
+		if strings.Join(got, ",") != strings.Join(c.want, ",") || declared != c.declared {
+			t.Errorf("DependsOn(%q) = %v, %v; want %v, %v", c.in, got, declared, c.want, c.declared)
+		}
+		if p := ParseDependsOn([]byte(c.in)); strings.Join(p, ",") != strings.Join(got, ",") {
+			t.Errorf("ParseDependsOn(%q) = %v, DependsOn deps = %v", c.in, p, got)
+		}
+	}
+}
+
+func TestSyncQueueIsTopological(t *testing.T) {
+	t.Run("ready tasks by ascending number", func(t *testing.T) {
+		l := graphLayout(t, map[string]string{
+			"007_d.md": "# D\nDepends-on: 006\n",
+			"006_c.md": "# C\nDepends-on: 004\n",
+			"005_b.md": "# B\nDepends-on: 004\n",
+			"004_a.md": "# A\nDepends-on: none\n",
+		}, nil)
+		requireQueue(t, l, "004_a.md", "005_b.md", "006_c.md", "007_d.md")
+	})
+	t.Run("declared out of number order", func(t *testing.T) {
+		l := graphLayout(t, map[string]string{
+			"004_a.md": "# A\nDepends-on: 007\n",
+			"005_b.md": "# B\nDepends-on: 004\n",
+			"006_c.md": "# C\nDepends-on: 004\n",
+			"007_d.md": "# D\nDepends-on: none\n",
+		}, nil)
+		requireQueue(t, l, "007_d.md", "004_a.md", "005_b.md", "006_c.md")
+	})
+	t.Run("independent task overtakes a blocked chain", func(t *testing.T) {
+		l := graphLayout(t, map[string]string{
+			"004_a.md": "# A\nDepends-on: 006\n",
+			"005_b.md": "# B\nDepends-on: none\n",
+			"006_c.md": "# C\nDepends-on: none\n",
+		}, nil)
+		requireQueue(t, l, "005_b.md", "006_c.md", "004_a.md")
+	})
+}
+
+func TestQueueIgnoresDoneDependency(t *testing.T) {
+	l := graphLayout(t, map[string]string{
+		"001_a.md": "# A\nDepends-on: none\n",
+		"002_b.md": "# B\nDepends-on: 003\n",
+		"003_c.md": "# C\nDepends-on: none\n",
+	}, []Row{
+		{Num: "001", Spec: "001_a.md", Status: StatusQueued},
+		{Num: "002", Spec: "002_b.md", Status: StatusQueued},
+		{Num: "003", Spec: "003_c.md", Status: StatusDone},
+	})
+	requireQueue(t, l, "001_a.md", "002_b.md")
+}
+
+func TestQueueWithoutDependsOnUnchanged(t *testing.T) {
+	l := graphLayout(t, map[string]string{
+		"001_a.md": "# A\n",
+		"002_b.md": "# B\n",
+		"003_c.md": "# C\n",
+		"010_j.md": "# J\n",
+		"004_d.md": "# D\n",
+	}, []Row{
+		{Num: "010", Spec: "010_j.md", Status: StatusQueued},
+		{Num: "003", Spec: "003_c.md", Status: StatusQueued},
+		{Num: "002", Spec: "002_b.md", Status: StatusFailed},
+		{Num: "001", Spec: "001_a.md", Status: StatusInProgress},
+	})
+	requireQueue(t, l, "001_a.md", "003_c.md", "004_d.md", "010_j.md")
+}
+
+func TestQueueImplicitDependencyYieldsToDeclared(t *testing.T) {
+	l := graphLayout(t, map[string]string{
+		"003_a.md": "# A\nDepends-on: 005\n",
+		"004_b.md": "# B\n",
+		"005_c.md": "# C\n",
+	}, nil)
+	requireQueue(t, l, "005_c.md", "003_a.md", "004_b.md")
+}
+
+func TestQueueKeepsCycleMembers(t *testing.T) {
+	l := graphLayout(t, map[string]string{
+		"001_a.md": "# A\nDepends-on: 002\n",
+		"002_b.md": "# B\nDepends-on: 001\n",
+		"003_c.md": "# C\nDepends-on: none\n",
+	}, nil)
+	requireQueue(t, l, "003_c.md", "001_a.md", "002_b.md")
+}
+
+func TestValidateGraphDangling(t *testing.T) {
+	l := graphLayout(t, map[string]string{
+		"001_a.md": "# A\nDepends-on: none\n",
+		"002_b.md": "# B\nDepends-on: 001, 999\n",
+		"003_c.md": "# C\nDepends-on: 998\n",
+	}, nil)
+	err := ValidateGraph(l)
+	var ge *GraphError
+	if !errors.As(err, &ge) {
+		t.Fatalf("ValidateGraph = %v, want a *GraphError", err)
+	}
+	want := []DanglingDep{{Spec: "002_b.md", Num: "999"}, {Spec: "003_c.md", Num: "998"}}
+	if !slices.Equal(ge.Dangling, want) {
+		t.Errorf("Dangling = %v, want %v", ge.Dangling, want)
+	}
+	for _, s := range []string{"002_b.md: Depends-on names 999, which matches no task spec", "003_c.md: Depends-on names 998"} {
+		if !strings.Contains(err.Error(), s) {
+			t.Errorf("error %q does not contain %q", err, s)
+		}
+	}
+	if len(ge.Cycles) != 0 {
+		t.Errorf("Cycles = %v, want none", ge.Cycles)
+	}
+}
+
+func TestValidateGraphCycles(t *testing.T) {
+	l := graphLayout(t, map[string]string{
+		"001_a.md": "# A\nDepends-on: 002\n",
+		"002_b.md": "# B\nDepends-on: 001\n",
+		"003_c.md": "# C\nDepends-on: 005\n",
+		"004_d.md": "# D\nDepends-on: 003\n",
+		"005_e.md": "# E\nDepends-on: 004\n",
+		"006_f.md": "# F\nDepends-on: 006\n",
+		"007_g.md": "# G\nDepends-on: 001\n",
+	}, []Row{{Num: "003", Spec: "003_c.md", Status: StatusDone}})
+	err := ValidateGraph(l)
+	var ge *GraphError
+	if !errors.As(err, &ge) {
+		t.Fatalf("ValidateGraph = %v, want a *GraphError", err)
+	}
+	want := [][]string{{"001_a.md", "002_b.md"}, {"003_c.md", "005_e.md", "004_d.md"}, {"006_f.md"}}
+	if !slices.EqualFunc(ge.Cycles, want, slices.Equal[[]string]) {
+		t.Errorf("Cycles = %v, want %v", ge.Cycles, want)
+	}
+	for _, s := range []string{
+		"dependency cycle: 001_a.md -> 002_b.md -> 001_a.md",
+		"dependency cycle: 003_c.md -> 005_e.md -> 004_d.md -> 003_c.md",
+		"dependency cycle: 006_f.md -> 006_f.md",
+	} {
+		if !strings.Contains(err.Error(), s) {
+			t.Errorf("error %q does not contain %q", err, s)
+		}
+	}
+
+	valid := graphLayout(t, map[string]string{
+		"001_a.md": "# A\n",
+		"002_b.md": "# B\nDepends-on: 001\n",
+		"003_c.md": "# C\nDepends-on: none\n",
+	}, nil)
+	if err := ValidateGraph(valid); err != nil {
+		t.Errorf("ValidateGraph(valid) = %v, want nil", err)
+	}
+}
+
+func TestCheckDependencies(t *testing.T) {
+	l := graphLayout(t, map[string]string{
+		"001_a.md":        "# A\n",
+		"002_b.md":        "# B\n",
+		"003_c.md":        "# C\n",
+		"004_d.md":        "# D\n",
+		"005_e.md":        "# E\n",
+		"010_ready.md":    "# R\nDepends-on: 001\n",
+		"011_failed.md":   "# F\nDepends-on: 001, 002\n",
+		"012_blocked.md":  "# B\nDepends-on: 004, 003\n",
+		"013_pending.md":  "# P\nDepends-on: 001, 004, 005, 099\n",
+		"014_implicit.md": "# I\n",
+	}, []Row{
+		{Num: "001", Spec: "001_a.md", Status: StatusDone},
+		{Num: "002", Spec: "002_b.md", Status: StatusFailed},
+		{Num: "003", Spec: "003_c.md", Status: StatusBlocked},
+		{Num: "004", Spec: "004_d.md", Status: StatusQueued},
+		{Num: "005", Spec: "005_e.md", Status: "SKIPPED"},
+	})
+	check := func(spec string) DepCheck {
+		t.Helper()
+		chk, err := CheckDependencies(l, spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return chk
+	}
+	if chk := check("010_ready.md"); chk.Blocker.Spec != "" || len(chk.Unfinished) != 0 {
+		t.Errorf("010: %+v, want ready", chk)
+	}
+	if chk := check("011_failed.md"); chk.Blocker.Spec != "002_b.md" || chk.Blocker.Status != StatusFailed {
+		t.Errorf("011: %+v, want blocked by FAILED 002_b.md", chk)
+	}
+	if chk := check("012_blocked.md"); chk.Blocker.Spec != "003_c.md" || chk.Blocker.Status != StatusBlocked {
+		t.Errorf("012: %+v, want blocked by BLOCKED 003_c.md", chk)
+	}
+	want := []string{"004 (QUEUED)", "005 (SKIPPED)", "099 (no such task)"}
+	if chk := check("013_pending.md"); chk.Blocker.Spec != "" || !slices.Equal(chk.Unfinished, want) {
+		t.Errorf("013: %+v, want unfinished %v", chk, want)
+	}
+	if chk := check("014_implicit.md"); chk.Blocker.Spec != "" || len(chk.Unfinished) != 0 {
+		t.Errorf("014 (no Depends-on, FAILED/BLOCKED tasks ahead): %+v, want ready", chk)
+	}
+}
+
+func TestBlockForDependencyCascades(t *testing.T) {
+	for _, status := range []string{StatusFailed, StatusBlocked} {
+		t.Run(status, func(t *testing.T) {
+			l := graphLayout(t, map[string]string{
+				"001_a.md": "# A\n",
+				"002_b.md": "# B\nDepends-on: 001\n",
+				"003_c.md": "# C\nDepends-on: 002\n",
+				"004_d.md": "# D\n",
+			}, []Row{
+				{Num: "001", Spec: "001_a.md", Status: status},
+				{Num: "002", Spec: "002_b.md", Status: StatusQueued},
+				{Num: "003", Spec: "003_c.md", Status: StatusQueued},
+				{Num: "004", Spec: "004_d.md", Status: StatusQueued},
+			})
+			chk, err := CheckDependencies(l, "002_b.md")
+			if err != nil {
+				t.Fatal(err)
+			}
+			rows, err := BlockForDependency(l, "002_b.md", chk.Blocker)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rows) != 2 || rows[0].Spec != "002_b.md" || rows[1].Spec != "003_c.md" {
+				t.Fatalf("blocked rows = %+v, want 002_b.md then 003_c.md", rows)
+			}
+			got, _ := ReadStatus(l.StatusPath)
+			wantReasons := map[string]string{
+				"002_b.md": "depends on 001_a.md, which is " + status,
+				"003_c.md": "depends on 002_b.md, which is BLOCKED",
+			}
+			for _, r := range got {
+				switch r.Spec {
+				case "002_b.md", "003_c.md":
+					if r.Status != StatusBlocked || r.Reason != wantReasons[r.Spec] {
+						t.Errorf("%s = %s: %q, want BLOCKED: %q", r.Spec, r.Status, r.Reason, wantReasons[r.Spec])
+					}
+				case "004_d.md":
+					if r.Status != StatusQueued {
+						t.Errorf("004_d.md = %s, want QUEUED (no Depends-on line)", r.Status)
+					}
+				}
+			}
+		})
 	}
 }

@@ -254,11 +254,7 @@ func (o *Orchestrator) blockTask(ctx context.Context, specFile, num string, ws *
 	if err != nil {
 		o.Log.Printf("task %s: couldn't block the tasks that depend on it: %v", specFile, err)
 	}
-	for _, d := range deps {
-		o.Log.Printf("task %s: BLOCKED: %s", d.Spec, d.Reason)
-		o.event(d.Spec, 0, "", "status", runlog.F("status", specs.StatusBlocked), runlog.F("reason", "dependency"),
-			runlog.F("blocked_by", blockerOf(d.Reason, specFile)))
-	}
+	o.reportDependencyBlocks(deps, specFile)
 
 	if err := os.WriteFile(reportPath, []byte(o.blockedReport(specFile, num, reason, applied, where, ws != nil, deps)), 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", reportPath, err)
@@ -268,6 +264,17 @@ func (o *Orchestrator) blockTask(ctx context.Context, specFile, num string, ws *
 		o.commitBookkeeping(ctx, specFile, "diadoche: BLOCKED "+specFile)
 	}
 	return nil
+}
+
+// reportDependencyBlocks logs every row BLOCKED because of a dependency
+// and records it as a status event naming its direct blocker (fallback
+// when the reason names none).
+func (o *Orchestrator) reportDependencyBlocks(rows []specs.Row, fallback string) {
+	for _, d := range rows {
+		o.Log.Printf("task %s: BLOCKED: %s", d.Spec, d.Reason)
+		o.event(d.Spec, 0, "", "status", runlog.F("status", specs.StatusBlocked), runlog.F("reason", "dependency"),
+			runlog.F("blocked_by", blockerOf(d.Reason, fallback)))
+	}
 }
 
 // blockerOf is the spec a dependency-BLOCKED row's reason names (its

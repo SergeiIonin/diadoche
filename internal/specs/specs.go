@@ -12,6 +12,19 @@
 // re-queues it, see ResumeWaiting). Only QUEUED, IN_PROGRESS and PAUSED
 // tasks are pending: neither a run nor a restart picks up a WAITING task on
 // its own.
+//
+// A task spec's Depends-on line (see DependsOn) has three states. Absent:
+// the task implicitly depends on the pending task before it in queue order,
+// so specs written without the line keep running one after another. This
+// implicit dependency constrains scheduling only — the queue order — and
+// never feeds the BLOCKED cascade: a FAILED or BLOCKED task does not block
+// tasks that merely sit behind it. "Depends-on: none" (or an empty value):
+// the task depends on nothing. A list of task numbers: exactly those tasks;
+// the task starts only once all of them are DONE, and becomes BLOCKED when
+// one of them is FAILED or BLOCKED (see CheckDependencies,
+// BlockForDependency and BlockDependents). ValidateGraph rejects declared
+// dependencies on missing tasks and dependency cycles; the pending queue is
+// ordered topologically (see pendingQueue).
 package specs
 
 import (
@@ -276,11 +289,11 @@ func WriteFileAtomic(path string, data []byte) error {
 // Sync discovers new task spec files that aren't in STATUS.md yet, appends
 // them as QUEUED rows, and rebuilds QUEUE.md from scratch: every row still
 // QUEUED, IN_PROGRESS or PAUSED (new tasks, and any left mid-flight by a
-// previous, interrupted run), ordered by ascending task number — so a restart always
-// resumes with the lowest-numbered pending task first, regardless of what
-// order rows happen to sit in STATUS.md or the previous QUEUE.md — except
-// that a spec with a Split-from line sorts at its original's position (see
-// pendingQueue). DONE, FAILED, BLOCKED and WAITING rows are not pending and
+// previous, interrupted run), each after the pending tasks it depends on,
+// otherwise by ascending task number — so a restart always resumes with the
+// lowest-numbered ready task first, regardless of what order rows happen to
+// sit in STATUS.md or the previous QUEUE.md — a spec with a Split-from line
+// sorting at its original's position (see pendingQueue). DONE, FAILED, BLOCKED and WAITING rows are not pending and
 // never go back to the queue (a WAITING one only by ResumeWaiting).
 func Sync(l Layout) (rows []Row, queue []string, err error) {
 	if err = l.Ensure(); err != nil {
@@ -299,7 +312,7 @@ func Sync(l Layout) (rows []Row, queue []string, err error) {
 }
 
 // PendingQueue returns the queue Sync would build — every pending task in
-// ascending task number, including task files not in STATUS.md yet —
+// dependency order, including task files not in STATUS.md yet —
 // without writing anything: no STATUS.md, no QUEUE.md, not even the spec
 // directory. Used by --dry-run.
 func PendingQueue(l Layout) ([]string, error) {
@@ -337,13 +350,27 @@ func mergedRows(l Layout) ([]Row, error) {
 	return rows, nil
 }
 
-// pendingQueue returns the specs of every QUEUED/IN_PROGRESS/PAUSED row in rows
-// (DONE, FAILED, BLOCKED and WAITING rows are not pending),
-// sorted ascending by numeric task number (rows whose Num isn't a plain
-// integer sort after all that are, in their original relative order). A
-// spec whose file has a Split-from line sorts right where the spec it was
-// split from would, ahead of every higher-numbered task, the parts in their
-// own number order; this nests, so a split of a split lands in place too.
+// pendingQueue returns the specs of every QUEUED/IN_PROGRESS/PAUSED row in
+// rows (DONE, FAILED, BLOCKED and WAITING rows are not pending), in
+// topological order: every task after the pending tasks it depends on.
+//
+// The base order sorts ascending by numeric task number (rows whose Num
+// isn't a plain integer sort after all that are, in their original relative
+// order); a spec whose file has a Split-from line sorts right where the spec
+// it was split from would, ahead of every higher-numbered task, the parts in
+// their own number order; this nests, so a split of a split lands in place
+// too. Among the tasks whose dependencies are all placed, the first in base
+// order goes next.
+//
+// Edges: a declared Depends-on number points at every pending task with
+// that number (a dependency that isn't pending — DONE, say — imposes
+// nothing). A spec without a Depends-on line depends implicitly on the
+// pending task right before it in base order, unless that edge would close
+// a cycle with the edges added so far (declared ones first, then implicit
+// ones in base order): implicit edges yield to declared ones. With no
+// Depends-on lines at all the result is exactly the base order. A cycle
+// among declared edges (ValidateGraph rejects those) never loses a task: the
+// tasks left on it follow in base order.
 func pendingQueue(l Layout, rows []Row) []string {
 	type pending struct {
 		key  []int
@@ -351,18 +378,86 @@ func pendingQueue(l Layout, rows []Row) []string {
 	}
 	var items []pending
 	for _, r := range rows {
-		if r.Status != StatusQueued && r.Status != StatusInProgress && r.Status != StatusPaused {
+		if !isPending(r.Status) {
 			continue
 		}
 		items = append(items, pending{key: queueKey(l, r.Spec, rowNumber(r.Num), nil), spec: r.Spec})
 	}
 	sort.SliceStable(items, func(i, j int) bool { return slices.Compare(items[i].key, items[j].key) < 0 })
 
-	out := make([]string, len(items))
+	n := len(items)
+	deps := make([][]int, n) // deps[i]: indices i must come after
+	declared := make([]bool, n)
 	for i, it := range items {
-		out[i] = it.spec
+		var nums []string
+		nums, declared[i] = readDependsOn(l, it.spec)
+		for _, d := range nums {
+			for j, other := range items {
+				if j != i && sameTaskNumber(TaskNumber(other.spec), d) && !slices.Contains(deps[i], j) {
+					deps[i] = append(deps[i], j)
+				}
+			}
+		}
+	}
+	// reaches reports whether to is reachable from from over deps.
+	reaches := func(from, to int) bool {
+		seen := make([]bool, n)
+		stack := []int{from}
+		for len(stack) > 0 {
+			v := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			if v == to {
+				return true
+			}
+			if seen[v] {
+				continue
+			}
+			seen[v] = true
+			stack = append(stack, deps[v]...)
+		}
+		return false
+	}
+	for i := 1; i < n; i++ {
+		if !declared[i] && !reaches(i-1, i) {
+			deps[i] = append(deps[i], i-1)
+		}
+	}
+
+	out := make([]string, 0, n)
+	placed := make([]bool, n)
+	for len(out) < n {
+		next := -1
+		for i := range items {
+			if placed[i] {
+				continue
+			}
+			ready := true
+			for _, d := range deps[i] {
+				ready = ready && placed[d]
+			}
+			if ready {
+				next = i
+				break
+			}
+		}
+		if next < 0 {
+			for i := range items {
+				if !placed[i] {
+					placed[i] = true
+					out = append(out, items[i].spec)
+				}
+			}
+			break
+		}
+		placed[next] = true
+		out = append(out, items[next].spec)
 	}
 	return out
+}
+
+// isPending reports whether status is QUEUED, IN_PROGRESS or PAUSED.
+func isPending(status string) bool {
+	return status == StatusQueued || status == StatusInProgress || status == StatusPaused
 }
 
 // rowNumber is num as an integer, math.MaxInt if it isn't one.
@@ -570,40 +665,64 @@ func HasNoTestsMarker(specContent []byte) bool {
 }
 
 // DependsOnPrefix starts the optional line of a task spec naming the tasks
-// it depends on: "Depends-on: 003, 007". A task depending on a BLOCKED task
-// is BLOCKED too (see BlockDependents); a spec without the line depends on
-// nothing.
+// it depends on: "Depends-on: 003, 007". It has three states (see
+// DependsOn): absent — the task implicitly runs after the task before it in
+// queue order, an ordering constraint only; "Depends-on: none" or an empty
+// value — no dependencies; a list — exactly those tasks, which must all be
+// DONE before it starts. A task whose declared dependency is FAILED or
+// BLOCKED is BLOCKED too (see BlockForDependency and BlockDependents).
 const DependsOnPrefix = "Depends-on:"
 
 var dependsOnRe = regexp.MustCompile(`(?i)^depends-on:\s*(.*)$`)
 
-// ParseDependsOn returns the task numbers named on specContent's
-// Depends-on lines (the key is case-insensitive; several lines add up), in
-// order and without duplicates. Numbers are comma- or space-separated; a
-// spec file name such as 003_foo.md counts as its number, and anything else
-// that isn't a plain number is ignored. nil means no dependencies.
-func ParseDependsOn(specContent []byte) []string {
-	var out []string
+// DependsOn returns the task numbers named on specContent's Depends-on
+// lines (the key is case-insensitive; several lines add up), in order and
+// without duplicates, and whether there is such a line at all. Numbers are
+// comma- or space-separated; a spec file name such as 003_foo.md counts as
+// its number, and anything else that isn't a plain number ("none"
+// included) is ignored. declared false means the line is absent (the
+// implicit previous-task dependency, ordering only); declared true with no
+// deps means "Depends-on: none" or an empty value.
+func DependsOn(specContent []byte) (deps []string, declared bool) {
 	for line := range strings.SplitSeq(string(specContent), "\n") {
 		m := dependsOnRe.FindStringSubmatch(strings.TrimSpace(line))
 		if m == nil {
 			continue
 		}
+		declared = true
 		for tok := range strings.FieldsFuncSeq(m[1], func(r rune) bool { return r == ',' || r == ' ' || r == '\t' }) {
 			num := TaskNumber(strings.Trim(tok, "`"))
 			if num == "" || strings.Trim(num, "0123456789") != "" {
 				continue
 			}
 			dup := false
-			for _, seen := range out {
+			for _, seen := range deps {
 				dup = dup || sameTaskNumber(seen, num)
 			}
 			if !dup {
-				out = append(out, num)
+				deps = append(deps, num)
 			}
 		}
 	}
-	return out
+	return deps, declared
+}
+
+// ParseDependsOn returns the explicitly declared dependencies of
+// specContent, as DependsOn does, without telling an absent line from an
+// empty one. nil means no declared dependencies.
+func ParseDependsOn(specContent []byte) []string {
+	deps, _ := DependsOn(specContent)
+	return deps
+}
+
+// readDependsOn is DependsOn of spec's file in the spec directory; an
+// unreadable file has no line.
+func readDependsOn(l Layout, spec string) (deps []string, declared bool) {
+	b, err := os.ReadFile(filepath.Join(l.SpecDir, spec))
+	if err != nil {
+		return nil, false
+	}
+	return DependsOn(b)
 }
 
 // sameTaskNumber compares task numbers numerically when both are integers
@@ -619,7 +738,8 @@ func sameTaskNumber(a, b string) bool {
 
 // BlockDependents marks BLOCKED every pending (QUEUED, IN_PROGRESS or
 // PAUSED) task whose spec declares, via a Depends-on line, a dependency on
-// blockedSpec — and, transitively, every pending task depending on one of
+// blockedSpec (explicitly declared dependencies only: the implicit
+// previous-task dependency of a spec without the line never cascades) — and, transitively, every pending task depending on one of
 // those. Each newly blocked row's reason names its direct blocker. DONE,
 // FAILED and BLOCKED rows are left alone, as is a row whose spec file can't
 // be read; so are WAITING rows. STATUS.md is written once, and only if something changed; the
@@ -631,14 +751,10 @@ func BlockDependents(l Layout, blockedSpec string) ([]Row, error) {
 	}
 	deps := make([][]string, len(rows))
 	for i, r := range rows {
-		if r.Status != StatusQueued && r.Status != StatusInProgress && r.Status != StatusPaused {
+		if !isPending(r.Status) {
 			continue
 		}
-		b, err := os.ReadFile(filepath.Join(l.SpecDir, r.Spec))
-		if err != nil {
-			continue
-		}
-		deps[i] = ParseDependsOn(b)
+		deps[i], _ = readDependsOn(l, r.Spec)
 	}
 
 	type blocker struct{ num, spec string }
@@ -733,11 +849,8 @@ func WaitingDependency(l Layout, spec string) (string, error) {
 	for len(frontier) > 0 {
 		var next []string
 		for _, s := range frontier {
-			b, err := os.ReadFile(filepath.Join(l.SpecDir, s))
-			if err != nil {
-				continue
-			}
-			for _, d := range ParseDependsOn(b) {
+			deps, _ := readDependsOn(l, s)
+			for _, d := range deps {
 				for _, r := range rows {
 					if seen[r.Spec] || !sameTaskNumber(TaskNumber(r.Spec), d) {
 						continue
@@ -753,4 +866,182 @@ func WaitingDependency(l Layout, spec string) (string, error) {
 		frontier = next
 	}
 	return "", nil
+}
+
+// DanglingDep is a Depends-on number of Spec that matches no task spec.
+type DanglingDep struct{ Spec, Num string }
+
+// GraphError is what ValidateGraph found wrong with the declared task
+// dependency graph: every dangling reference (sorted by spec) and every
+// cycle (spec names in cycle order, starting at the smallest, the first not
+// repeated at the end; sorted by that first spec).
+type GraphError struct {
+	Dangling []DanglingDep
+	Cycles   [][]string
+}
+
+func (e *GraphError) Error() string {
+	var lines []string
+	for _, d := range e.Dangling {
+		lines = append(lines, fmt.Sprintf("%s: Depends-on names %s, which matches no task spec", d.Spec, d.Num))
+	}
+	for _, c := range e.Cycles {
+		lines = append(lines, "dependency cycle: "+strings.Join(append(slices.Clone(c), c[0]), " -> "))
+	}
+	return "task dependency graph is invalid:\n  " + strings.Join(lines, "\n  ")
+}
+
+// ValidateGraph checks the explicitly declared dependencies of every task
+// spec — every STATUS.md row and every task file not in it yet, whatever
+// its status — and returns a *GraphError listing every Depends-on number
+// that matches no task spec and every dependency cycle (a task depending on
+// itself is a cycle of one), or nil. A number matching several specs points
+// at all of them; an unreadable spec file declares nothing. The implicit
+// previous-task dependency is not part of this graph. It writes nothing.
+func ValidateGraph(l Layout) error {
+	rows, err := mergedRows(l)
+	if err != nil {
+		return err
+	}
+	specNames := make([]string, len(rows))
+	for i, r := range rows {
+		specNames[i] = r.Spec
+	}
+	slices.Sort(specNames)
+
+	ge := &GraphError{}
+	edges := map[string][]string{}
+	for _, spec := range specNames {
+		deps, _ := readDependsOn(l, spec)
+		for _, d := range deps {
+			found := false
+			for _, other := range specNames {
+				if sameTaskNumber(TaskNumber(other), d) {
+					found = true
+					if !slices.Contains(edges[spec], other) {
+						edges[spec] = append(edges[spec], other)
+					}
+				}
+			}
+			if !found {
+				ge.Dangling = append(ge.Dangling, DanglingDep{Spec: spec, Num: d})
+			}
+		}
+	}
+
+	const (
+		white = iota
+		grey
+		black
+	)
+	colour := map[string]int{}
+	seenCycle := map[string]bool{}
+	var stack []string
+	var visit func(spec string)
+	visit = func(spec string) {
+		colour[spec] = grey
+		stack = append(stack, spec)
+		for _, next := range edges[spec] {
+			switch colour[next] {
+			case white:
+				visit(next)
+			case grey:
+				start := slices.Index(stack, next)
+				cycle := slices.Clone(stack[start:])
+				least := 0
+				for i, s := range cycle {
+					if s < cycle[least] {
+						least = i
+					}
+				}
+				cycle = append(cycle[least:], cycle[:least]...)
+				if key := strings.Join(cycle, "\x00"); !seenCycle[key] {
+					seenCycle[key] = true
+					ge.Cycles = append(ge.Cycles, cycle)
+				}
+			}
+		}
+		stack = stack[:len(stack)-1]
+		colour[spec] = black
+	}
+	for _, spec := range specNames {
+		if colour[spec] == white {
+			visit(spec)
+		}
+	}
+	slices.SortStableFunc(ge.Cycles, func(a, b []string) int { return strings.Compare(a[0], b[0]) })
+
+	if len(ge.Dangling) == 0 && len(ge.Cycles) == 0 {
+		return nil
+	}
+	return ge
+}
+
+// DepCheck is whether a task's explicitly declared dependencies let it
+// start (see CheckDependencies). Blocker is the first declared dependency
+// that is FAILED or BLOCKED (zero Row if none); Unfinished describes every
+// other dependency not DONE yet, e.g. "001 (QUEUED)" or "009 (no such
+// task)". A task with neither may start.
+type DepCheck struct {
+	Blocker    Row
+	Unfinished []string
+}
+
+// CheckDependencies looks up the status of every dependency spec declares
+// on its Depends-on lines (a task file not in STATUS.md yet counts as
+// QUEUED). The implicit previous-task dependency of a spec without the line
+// is not checked: it only orders the queue, so a FAILED or BLOCKED task
+// never holds up tasks that merely follow it.
+func CheckDependencies(l Layout, spec string) (DepCheck, error) {
+	var chk DepCheck
+	rows, err := mergedRows(l)
+	if err != nil {
+		return chk, err
+	}
+	deps, _ := readDependsOn(l, spec)
+	for _, d := range deps {
+		unfinished := ""
+		matched := false
+		for _, r := range rows {
+			if !sameTaskNumber(TaskNumber(r.Spec), d) {
+				continue
+			}
+			matched = true
+			switch r.Status {
+			case StatusFailed, StatusBlocked:
+				if chk.Blocker.Spec == "" {
+					chk.Blocker = r
+				}
+			case StatusDone:
+			default:
+				if unfinished == "" {
+					unfinished = fmt.Sprintf("%s (%s)", d, r.Status)
+				}
+			}
+		}
+		if !matched {
+			unfinished = d + " (no such task)"
+		}
+		if unfinished != "" {
+			chk.Unfinished = append(chk.Unfinished, unfinished)
+		}
+	}
+	if chk.Blocker.Spec != "" {
+		chk.Unfinished = nil
+	}
+	return chk, nil
+}
+
+// BlockForDependency marks spec BLOCKED because its declared dependency dep
+// is FAILED or BLOCKED ("depends on <dep>, which is <status>"), then
+// cascades along declared dependencies (see BlockDependents). It returns
+// spec's own row followed by the rows blocked along with it.
+func BlockForDependency(l Layout, spec string, dep Row) ([]Row, error) {
+	reason := fmt.Sprintf("depends on %s, which is %s", dep.Spec, dep.Status)
+	if err := SetStatusReason(l, spec, StatusBlocked, reason); err != nil {
+		return nil, err
+	}
+	out := []Row{{Num: TaskNumber(spec), Spec: spec, Status: StatusBlocked, Reason: reason}}
+	more, err := BlockDependents(l, spec)
+	return append(out, more...), err
 }

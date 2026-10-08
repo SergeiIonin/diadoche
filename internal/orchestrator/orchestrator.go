@@ -290,6 +290,13 @@ func (o *Orchestrator) Run(ctx context.Context) (err error) {
 		if err := o.syncQueueLocked(); err != nil {
 			return fmt.Errorf("sync spec queue: %w", err)
 		}
+		// A dangling Depends-on reference or a dependency cycle stops the
+		// run before any agent is called for the tasks involved.
+		if err := specs.ValidateGraph(o.Layout); err != nil {
+			o.Log.Printf("%v", err)
+			o.printUsageSummary(uw)
+			return err
+		}
 		if !stateInitialized {
 			stateInitialized = true
 			queue, err := specs.ReadQueue(o.Layout.QueuePath)
@@ -305,6 +312,7 @@ func (o *Orchestrator) Run(ctx context.Context) (err error) {
 		}
 
 		processedAny := false
+		var deferred []string // "<spec> waits for <deps>", this round
 		consecutiveFailures := 0
 		for {
 			if o.stopRequested() {
@@ -320,6 +328,13 @@ func (o *Orchestrator) Run(ctx context.Context) (err error) {
 			if next == "" {
 				break
 			}
+			// Before a popped task starts: a task that stopped being
+			// pending after QUEUE.md was built is skipped; then one
+			// depending on a WAITING task; then one whose declared
+			// dependencies aren't all DONE (BLOCKED if one is FAILED or
+			// BLOCKED, deferred if one is still pending); then the run
+			// budget is checked.
+			//
 			// A task that stopped being pending after QUEUE.md was built
 			// (e.g. BLOCKED because a task it depends on was) is skipped.
 			if status, err := specs.GetStatus(o.Layout, next); err == nil &&
@@ -332,6 +347,27 @@ func (o *Orchestrator) Run(ctx context.Context) (err error) {
 			if dep, err := specs.WaitingDependency(o.Layout, next); err == nil && dep != "" {
 				o.Log.Printf("skipping %s: it depends on %s, which is %s", next, dep, specs.StatusWaiting)
 				o.event(next, 0, "", "skipped", runlog.F("reason", "waiting_dependency"), runlog.F("waiting_on", dep))
+				continue
+			}
+			// Only explicitly declared dependencies are checked here: the
+			// implicit "previous task" one only orders the queue.
+			chk, err := specs.CheckDependencies(o.Layout, next)
+			if err != nil {
+				return fmt.Errorf("check dependencies of %s: %w", next, err)
+			}
+			if chk.Blocker.Spec != "" {
+				rows, err := specs.BlockForDependency(o.Layout, next, chk.Blocker)
+				if err != nil {
+					o.Log.Printf("task %s: couldn't block it or the tasks that depend on it: %v", next, err)
+				}
+				o.reportDependencyBlocks(rows, chk.Blocker.Spec)
+				continue
+			}
+			if len(chk.Unfinished) > 0 {
+				waitsFor := strings.Join(chk.Unfinished, ", ")
+				o.Log.Printf("deferring %s: it depends on %s, not DONE yet", next, waitsFor)
+				o.event(next, 0, "", "skipped", runlog.F("reason", "pending_dependency"), runlog.F("waiting_on", waitsFor))
+				deferred = append(deferred, next+" waits for "+waitsFor)
 				continue
 			}
 			// --max-cost-per-run crossed by the previous task's last call:
@@ -361,6 +397,15 @@ func (o *Orchestrator) Run(ctx context.Context) (err error) {
 			consecutiveFailures = 0
 		}
 
+		if !processedAny && len(deferred) > 0 {
+			// Every task left waits for one that will never become DONE in
+			// this run: validation ruled cycles out, so STATUS.md was
+			// probably edited by hand.
+			o.cur = nil
+			o.saveState()
+			o.printUsageSummary(uw)
+			return fmt.Errorf("no pending task is ready and none is in flight (a hand-edited STATUS.md?): %s", strings.Join(deferred, "; "))
+		}
 		if !processedAny {
 			// Nothing left to do and nothing new showed up in this round's
 			// sync: no leftover work, no new task specs. We're done.

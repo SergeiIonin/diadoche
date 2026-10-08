@@ -401,3 +401,29 @@ func TestDryRunResumeWaitingShowsAnswersAndChangesNothing(t *testing.T) {
 		t.Errorf("QUESTIONS.md changed:\n%s", got)
 	}
 }
+
+func TestDryRunReportsInvalidGraphAndStartsNothing(t *testing.T) {
+	dir, layout := dryRunRepo(t)
+	writeFile(t, filepath.Join(layout.SpecDir, "001_a.md"), "# A\nDepends-on: 002\n")
+	writeFile(t, filepath.Join(layout.SpecDir, "002_b.md"), "# B\nDepends-on: 001\n")
+	writeFile(t, filepath.Join(layout.SpecDir, "003_c.md"), "# C\nDepends-on: 999\n")
+	filesBefore, gitBefore := treeSnapshot(t, dir), gitSnapshot(t, dir)
+
+	var buf bytes.Buffer
+	logger := log.New(&buf, "", 0)
+	o := newDryRunOrchestrator(dir, layout, neverCalledRunner{t}, logger)
+	err := o.Run(context.Background())
+	if err == nil {
+		t.Fatal("Run succeeded on a graph with a cycle and a dangling reference")
+	}
+	for _, want := range []string{"dependency cycle: 001_a.md -> 002_b.md -> 001_a.md", "003_c.md: Depends-on names 999"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error lacks %q: %v", want, err)
+		}
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("log lacks %q:\n%s", want, buf.String())
+		}
+	}
+	diffSnapshots(t, "files", filesBefore, treeSnapshot(t, dir))
+	diffSnapshots(t, "git", gitBefore, gitSnapshot(t, dir))
+}

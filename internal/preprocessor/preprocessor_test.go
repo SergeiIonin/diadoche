@@ -247,13 +247,29 @@ func TestBuildPromptRawModeUnchanged(t *testing.T) {
 	want := "Raw task file (raw/x.md):\ndo A and B\n\n" +
 		"Existing task spec files already in /p/spec (do not reuse or collide with their numbers):\n- 001_a.md\n\n" +
 		"Split this raw task into one or more atomic task specs and write each as its own file " +
-		"directly in /p/spec (not in spec/raw), following the spec/NNN_<slug>.md naming convention."
+		"directly in /p/spec (not in spec/raw), following the spec/NNN_<slug>.md naming convention. " +
+		`Every spec you write must contain, on a line of its own, "Depends-on: NNN[, NNN...]" naming the tasks it really depends on, ` +
+		`or "Depends-on: none" when it depends on nothing.`
 	if got != want {
 		t.Errorf("buildPrompt =\n%q\nwant\n%q", got, want)
 	}
 	got = buildPrompt("raw/x.md", "do A", "/p/spec", nil)
 	if !strings.Contains(got, "There are no existing task spec files in /p/spec yet; start numbering from 001.\n\n") {
 		t.Errorf("buildPrompt without existing files =\n%s", got)
+	}
+}
+
+func TestPromptsRequireDependsOnEveryTask(t *testing.T) {
+	prompts := map[string]string{
+		"raw":   buildPrompt("raw/x.md", "do A and B", "/p/spec", nil),
+		"split": SplitPrompt(SplitRequest{SpecFile: "001_big.md", SpecContent: "# Big", SpecDir: "/p/spec", Iterations: 2}),
+	}
+	for mode, got := range prompts {
+		for _, want := range []string{"Every spec you write must contain", `"Depends-on: NNN[, NNN...]"`, `"Depends-on: none"`} {
+			if !strings.Contains(got, want) {
+				t.Errorf("%s prompt lacks %q:\n%s", mode, want, got)
+			}
+		}
 	}
 }
 

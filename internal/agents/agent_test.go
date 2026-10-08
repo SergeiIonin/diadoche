@@ -141,6 +141,22 @@ func TestEmbeddedTesterPromptIsDiffScoped(t *testing.T) {
 	}
 }
 
+func TestEmbeddedPreprocessorPromptDemandsDependsOnEveryTask(t *testing.T) {
+	pre, err := LoadOrDefault(t.TempDir(), "preprocessor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Every task file you create MUST have a `Depends-on:` line", "`Depends-on: none`",
+		"Every new task gets a `Depends-on:` line (`Depends-on: none` included)", "FAILED or BLOCKED", "cycle"} {
+		if !strings.Contains(pre.SystemPrompt, want) {
+			t.Errorf("embedded preprocessor prompt is missing %q", want)
+		}
+	}
+	if strings.Contains(pre.SystemPrompt, "depends on nothing gets no such line") {
+		t.Error("embedded preprocessor prompt still lets an independent task omit the Depends-on line")
+	}
+}
+
 // TestEmbeddedPlannerPromptAsksForRelevantADRs pins the ADR half of the
 // plan: planner reads the index and always writes the section, "none"
 // included, next to the two required sections.

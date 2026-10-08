@@ -163,12 +163,17 @@ func recordUsage(logger *log.Logger, layout specs.Layout, dryRun bool, taskPath,
 	}
 }
 
+// dependsOnRule is the sentence of both prompts that makes every task spec
+// the preprocessor writes declare its dependencies explicitly.
+const dependsOnRule = `Every spec you write must contain, on a line of its own, "Depends-on: NNN[, NNN...]" naming the tasks it really depends on, ` +
+	`or "Depends-on: none" when it depends on nothing.`
+
 func buildPrompt(taskPath, rawContent, specDir string, existing []string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Raw task file (%s):\n%s\n\n", taskPath, rawContent)
 	writeExisting(&b, specDir, existing)
 	fmt.Fprintf(&b, "Split this raw task into one or more atomic task specs and write each as its own file "+
-		"directly in %s (not in spec/raw), following the spec/NNN_<slug>.md naming convention.", specDir)
+		"directly in %s (not in spec/raw), following the spec/NNN_<slug>.md naming convention. %s", specDir, dependsOnRule)
 	return b.String()
 }
 
@@ -218,9 +223,9 @@ func SplitPrompt(req SplitRequest) string {
 		"Its code changes have been set aside, so the new tasks start from the code as it was before it. "+
 		"Use the reviews to see where it got stuck. "+
 		"Write each new task as its own file directly in %s, following the spec/NNN_<slug>.md naming convention, "+
-		"numbered after the highest existing number, in the order they should run, with Depends-on lines between them where needed. "+
+		"numbered after the highest existing number, in the order they should run. %s "+
 		"Do not modify the original spec, its plan or reviews, STATUS.md or QUEUE.md.",
-		req.SpecFile, req.Iterations, req.SpecDir)
+		req.SpecFile, req.Iterations, req.SpecDir, dependsOnRule)
 	return b.String()
 }
 

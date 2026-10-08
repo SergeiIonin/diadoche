@@ -33,7 +33,16 @@ import (
 // QUESTIONS.md; with --resume-waiting the WAITING tasks are walked too
 // (their prompts carry their questions and answers), but they stay
 // WAITING.
+//
+// Like a real run it first validates the task dependency graph (see
+// specs.ValidateGraph): a dangling Depends-on reference or a cycle is
+// reported and returned as the error, and no agent is called. The queue is
+// walked in the same dependency order a real run uses.
 func (o *Orchestrator) dryRun(ctx context.Context) error {
+	if err := specs.ValidateGraph(o.Layout); err != nil {
+		o.Log.Printf("dry-run: %v", err)
+		return fmt.Errorf("dry-run: %w", err)
+	}
 	planner, worker, tester, err := o.loadAgents()
 	if err != nil {
 		return err

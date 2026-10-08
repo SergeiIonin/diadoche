@@ -260,10 +260,32 @@ still leave it pending.
   [Open questions and WAITING](#open-questions-and-waiting---resume-waiting).)
 
 A task spec may declare dependencies on a line of its own,
-`Depends-on: 003, 007`. When a task is BLOCKED, every pending task that
-depends on it (transitively) is BLOCKED too, with the reason
-`depends on <spec>, which is BLOCKED`; a spec without the line depends on
-nothing. Every applied policy is a `run.log` event
+`Depends-on: 003, 007`. The line has three states:
+
+- **a list of task numbers** — the task starts only once every task it
+  names is `DONE`, and the queue places it after them. When one of them is
+  `FAILED` or `BLOCKED`, the task becomes `BLOCKED` instead
+  (`depends on <spec>, which is FAILED`), and so, transitively, does every
+  pending task that names it; when a task is BLOCKED by `--on-fail`, its
+  dependents are BLOCKED right away (`depends on <spec>, which is BLOCKED`).
+  A dependency still pending leaves the task `QUEUED` for a later round of
+  the loop; if nothing left is ready and nothing is in flight, the run
+  stops with an error naming the stuck tasks;
+- **`Depends-on: none`** (or an empty `Depends-on:`) — no dependencies, the
+  task may run whenever;
+- **absent** — the task implicitly runs after the task before it in queue
+  order, exactly as before the line existed. This implicit dependency only
+  orders the queue: a `FAILED` or `BLOCKED` task never blocks tasks that
+  merely follow it.
+
+The declared graph is validated at startup, over every task spec: a
+`Depends-on` number that matches no task spec, and a dependency cycle, are
+both errors (all offenders are listed, e.g.
+`dependency cycle: 004_a.md -> 005_b.md -> 004_a.md`) that stop the run
+before any agent is called; `--dry-run` reports them the same way. The
+queue (`QUEUE.md`) is ordered topologically: every task after the pending
+tasks it depends on, ascending task number between tasks that are both
+ready. Every applied policy is a `run.log` event
 `on_fail_policy policy=<name> step=<n> outcome=<...>`. `--dry-run` applies
 no policy, calls no agent for it and writes no spec.
 
@@ -298,7 +320,9 @@ preprocessor) are guarded by a `spec/.lock` file lock, so a concurrent
 
 1. On startup, diadoche compares `spec/NNN_<slug>.md` files against the
    `spec/STATUS.md` table; new tasks are added there with status `QUEUED`
-   and pushed onto `spec/QUEUE.md` (this run's work queue).
+   and pushed onto `spec/QUEUE.md` (this run's work queue, in dependency
+   order — see `Depends-on` above; a dangling reference or a cycle stops
+   the run here).
 2. For each task pulled off the queue, status is set to `IN_PROGRESS`, and
    diadoche runs up to `--ITER` rounds of:
    - **planner** (model `claude-opus-5-5` by default) — writes

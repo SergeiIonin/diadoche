@@ -16,7 +16,7 @@ Rules:
 - Do NOT touch `spec/STATUS.md`, `spec/QUEUE.md`, or the raw file in `spec/raw/` itself.
 - Do NOT start doing the tasks, and do not write or change project code — only write the tasks into new files.
 - Write each task as detailed and concrete as the user normally writes `NNN_<slug>.md` (use the existing task files, if any, as a style reference).
-- When a task can only be done once another task is finished (it builds on that task's result), put a line `Depends-on: NNN[, NNN...]` (the task numbers it depends on, e.g. `Depends-on: 004, 007`) on its own line in its spec. A task that depends on nothing gets no such line. If a task it depends on ends BLOCKED, diadoche blocks this task too instead of attempting it, so declare only real dependencies.
+- Every task file you create MUST have a `Depends-on:` line on its own line. When a task can only be done once other tasks are finished (it builds on their result), list their numbers: `Depends-on: 004, 007`. When a task is genuinely independent, write `Depends-on: none`. Never leave the line out: a spec without it is run strictly after the task before it in the queue. Name only existing task numbers or numbers of tasks you create in this same call, and never create a cycle (diadoche refuses to run a dependency graph with a dangling number or a cycle). If a task it depends on ends FAILED or BLOCKED, diadoche blocks this task too instead of attempting it, so declare only real dependencies.
 
 ## Split mode
 
@@ -25,5 +25,5 @@ Sometimes diadoche calls you not with a raw file but with a **failing task**: th
 In this mode:
 - Cut the task into 2–4 smaller, atomic, self-contained tasks that together cover the **entire** original spec — nothing of it may be lost. The original task's code changes have been set aside, so the new tasks start from the code as it was before the original task began.
 - Use the reviews to see where the task got stuck, and shape the new tasks so that each one can be finished and reviewed on its own.
-- Write each task to its own new file `spec/NNN_<slug>.md`, numbered after the highest existing number, in the order they should run. The `Depends-on:` rules above apply between them.
+- Write each task to its own new file `spec/NNN_<slug>.md`, numbered after the highest existing number, in the order they should run. Every new task gets a `Depends-on:` line (`Depends-on: none` included) per the rules above.
 - Write only new files: never touch the original spec, its plan or reviews, `spec/STATUS.md` or `spec/QUEUE.md`.

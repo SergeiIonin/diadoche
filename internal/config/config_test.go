@@ -655,7 +655,8 @@ func TestParseHelpMentionsOnFail(t *testing.T) {
 	})
 	for _, want := range []string{"ON-FAIL POLICIES", "--on-fail", "--escalation-model", "DIADOCHE_ESCALATION_MODEL",
 		"escalate", "block", "Depends-on:", "NNN_BLOCKED.md", "diadoche/blocked/", "on_fail_policy",
-		"split", "Split-from", "diadoche/split/", "no_op", "--on-fail escalate,split,block"} {
+		"split", "Split-from", "diadoche/split/", "no_op", "--on-fail escalate,split,block",
+		"Depends-on: none", "dependency cycle", "which is FAILED", "only orders the queue", "dependency order"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("help output missing %q", want)
 		}

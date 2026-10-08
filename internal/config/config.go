@@ -542,8 +542,17 @@ const helpOnFail = `ON-FAIL POLICIES
 
     A task spec may declare its dependencies on a line of its own:
         Depends-on: 003, 007
-    (task numbers, comma- or space-separated). A spec without such a line
-    depends on nothing, and nothing cascades to it.
+    (task numbers, comma- or space-separated). The task starts only once
+    every task it names is DONE; when one of them is FAILED or BLOCKED the
+    task becomes BLOCKED instead ("depends on <spec>, which is FAILED"),
+    and so, transitively, do the tasks that name it. "Depends-on: none" (or
+    an empty value) declares no dependencies: the task may run whenever. A
+    spec without the line implicitly runs after the task before it in queue
+    order, as before; that implicit dependency only orders the queue — a
+    FAILED or BLOCKED task never blocks tasks that merely follow it. A
+    Depends-on number that matches no task spec, or a dependency cycle,
+    stops the run at startup before any agent is called (--dry-run reports
+    it the same way).
 
     Every applied policy is a run.log event "on_fail_policy policy=<name>
     step=<n> outcome=<done|not_done|blocked|split|no_op|error|interrupted>";
@@ -607,7 +616,9 @@ FILES
         failed (exit 2)") or that an escalated round finished.
 
     <project>/.claude/diadoche/spec/QUEUE.md
-        This run's work queue, rebuilt from STATUS.md on every sync. A
+        This run's work queue, rebuilt from STATUS.md on every sync, in
+        dependency order: every task after the pending tasks it depends on
+        (Depends-on), ascending task number otherwise. A
         trailing " [no-tests]" on a line is tolerated and ignored; mark the
         spec itself instead.
 
@@ -616,8 +627,11 @@ FILES
         NNN_REVIEW_<M>.md alongside it as the task progresses. A line
         <!-- diadoche: no-tests --> in the spec marks a task that needs no
         tests (see RED-GREEN CHECK). An optional line
-        Depends-on: NNN[, NNN...] names the tasks it depends on: when one
-        of them is BLOCKED, so is this one (see ON-FAIL POLICIES). A line
+        Depends-on: NNN[, NNN...] names the tasks it depends on: it starts
+        once they are all DONE, and when one of them is FAILED or BLOCKED,
+        so is this one; "Depends-on: none" means no dependencies, and a
+        spec without the line runs after the task before it in queue order
+        (ordering only, see ON-FAIL POLICIES). A line
         Split-from: <spec>, written by diadoche on the specs --on-fail
         split creates, queues the spec at that original spec's position.
 
