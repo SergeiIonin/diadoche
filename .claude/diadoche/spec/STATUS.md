@@ -17,4 +17,4 @@
 | 015 | 015_planner_tester_use_adrs.md | FAILED |
 | 016 | 016_on_fail_policy_escalate_block.md | DONE |
 | 017 | 017_on_fail_policy_split.md | DONE |
-| 018 | 018_questions_md_and_needs_human.md | QUEUED |
+| 018 | 018_questions_md_and_needs_human.md | DONE |
