@@ -22,4 +22,4 @@
 | 020 | 020_parallel_tasks_serial_merge.md | DONE |
 | 021 | 021_parallel_limits_budgets_adr.md | DONE |
 | 022 | 022_smoke_config_and_runner.md | DONE |
-| 023 | 023_smoke_in_iteration.md | QUEUED |
+| 023 | 023_smoke_in_iteration.md | DONE |
