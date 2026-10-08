@@ -113,6 +113,9 @@ Flags:
 - `--test-globs` — comma-separated test-file globs for non-Go projects,
   e.g. `'test_*.py,*.spec.ts'` (default: inferred from the plan's
   `## Test Command`; `*_test.go` always counts).
+- `--browser-cmd <path>` — the command that opens the `browser` URLs of
+  `smoke.yaml` (else `$DIADOCHE_BROWSER_CMD`; unset skips the browser step
+  with a warning). See "Smoke check" below.
 - `--fresh` — ignore the saved `.claude/diadoche/run-state.json` and start
   from the head of the queue; the file is rewritten from scratch. See
   "Restart state and graceful shutdown" below.
@@ -668,6 +671,75 @@ code:
 
 The step is skipped in `--dry-run` and for a repository without commits.
 
+## Smoke check (`smoke.yaml`)
+
+"The tests pass" says little about whether the application starts. A
+project can add `.claude/diadoche/smoke.yaml`, and diadoche then boots the
+application, checks it and tears it down in every iteration, after the
+red-green check and before tester. Without the file nothing changes.
+
+The file is looked up in the task's worktree first (so a task may add or
+change it), then in the main tree. Its commands always run in the task's
+work dir (the worktree, or the main tree with `--worktree=false`).
+
+```yaml
+up: docker compose up -d
+wait:
+  url: http://localhost:8080/healthz
+  timeout: 60s
+  interval: 1s
+checks:
+  - cmd: ./scripts/smoke.sh
+    timeout: 30s
+  - url: http://localhost:8080/api/ping
+    status: 200
+browser:
+  - http://localhost:8080/
+  - http://localhost:8080/login
+down: docker compose down -v
+```
+
+- `up`, `down` — shell commands (`sh -c`); also `{cmd: ..., timeout: 10m}`.
+  Default timeouts 5m and 2m.
+- `wait` — exactly one of `url` (ready on any 2xx) or `cmd` (ready on exit
+  0), polled every `interval` (default 1s) until `timeout` (default 60s).
+- `checks` — items of `cmd` (passes on exit 0) or `url` with the expected
+  `status` (default 200); the first failing item ends the run.
+- `browser` — URLs opened with `--browser-cmd`.
+
+The file is a deliberate YAML subset (see `internal/smoke/doc.go`); an
+unknown key or unsupported construct is an error naming the line.
+
+Outcome:
+
+- A failed `up`, `wait` or `checks` item → the iteration is unsuccessful:
+  the review `spec/NNN_REVIEW_M.md` lists the steps, exit codes, output
+  tails, console errors and screenshots for the next planner, tester is not
+  called, and run.log gets `smoke_failed`.
+- Otherwise tester's prompt gets a smoke block: a short "passed" line for a
+  clean run, else the summary. Console errors from the browser step,
+  failed pages and a failed `down` are only reported there, never fatal.
+- `down` always runs: after a failure, and on SIGINT/SIGTERM (including the
+  `--shutdown-timeout` path) before diadoche exits. An interrupted smoke
+  step is not a failure: the task stays pending and a resumed run repeats
+  the step.
+- An invalid `smoke.yaml` fails the task with an error naming the file and
+  line; nothing is started.
+
+`--browser-cmd` (or `DIADOCHE_BROWSER_CMD`; a passed flag wins, even empty)
+is a shell command prefix run as `<cmd> '<url>' '<outdir>' '<screenshot.png>'`.
+It must write the PNG screenshot to the third argument, print each browser
+console error as one line on stdout, and exit 0 when the page loaded.
+Without it the browser step is skipped with one warning per task and the
+rest of the file still runs.
+
+Artifacts land in the task's run directory: `iter-<N>-smoke.log` (the full
+step-by-step record), the screenshots as `iter-<N>-<NN>-<slug>.png` and
+the console errors as `iter-<N>-<NN>-<slug>-console.txt`.
+
+`--dry-run` runs none of the steps (no command, no HTTP request); it only
+reports whether `smoke.yaml` was found and what it configures.
+
 ## Worktrees
 
 By default (`--worktree`) every task runs in its own git worktree, so an
@@ -846,6 +918,9 @@ Every run (except `--dry-run`) gets its own directory
     ├── iter-<N>-REVIEW.md         copy of the review of iteration N
     ├── iter-<N>-<agent>.stdout    raw stdout of the call (claude's JSON reply)
     ├── iter-<N>-<agent>.stderr    raw stderr of the call
+    ├── iter-<N>-smoke.log         the smoke check's full record (with smoke.yaml)
+    ├── iter-<N>-<NN>-<slug>.png   a smoke browser screenshot
+    ├── iter-<N>-<NN>-<slug>-console.txt  console errors of that page
     ├── iter-0-adr-writer.stdout   raw output (and .stderr) of the --adr step's agent call
     ├── final.diff                 the task's changes against its base commit
     └── decisions.json             decisions worker reported in the DONE iteration
@@ -863,6 +938,8 @@ also echoed to stdout as `event: ...`:
 Events: `run_start`, `task_start`, `status` (every STATUS.md change),
 `agent_start`, `agent_end` (duration, exit code, cost, tokens), `verdict`
 (tester's DONE/NOT_DONE), `plan_rejected`, `empty_diff`, `redgreen_failed`,
+`smoke_start`, `smoke_end` (result, failed step, duration, down state),
+`smoke_failed`, `smoke_invalid` (file and line),
 `decisions` (count of decisions worker reported), `decisions_missing`
 (worker gave no `## Decisions` section; not a failure), `pause`, `pause_wait` (a `--parallel` task refused while the run is
 already paused), `resume`, `parallelism` (the effective `--parallel`

@@ -294,10 +294,11 @@ func (e *executor) browser(ctx context.Context, urls []BrowserURL) StepResult {
 		if ctx.Err() != nil {
 			return cancelled(ctx)
 		}
-		shot := filepath.Join(outDir, fmt.Sprintf("%02d-%s.png", i+1, slug(u.URL)))
+		name := fmt.Sprintf("%02d-%s", i+1, slug(u.URL))
+		shot := filepath.Join(outDir, name+".png")
 		script := strings.Join([]string{e.opts.BrowserCmd, shellQuote(u.URL), shellQuote(outDir), shellQuote(shot)}, " ")
 		r := e.run(ctx, e.opts.Dir, script, timeout)
-		page := Page{URL: u.URL}
+		page := Page{URL: u.URL, Name: name}
 		if _, err := os.Stat(shot); err == nil {
 			page.Screenshot = shot
 		}

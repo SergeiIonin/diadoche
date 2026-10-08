@@ -827,3 +827,43 @@ func TestHelpDescribesParallel(t *testing.T) {
 		}
 	}
 }
+
+func TestParseBrowserCmd(t *testing.T) {
+	// t.Setenv first so the ambient value is restored at cleanup.
+	t.Setenv("DIADOCHE_BROWSER_CMD", "placeholder")
+	if err := os.Unsetenv("DIADOCHE_BROWSER_CMD"); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Parse(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.BrowserCmd != "" {
+		t.Errorf("BrowserCmd = %q, want empty when nothing is set", cfg.BrowserCmd)
+	}
+	if cfg, err = Parse([]string{"--browser-cmd", "/bin/shoot --headless"}); err != nil || cfg.BrowserCmd != "/bin/shoot --headless" {
+		t.Errorf("flag: BrowserCmd = %q, err %v", cfg.BrowserCmd, err)
+	}
+
+	t.Setenv("DIADOCHE_BROWSER_CMD", " /env/shoot ")
+	if cfg, err = Parse(nil); err != nil || cfg.BrowserCmd != "/env/shoot" {
+		t.Errorf("env: BrowserCmd = %q, err %v", cfg.BrowserCmd, err)
+	}
+	if cfg, err = Parse([]string{"--browser-cmd", "/flag/shoot"}); err != nil || cfg.BrowserCmd != "/flag/shoot" {
+		t.Errorf("flag over env: BrowserCmd = %q, err %v", cfg.BrowserCmd, err)
+	}
+	if cfg, err = Parse([]string{"--browser-cmd="}); err != nil || cfg.BrowserCmd != "" {
+		t.Errorf("empty flag over env: BrowserCmd = %q, err %v", cfg.BrowserCmd, err)
+	}
+}
+
+func TestParseHelpMentionsSmokeCheck(t *testing.T) {
+	out := captureStdout(t, func() {
+		_, _ = Parse([]string{"--help"})
+	})
+	for _, want := range []string{"--browser-cmd", "SMOKE CHECK", "smoke.yaml", "DIADOCHE_BROWSER_CMD", "smoke_failed"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("help output missing %q", want)
+		}
+	}
+}

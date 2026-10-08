@@ -92,3 +92,31 @@ func TestSummaryOK(t *testing.T) {
 		}
 	}
 }
+
+func TestLogIsUncapped(t *testing.T) {
+	long := strings.Repeat("x", 3000) + "\nthe-very-end-of-output"
+	res := failedRunWithShots(t, long, 2)
+	log := res.Log()
+	for _, want := range []string{
+		"smoke: FAILED at checks[1]",
+		"== up: ok",
+		"== checks[1]: failed",
+		"run: cmd: ./smoke.sh",
+		"exit code: 1",
+		"== browser: skipped",
+		"== down: ok",
+		"the-very-end-of-output",
+		"screenshot: /out/01-localhost-8080.png",
+		"console errors:",
+		strings.Repeat("e", maxConsoleErrorLen),
+		"down: ok",
+	} {
+		if !strings.Contains(log, want) {
+			t.Errorf("Log lacks %q", want)
+		}
+	}
+	// The whole stored tail is there, unlike in a Summary squeezed by many sections.
+	if !strings.Contains(log, strings.Repeat("x", 3000)) {
+		t.Error("Log does not hold the full output tail")
+	}
+}

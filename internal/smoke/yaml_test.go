@@ -98,3 +98,14 @@ func TestParseYAMLRejects(t *testing.T) {
 		})
 	}
 }
+
+func TestErrorPath(t *testing.T) {
+	e := &Error{Line: 3, Key: "up", Msg: "bad"}
+	if got := e.Error(); got != "smoke.yaml:3: up: bad" {
+		t.Errorf("Error() = %q", got)
+	}
+	e.Path = "/p/.claude/diadoche/smoke.yaml"
+	if got := e.Error(); got != "/p/.claude/diadoche/smoke.yaml:3: up: bad" {
+		t.Errorf("Error() with Path = %q", got)
+	}
+}

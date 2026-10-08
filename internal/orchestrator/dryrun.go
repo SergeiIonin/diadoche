@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"diadoche/internal/agents"
 	"diadoche/internal/config"
 	"diadoche/internal/onfail"
+	"diadoche/internal/smoke"
 	"diadoche/internal/specs"
 )
 
@@ -32,7 +34,8 @@ import (
 // changes. No answer is inspected for NEEDS_HUMAN and nothing writes
 // QUESTIONS.md; with --resume-waiting the WAITING tasks are walked too
 // (their prompts carry their questions and answers), but they stay
-// WAITING.
+// WAITING. A smoke.yaml is only reported (found or not, its steps) and
+// its placeholder put into tester's prompt; none of its steps runs.
 //
 // Like a real run it first validates the task dependency graph (see
 // specs.ValidateGraph): a dangling Depends-on reference or a cycle is
@@ -90,6 +93,10 @@ func (o *Orchestrator) dryRun(ctx context.Context) error {
 		o.Log.Printf("dry-run: a task not DONE after --ITER would get --on-fail %s (escalation model %s); the dry run applies none",
 			strings.Join(o.Cfg.OnFail, ","), cmp.Or(o.Cfg.EscalationModel.Value, onfail.DefaultEscalationModel))
 	}
+	testerGuidance := normalDiffGuidance
+	if o.dryRunReportSmoke() {
+		testerGuidance += "\n\n" + dryRunSmoke
+	}
 
 	for _, specFile := range queue {
 		if o.stopRequested() {
@@ -116,7 +123,7 @@ func (o *Orchestrator) dryRun(ctx context.Context) error {
 			{worker, workerPrompt(specFile, specContent, implPlanFile, plan, "", questionsBlock)},
 			{tester, testerPrompt(testerPromptInput{
 				specFile: specFile, specContent: specContent, implPlanFile: implPlanFile, plan: plan,
-				testCommand: dryRunTestCommand, diff: dryRunDiff, guidance: normalDiffGuidance,
+				testCommand: dryRunTestCommand, diff: dryRunDiff, guidance: testerGuidance,
 				adrs: dryRunADRs, reviewPath: reviewPath, statusPath: o.Layout.StatusPath,
 			})},
 		}
@@ -135,6 +142,54 @@ func (o *Orchestrator) dryRun(ctx context.Context) error {
 
 	o.Log.Print("dry-run: no state was changed")
 	return nil
+}
+
+// dryRunReportSmoke reports whether the main tree has a smoke.yaml and
+// which steps it configures, and returns whether one was found. It only
+// reads the file: no command runs and no URL is requested.
+func (o *Orchestrator) dryRunReportSmoke() bool {
+	path, err := o.findSmokeFile(nil)
+	if err != nil {
+		o.Log.Printf("dry-run: smoke check: %v", err)
+		return false
+	}
+	if path == "" {
+		o.Log.Print("dry-run: no smoke check: no .claude/diadoche/smoke.yaml")
+		return false
+	}
+	cfg, err := smoke.Load(path)
+	if err != nil {
+		var se *smoke.Error
+		if errors.As(err, &se) {
+			cp := *se
+			cp.Path = o.relPath(path)
+			err = &cp
+		}
+		o.Log.Printf("dry-run: smoke check: %v (a real run would fail the task)", err)
+		return true
+	}
+	var steps []string
+	if cfg.Up != nil {
+		steps = append(steps, "up")
+	}
+	if cfg.Wait != nil {
+		steps = append(steps, "wait")
+	}
+	if n := len(cfg.Checks); n > 0 {
+		steps = append(steps, fmt.Sprintf("%d check(s)", n))
+	}
+	if n := len(cfg.Browser); n > 0 {
+		steps = append(steps, fmt.Sprintf("%d browser URL(s)", n))
+	}
+	if cfg.Down != nil {
+		steps = append(steps, "down")
+	}
+	o.Log.Printf("dry-run: smoke check: %s found (%s); a real run would run it after the red-green check and before tester, in each task's work dir; the dry run runs none of its steps",
+		o.relPath(path), strings.Join(steps, ", "))
+	if len(cfg.Browser) > 0 && o.Cfg.BrowserCmd == "" {
+		o.Log.Print("dry-run: smoke check: no --browser-cmd, the browser step would be skipped")
+	}
+	return true
 }
 
 // dryRunWaves reports which tasks of queue a --parallel n run could run

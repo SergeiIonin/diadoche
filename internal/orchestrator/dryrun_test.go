@@ -5,16 +5,20 @@ import (
 	"context"
 	"io/fs"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"diadoche/internal/agents"
 	"diadoche/internal/config"
 	"diadoche/internal/gitutil"
 	"diadoche/internal/onfail"
+	"diadoche/internal/smoke"
 	"diadoche/internal/specs"
 )
 
@@ -426,4 +430,53 @@ func TestDryRunReportsInvalidGraphAndStartsNothing(t *testing.T) {
 	}
 	diffSnapshots(t, "files", filesBefore, treeSnapshot(t, dir))
 	diffSnapshots(t, "git", gitBefore, gitSnapshot(t, dir))
+}
+
+func TestDryRunReportsSmokeFileAndRunsNothing(t *testing.T) {
+	dir, layout := dryRunRepo(t)
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits.Add(1) }))
+	defer srv.Close()
+	marker := filepath.Join(t.TempDir(), "up-ran")
+	writeFile(t, smoke.PathIn(layout.Root), "up: touch '"+marker+"'\nwait:\n  url: "+srv.URL+"/\nchecks:\n  - url: "+srv.URL+"/x\nbrowser:\n  - "+srv.URL+"/\ndown: touch '"+marker+"'\n")
+
+	var buf bytes.Buffer
+	rec := &promptRecorder{}
+	if err := newDryRunOrchestrator(dir, layout, rec, log.New(&buf, "", 0)).Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{
+		"smoke check: .claude/diadoche/smoke.yaml found (up, wait, 1 check(s), 1 browser URL(s), down)",
+		"the dry run runs none of its steps",
+		"no --browser-cmd, the browser step would be skipped",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("dry-run log lacks %q:\n%s", want, out)
+		}
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Error("a smoke command ran in --dry-run")
+	}
+	if n := hits.Load(); n != 0 {
+		t.Errorf("%d HTTP request(s) in --dry-run", n)
+	}
+	if !strings.Contains(rec.prompts[2], dryRunSmoke) {
+		t.Errorf("tester prompt lacks the smoke placeholder:\n%s", rec.prompts[2])
+	}
+}
+
+func TestDryRunWithoutSmokeFileSaysSo(t *testing.T) {
+	dir, layout := dryRunRepo(t)
+	var buf bytes.Buffer
+	rec := &promptRecorder{}
+	if err := newDryRunOrchestrator(dir, layout, rec, log.New(&buf, "", 0)).Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !strings.Contains(buf.String(), "dry-run: no smoke check: no .claude/diadoche/smoke.yaml") {
+		t.Errorf("dry-run log does not say there is no smoke check:\n%s", buf.String())
+	}
+	if strings.Contains(rec.prompts[2], dryRunSmoke) {
+		t.Error("tester prompt has the smoke placeholder without a smoke.yaml")
+	}
 }

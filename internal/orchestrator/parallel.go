@@ -100,6 +100,11 @@ type runShared struct {
 	// gate is the run's usage-limit gate, every agent call goes through
 	// it (see limitgate.go); it has its own mutex.
 	gate *limitGate
+
+	// smokeBrowserWarned are the tasks that already got the "browser step
+	// skipped" warning of the smoke check, keyed by spec file; guarded by
+	// mu, created lazily.
+	smokeBrowserWarned map[string]bool
 }
 
 // ownerJob is work a task goroutine needs done by the merge owner (the

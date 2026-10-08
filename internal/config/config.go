@@ -78,7 +78,7 @@ const helpSynopsis = `SYNOPSIS
              [--max-cost-per-run <usd>] [--allow-dirty]
              [--stable-system-prompt=<bool>] [--worktree=<bool>]
              [--parallel N]
-             [--red-green=<bool>] [--test-globs <list>]
+             [--red-green=<bool>] [--test-globs <list>] [--browser-cmd <path>]
              [--fresh] [--shutdown-timeout <duration>]
              [--on-task-done <command>]... [--hook-timeout <duration>]
              [--on-fail <list>] [--escalation-model <name>]
@@ -286,6 +286,27 @@ const helpDescription = `DESCRIPTION
       to check that those existing tests were not weakened.
     The check is skipped in --dry-run and for a repository without
     commits. --red-green=false disables it entirely.
+
+    SMOKE CHECK (optional .claude/diadoche/smoke.yaml): when the task's
+    worktree has that file (else when the main tree has it), diadoche runs
+    it after the red-green check and before tester, in the task's work dir:
+    up boots the application, wait polls it until it is ready, checks probe
+    it (commands and URLs), browser opens URLs with --browser-cmd, and down
+    tears it down. down always runs, also after a failure and on SIGINT/
+    SIGTERM before diadoche exits.
+      A failed up, wait or checks item: the iteration is unsuccessful, the
+      review (steps, exit codes, output tails) is written for the next
+      planner, tester is not called, run.log gets smoke_failed.
+      Otherwise tester's prompt gets a smoke block; console errors from the
+      browser step, failed pages and a failed down are only reported there.
+      An invalid smoke.yaml fails the task with an error naming the file
+      and line; nothing is started.
+    --browser-cmd <path> (else $DIADOCHE_BROWSER_CMD) is run as
+    <cmd> '<url>' '<outdir>' '<screenshot.png>': it writes the screenshot
+    and prints console errors on stdout; unset skips the browser step with
+    a warning. Artifacts: iter-<N>-smoke.log, iter-<N>-<NN>-<slug>.png and
+    iter-<N>-<NN>-<slug>-console.txt. --dry-run only reports whether the
+    file exists and runs none of its steps. No smoke.yaml: nothing changes.
 
     DIRTY TREE: with --worktree, the run refuses to start if the main
     working tree has uncommitted changes outside .claude/diadoche/ and
@@ -900,6 +921,12 @@ type Config struct {
 	// plan's "## Test Command".
 	TestGlobs []string
 
+	// BrowserCmd is the external command internal/smoke opens the browser
+	// URLs of smoke.yaml with, resolved as --browser-cmd >
+	// DIADOCHE_BROWSER_CMD > "". Empty means the browser step of smoke.yaml
+	// is skipped with a warning.
+	BrowserCmd string
+
 	// Fresh ignores the saved .claude/diadoche/run-state.json and starts
 	// from the head of the queue; the file is rewritten from scratch.
 	Fresh bool
@@ -977,6 +1004,7 @@ func Parse(args []string) (*Config, error) {
 	stableSystemPrompt := fs.Bool("stable-system-prompt", true, "pass claude --exclude-dynamic-system-prompt-sections, keeping the shared prompt prefix identical between calls; set to false for a claude CLI without that flag")
 	parallel := fs.Int("parallel", 1, "run up to N tasks that are ready by the dependency graph at the same time, each in its own worktree; merges into the current branch stay one at a time, in the order tasks finish; requires --worktree")
 	redGreen := fs.Bool("red-green", true, "after worker, run the task's new/changed test files on the base commit in a temporary worktree; tests that pass there fail the iteration")
+	browserCmd := fs.String("browser-cmd", "", "command that opens smoke.yaml browser URLs: run as <cmd> '<url>' '<outdir>' '<screenshot.png>', it writes the screenshot and prints console errors on stdout (else $DIADOCHE_BROWSER_CMD; unset skips the browser step)")
 	testGlobs := fs.String("test-globs", "", "comma-separated test-file globs for non-Go projects, e.g. 'test_*.py,*.spec.ts'; default: inferred from the plan's ## Test Command; *_test.go always counts")
 	maxCallCost := fs.Float64("max-call-cost", 0, "fail the task if a single agent call's cost in USD exceeds this — checked after the call returns, so it cannot preempt the spend (0 = no limit)")
 	maxCostPerTask := fs.Float64("max-cost-per-task", 0, "fail the task once the total recorded cost of the task in usage.jsonl, previous runs included, exceeds this many USD; checked after each agent call (0 = no limit)")
@@ -1126,6 +1154,7 @@ func Parse(args []string) (*Config, error) {
 		StableSystemPrompt: *stableSystemPrompt,
 		RedGreen:           *redGreen,
 		TestGlobs:          globs,
+		BrowserCmd:         resolveBrowserCmd(passed, *browserCmd),
 		Fresh:              *fresh,
 		ResumeWaiting:      *resumeWaiting,
 		ShutdownTimeout:    *shutdownTimeout,
@@ -1189,6 +1218,22 @@ func resolveModelOverride(passed map[string]bool, flagName, flagVal, envName str
 		return agents.ModelOverride{Value: value, Source: agents.ModelSourceEnv}, nil
 	}
 	return agents.ModelOverride{}, nil
+}
+
+// browserCmdEnv is the environment variable of --browser-cmd.
+const browserCmdEnv = "DIADOCHE_BROWSER_CMD"
+
+// resolveBrowserCmd resolves --browser-cmd with the flag > environment
+// variable > default priority. A passed flag wins even when empty, so
+// --browser-cmd= turns the browser step off whatever the environment says.
+func resolveBrowserCmd(passed map[string]bool, flagVal string) string {
+	if passed["browser-cmd"] {
+		return strings.TrimSpace(flagVal)
+	}
+	if v, ok := os.LookupEnv(browserCmdEnv); ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
 }
 
 // printHelp writes the full man-page-style help text to w, including the

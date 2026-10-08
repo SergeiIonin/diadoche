@@ -384,3 +384,26 @@ func TestSlugAndShellQuote(t *testing.T) {
 		t.Errorf("shellQuote = %s", got)
 	}
 }
+
+func TestRunBrowserPageName(t *testing.T) {
+	cfg, err := Parse([]byte("browser:\n  - http://localhost:8080/\n  - http://localhost:8080/noshot\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fr := &fakeRunner{browser: "shoot", onBrowser: func(url, outdir, shot string) redgreen.CommandResult {
+		if !strings.HasSuffix(url, "/noshot") {
+			writeShot(shot)
+		}
+		return redgreen.CommandResult{}
+	}}
+	res := Run(context.Background(), Options{Config: cfg, Runner: fr.run, Clock: newClock(), BrowserCmd: "shoot", OutDir: t.TempDir()})
+	if len(res.Pages) != 2 {
+		t.Fatalf("pages = %+v", res.Pages)
+	}
+	if p := res.Pages[0]; p.Name != "01-localhost-8080" || filepath.Base(p.Screenshot) != p.Name+".png" {
+		t.Errorf("page 1 = %+v", p)
+	}
+	if p := res.Pages[1]; p.Name != "02-localhost-8080-noshot" || p.Screenshot != "" {
+		t.Errorf("page 2 = %+v", p)
+	}
+}

@@ -1,6 +1,7 @@
 package smoke
 
 import (
+	"cmp"
 	"fmt"
 	"regexp"
 	"strings"
@@ -9,16 +10,18 @@ import (
 // Error is a parse or validation error of a smoke file. Line is 1-based (0
 // when the error is about the file as a whole); Key is the dotted path of
 // the offending key ("wait.timeout", "checks[2].status"), empty when the
-// error is not about a key.
+// error is not about a key. Path, when set (Load sets it), names the
+// file in place of the bare FileName.
 type Error struct {
 	Line int
 	Key  string
 	Msg  string
+	Path string
 }
 
 func (e *Error) Error() string {
 	var b strings.Builder
-	b.WriteString(FileName)
+	b.WriteString(cmp.Or(e.Path, FileName))
 	if e.Line > 0 {
 		fmt.Fprintf(&b, ":%d", e.Line)
 	}

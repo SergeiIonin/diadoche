@@ -84,6 +84,11 @@ func dryRunPlan(implPlanFile string) string {
 }
 
 // dryRunTestCommand stands in for the plan's test command.
+// dryRunSmoke stands in for the smoke block of tester's prompt when the
+// project has a smoke.yaml.
+const dryRunSmoke = dryRunPlaceholder + " smoke check result: in a real run the outcome of .claude/diadoche/smoke.yaml " +
+	"(steps, failures, log tails, console errors, screenshot paths) goes here."
+
 const dryRunTestCommand = dryRunPlaceholder + ` the command(s) from the plan's "## Test Command" section`
 
 // dryRunDiff stands in for the diff of worker's changes.

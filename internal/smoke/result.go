@@ -50,6 +50,7 @@ type StepResult struct {
 // Page is the outcome of opening one browser URL.
 type Page struct {
 	URL           string
+	Name          string // file stem "<NN>-<slug>" of the screenshot, set for every visited URL
 	Screenshot    string // path of the screenshot, empty when none was written
 	OK            bool
 	Detail        string // why the page failed
@@ -244,4 +245,76 @@ func oneLine(s string, n int) string {
 
 func fmtDur(d time.Duration) string {
 	return d.Round(time.Millisecond).String()
+}
+
+// Log renders the full step-by-step record of the run, uncapped: the
+// verdict, every step with its status, duration, detail, exit code and
+// complete stored output and body tails, every page with its screenshot
+// and console errors, the warnings and the down state.
+func (r Result) Log() string {
+	var b strings.Builder
+	if r.OK() {
+		fmt.Fprintf(&b, "smoke: OK in %s\n", fmtDur(r.Duration))
+	} else {
+		fmt.Fprintf(&b, "smoke: FAILED at %s in %s\n", r.Failed, fmtDur(r.Duration))
+	}
+	for _, s := range r.Steps {
+		fmt.Fprintf(&b, "\n== %s: %s", s.Name, s.Status)
+		if s.Status != StatusSkipped {
+			fmt.Fprintf(&b, " in %s", fmtDur(s.Duration))
+		}
+		b.WriteString("\n")
+		if s.Label != "" {
+			b.WriteString("  run: " + s.Label + "\n")
+		}
+		if s.Detail != "" {
+			b.WriteString("  detail: " + s.Detail + "\n")
+		}
+		if s.Status == StatusFailed && (s.ExitCode != 0 || s.TimedOut) {
+			fmt.Fprintf(&b, "  exit code: %d, timed out: %t\n", s.ExitCode, s.TimedOut)
+		}
+		if s.HTTPStatus != 0 {
+			fmt.Fprintf(&b, "  HTTP status: %d\n", s.HTTPStatus)
+		}
+		if s.OutputTail != "" {
+			b.WriteString("  output (tail):\n" + indent(indent(s.OutputTail)))
+		}
+		if s.BodyTail != "" {
+			b.WriteString("  body (tail):\n" + indent(indent(s.BodyTail)))
+		}
+	}
+	for _, p := range r.Pages {
+		status := "ok"
+		if !p.OK {
+			status = "FAILED: " + p.Detail
+		}
+		fmt.Fprintf(&b, "\n== page %s: %s\n", p.URL, status)
+		if p.Screenshot != "" {
+			b.WriteString("  screenshot: " + p.Screenshot + "\n")
+		}
+		if len(p.ConsoleErrors) > 0 {
+			b.WriteString("  console errors:\n")
+			for _, e := range p.ConsoleErrors {
+				b.WriteString("    " + e + "\n")
+			}
+		}
+		if p.OutputTail != "" {
+			b.WriteString("  output (tail):\n" + indent(indent(p.OutputTail)))
+		}
+	}
+	if len(r.Warnings) > 0 {
+		b.WriteString("\nwarnings:\n")
+		for _, w := range r.Warnings {
+			b.WriteString("  " + w + "\n")
+		}
+	}
+	switch {
+	case !r.DownRan:
+		b.WriteString("\ndown: not run\n")
+	case r.DownOK:
+		b.WriteString("\ndown: ok\n")
+	default:
+		b.WriteString("\ndown: FAILED\n")
+	}
+	return b.String()
 }

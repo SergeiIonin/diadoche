@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -146,5 +147,20 @@ func TestLoad(t *testing.T) {
 	}
 	if got := PathIn("/p/.claude/diadoche"); got != filepath.Join("/p/.claude/diadoche", "smoke.yaml") {
 		t.Errorf("PathIn = %q", got)
+	}
+}
+
+func TestLoadErrorNamesPathAndLine(t *testing.T) {
+	path := PathIn(t.TempDir())
+	if err := os.WriteFile(path, []byte("up: echo hi\nbogus: x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	var e *Error
+	if !errors.As(err, &e) {
+		t.Fatalf("err = %v, want *Error", err)
+	}
+	if e.Path != path || !strings.HasPrefix(err.Error(), path+":2: bogus:") {
+		t.Errorf("err = %q, want prefix %q", err, path+":2: bogus:")
 	}
 }

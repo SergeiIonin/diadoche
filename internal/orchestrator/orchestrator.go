@@ -8,7 +8,10 @@
 // chain that runs out, or another cause (an agent error, a cost cap). Between
 // worker and tester, the red-green check (see redgreen.go) makes sure
 // worker's tests fail on the task's base commit, i.e. actually test the
-// new code.
+// new code. After it, the project's optional .claude/diadoche/smoke.yaml
+// is run (see smoke.go): it boots the application, checks it and tears it
+// down, and its result goes to tester; a failed up, wait or checks item
+// fails the iteration like a failed red-green check.
 //
 // With cfg.Worktree each task runs in its own git worktree and branch
 // (see worktree.go), merged into the current branch once DONE; without it
@@ -88,6 +91,7 @@ import (
 	"diadoche/internal/runlog"
 	"diadoche/internal/runstate"
 	"diadoche/internal/skills"
+	"diadoche/internal/smoke"
 	"diadoche/internal/speclock"
 	"diadoche/internal/specs"
 	"diadoche/internal/usage"
@@ -191,6 +195,11 @@ type Orchestrator struct {
 	// --dry-run used to do. Real --dry-run is the read-only walk in
 	// dryrun.go.
 	simulate bool
+
+	// smokeRunner and smokeHTTP are for tests only: the command runner and
+	// HTTP client of the smoke step; nil means the real ones.
+	smokeRunner smoke.Runner
+	smokeHTTP   smoke.HTTPDoer
 }
 
 // offline reports whether the loop runs without git, usage.jsonl,
@@ -856,8 +865,8 @@ type iterationInput struct {
 // runIteration runs one planner -> worker -> tester round (see
 // runIterations): done reports tester's DONE verdict, a non-nil err why the
 // task was cut short; both false and nil is an unsuccessful iteration (a
-// rejected plan, an empty diff, a failed red-green check or a NOT_DONE
-// verdict).
+// rejected plan, an empty diff, a failed red-green check, a failed smoke
+// check or a NOT_DONE verdict).
 func (o *Orchestrator) runIteration(ctx context.Context, in iterationInput) (done bool, err error) {
 	specFile, num, specContent, ws, iter, uw := in.specFile, in.num, in.specContent, in.ws, in.iter, in.uw
 	planner, worker, tester, startAgent := in.planner, in.worker, in.tester, in.startAgent
@@ -1045,6 +1054,30 @@ func (o *Orchestrator) runIteration(ctx context.Context, in iterationInput) (don
 		}
 		if rg.testerNote != "" {
 			guidance += "\n\n" + rg.testerNote
+		}
+	}
+
+	// The smoke check runs after the red-green check; its tester note
+	// becomes its own paragraph too. Without a smoke.yaml nothing happens.
+	if !o.offline() {
+		sm, err := o.smokeCheck(ctx, specFile, num, iter, ws)
+		if err != nil {
+			return false, fmt.Errorf("smoke check: %w", err)
+		}
+		if sm.interrupted {
+			return false, ErrInterrupted
+		}
+		if sm.fail {
+			if err := os.WriteFile(reviewPath, []byte(sm.review), 0o644); err != nil {
+				return false, fmt.Errorf("write smoke review: %w", err)
+			}
+			o.Log.Printf("%s iteration %d: smoke check failed at %s, skipping tester (iteration unsuccessful)", specFile, iter, sm.failedStep)
+			o.copyArtifact(specFile, num, fmt.Sprintf("iter-%d-REVIEW.md", iter), reviewPath)
+			o.event(specFile, iter, "", "smoke_failed", runlog.F("step", sm.failedStep), runlog.F("review", reviewFile))
+			return false, nil
+		}
+		if sm.testerNote != "" {
+			guidance += "\n\n" + sm.testerNote
 		}
 	}
 

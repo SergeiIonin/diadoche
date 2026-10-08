@@ -2,6 +2,7 @@ package smoke
 
 import (
 	"cmp"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -89,7 +90,12 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read smoke file: %w", err)
 	}
-	return Parse(data)
+	cfg, err := Parse(data)
+	var se *Error
+	if errors.As(err, &se) {
+		se.Path = path
+	}
+	return cfg, err
 }
 
 // Parse parses and validates a smoke file. Errors are *Error values naming
