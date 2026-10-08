@@ -21,3 +21,41 @@ The plan's `## Files` section is the exact list of files to create or modify; pl
 Every behaviour change needs tests, and new tests must fail without the new code: after you finish, diadoche runs the test files you added or changed on the task's base commit, and if they pass there the iteration is unsuccessful. Do not weaken existing tests (remove or loosen assertions, delete cases, skip tests) unless the plan lists those test files.
 
 `spec/STATUS.md`, `spec/QUEUE.md`, `spec/NNN_REVIEW_*.md` and the task file `spec/NNN_<slug>.md` are off-limits — planner and tester handle those. The only edit you may make to `spec/NNN_IMPL_PLAN.md` is appending bullets to its `## Files` section as described above.
+
+## Reporting your decisions
+
+Your final answer MUST end with a section headed exactly `## Decisions`, on its own line, with nothing after the section. diadoche parses this section into `decisions.json` and later turns it into architecture decision records, so its layout is a contract: follow it exactly.
+
+The layout is one entry per decision: a `### ` heading with a short one-line title, then three lines starting with the labels `Context:`, `Decision:` and `Alternatives:`, in this order, each label exactly once. A field's text may continue on the following lines, up to the next label, the next `### ` heading or the end of the section. Context is 1–3 sentences on what forced the choice; Decision is what you chose; Alternatives names the alternatives you rejected and why. If there were no real alternatives, write `Alternatives: none considered` — never omit the label.
+
+```
+## Decisions
+
+### Store the cache index as JSON lines
+Context: The index must survive restarts and be appended to by one writer without rewriting the whole file.
+Decision: Write one JSON object per line to index.jsonl and append to it.
+Alternatives: SQLite — rejected, it is a new external dependency for one table; a single JSON document — rejected, every update rewrites the file.
+
+### Deviate from the spec on the default timeout
+Context: The task spec asks for a 5s default, but the existing integration tests already take up to 8s per call.
+Decision: Default to 10s and document the deviation in the README.
+Alternatives: 5s as specified — rejected, it fails the existing tests.
+```
+
+Record a decision only if it is one of these, and nothing else (the list is closed):
+
+1. a new external dependency;
+2. a new or changed external contract: an HTTP/gRPC API, a DB schema, an event or file format;
+3. a choice between real architectural alternatives;
+4. a deviation from the task spec (or from the plan) — say what deviates and why;
+5. the reversal of a decision taken earlier.
+
+These are NOT decisions and must not be listed: renames, refactoring that keeps the contract, the choice of names, formatting, test-only helpers.
+
+If nothing you did qualifies, the section contains exactly `none` (lowercase, alone on its line):
+
+```
+## Decisions
+
+none
+```

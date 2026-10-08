@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 
 	"diadoche/internal/agents"
+	"diadoche/internal/decisions"
 	"diadoche/internal/gitutil"
 	"diadoche/internal/runlog"
 )
@@ -104,4 +105,56 @@ func (o *Orchestrator) writeFinalDiff(ctx context.Context, specFile, num string,
 		o.artifactWarn(specFile, "final.diff", err)
 	}
 	o.saveArtifact(specFile, num, "final.diff", []byte(diff+added))
+}
+
+// recordDecisions parses the ## Decisions section of the DONE iteration's
+// worker answer and saves it as the task's decisions.json — written for
+// every DONE task, as [] when worker reported none. A missing section is
+// only a warning, never a task failure. workerRan is false when a resumed
+// run skipped worker, whose answer is then not available. Nothing is
+// written in --dry-run or a simulated loop. The event carries only a count
+// and a file name, never decision text.
+func (o *Orchestrator) recordDecisions(specFile, num string, iter int, output string, workerRan bool) {
+	if o.offline() {
+		return
+	}
+	var ds []decisions.Decision
+	if !workerRan {
+		o.Log.Printf("warning: %s: worker's answer of iteration %d is not available (resumed after worker); recording no decisions", specFile, iter)
+		o.event(specFile, iter, "worker", "decisions_missing", runlog.F("reason", "resumed"))
+	} else {
+		var found bool
+		ds, found = decisions.Parse(output)
+		if found {
+			o.event(specFile, iter, "worker", "decisions", runlog.F("count", len(ds)), runlog.F("file", decisions.FileName))
+		} else {
+			o.Log.Printf("warning: %s: worker did not report its decisions (no %q section in its answer)", specFile, decisions.Heading)
+			o.event(specFile, iter, "worker", "decisions_missing")
+		}
+	}
+	data, err := decisions.Marshal(ds)
+	if err != nil {
+		o.artifactWarn(specFile, decisions.FileName, err)
+		return
+	}
+	if o.run == nil {
+		return
+	}
+	id := taskID(specFile, num)
+	if err := o.run.WriteArtifact(id, decisions.FileName, data); err != nil {
+		o.artifactWarn(specFile, decisions.FileName, err)
+		return
+	}
+	if o.decisions == nil {
+		o.decisions = map[string]string{}
+	}
+	o.decisions[specFile] = filepath.Join(o.run.TaskDir(id), decisions.FileName)
+}
+
+// DecisionsPath is the decisions.json this run wrote for specFile, under
+// .claude/diadoche/runs/<run-id>/<task-id>/ — outside any worktree, so it
+// stays valid after the task's merge or commit. It is "" when the task has
+// no such file in this run: --dry-run, not DONE, or the write failed.
+func (o *Orchestrator) DecisionsPath(specFile string) string {
+	return o.decisions[specFile]
 }

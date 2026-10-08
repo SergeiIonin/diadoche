@@ -171,3 +171,26 @@ func TestEmbeddedPlannerAndWorkerPromptsCarryPlanContract(t *testing.T) {
 		t.Error("embedded worker prompt still bans all spec/NNN_* files, which contradicts appending to the plan's Files section")
 	}
 }
+
+func TestBuiltinWorkerPromptDocumentsDecisions(t *testing.T) {
+	b, err := DefaultPromptFile("worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt := string(b)
+	for _, want := range []string{
+		"## Decisions", "### ", "Context:", "Decision:", "Alternatives:", "`none`",
+		// the closed list of recordable decisions
+		"a new external dependency",
+		"a new or changed external contract",
+		"a choice between real architectural alternatives",
+		"a deviation from the task spec",
+		"the reversal of a decision taken earlier",
+		// the explicit non-decisions
+		"NOT decisions", "renames", "refactoring that keeps the contract", "the choice of names",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("built-in worker prompt lacks %q", want)
+		}
+	}
+}

@@ -29,7 +29,9 @@
 // package runlog): run.log, one line per event (run/task start and end,
 // agent calls, tester verdicts, pauses, status changes, merges, parking),
 // and per task a <NNN>-<slug>/ directory with each iteration's plan and
-// review, every agent call's raw stdout/stderr and the task's final.diff.
+// review, every agent call's raw stdout/stderr and the task's final.diff,
+// plus, for a DONE task, decisions.json — the decisions worker reported in
+// the DONE iteration (see package decisions).
 // Writing them is best effort: a failure is a warning, never the end of
 // the run.
 //
@@ -120,6 +122,12 @@ type Orchestrator struct {
 	// run.log and the tasks' artifacts; nil in --dry-run or when it
 	// couldn't be created (every runlog method is a no-op on nil).
 	run *runlog.Run
+
+	// decisions maps a spec file to the absolute path of the decisions.json
+	// this run wrote for it. The file lives under runs/, outside any
+	// worktree, so it outlives the task's merge; later steps such as the
+	// ADR step read it (see DecisionsPath).
+	decisions map[string]string
 
 	// simulate is for tests only: run the whole loop like a real run but
 	// without git, usage.jsonl, run-state.json or run artifacts — what
@@ -620,6 +628,11 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 		}
 		plan := string(implPlanBytes)
 
+		// workerOutput is this iteration's worker answer, for its
+		// ## Decisions section; workerRan is false when a resumed run
+		// skipped worker, whose answer is then not available.
+		var workerOutput string
+		workerRan := false
 		if !skipWorker {
 			workerResult, err := o.runStep(ctx, call, worker, workerPrompt(specFile, specContent, implPlanFile, plan, priorReview))
 			if err := o.checkBudgets(specFile, uw); err != nil {
@@ -631,6 +644,7 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 			if err := o.checkCallCost("worker", workerResult); err != nil {
 				return false, err
 			}
+			workerOutput, workerRan = workerResult.Output, true
 			if o.stopRequested() {
 				return false, ErrInterrupted
 			}
@@ -700,6 +714,7 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 		o.event(specFile, iter, "tester", "verdict", runlog.F("verdict", verdict), runlog.F("review", reviewFile))
 		if status == specs.StatusDone {
 			o.event(specFile, iter, "tester", "status", runlog.F("status", specs.StatusDone), runlog.F("by", "tester"))
+			o.recordDecisions(specFile, num, iter, workerOutput, workerRan)
 			// A task that just reached DONE is never failed for cost after
 			// the fact — that would throw away completed work for no
 			// benefit, since there's no further spend left to prevent this

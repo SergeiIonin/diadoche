@@ -25,13 +25,15 @@ const artifactRunID = "20261008-120000"
 // a plan naming the iteration, worker writes feature.txt, tester writes the
 // iteration's review and marks the task DONE from iteration doneAt on.
 // Every call returns stdout/stderr naming the agent and iteration.
-// onCall, when set, runs first on every call.
+// onCall, when set, runs first on every call. workerOutput, when set, is
+// worker's final answer (RunResult.Output) instead of "worker <N>".
 type artifactRunner struct {
-	layout specs.Layout
-	doneAt int
-	calls  map[string]int
-	onCall func(a *agents.Agent, n int)
-	total  int
+	layout       specs.Layout
+	doneAt       int
+	calls        map[string]int
+	onCall       func(a *agents.Agent, n int)
+	total        int
+	workerOutput string
 }
 
 func newArtifactRunner(layout specs.Layout, doneAt int) *artifactRunner {
@@ -60,6 +62,9 @@ func (r *artifactRunner) Run(_ context.Context, dir string, a *agents.Agent, _ s
 			return result, err
 		}
 	case "worker":
+		if r.workerOutput != "" {
+			result.Output = r.workerOutput
+		}
 		if err := os.WriteFile(filepath.Join(dir, "feature.txt"), []byte(fmt.Sprintf("feature v%d\n", iter)), 0o644); err != nil {
 			return result, err
 		}
@@ -173,6 +178,9 @@ func TestRunWritesTaskArtifacts(t *testing.T) {
 			if strings.Contains(diff, ".claude/diadoche") {
 				t.Errorf("final.diff includes diadoche's own files:\n%s", diff)
 			}
+			if got := readFile(t, filepath.Join(taskDir, "decisions.json")); got != "[]\n" {
+				t.Errorf("decisions.json = %q, want \"[]\\n\"", got)
+			}
 
 			if st := gitOut(t, dir, "status", "--porcelain", "--untracked-files=all"); strings.Contains(st, "runs/") {
 				t.Errorf("runs/ shows up in git status:\n%s", st)
@@ -221,7 +229,7 @@ func TestRunLogEventsInOrderAndFlushedImmediately(t *testing.T) {
 	log := readRunLog(t, layout)
 	want := []string{"run_start", "task_start", "status",
 		"agent_start", "agent_end", "agent_start", "agent_end", "agent_start", "agent_end",
-		"verdict", "status", "commit", "task_end", "run_end"}
+		"verdict", "status", "decisions_missing", "commit", "task_end", "run_end"}
 	if got := eventNames(log); strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Errorf("events = %v\nwant     %v\n%s", got, want, log)
 	}

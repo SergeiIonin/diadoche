@@ -161,7 +161,16 @@ preprocessor) are guarded by a `spec/.lock` file lock, so a concurrent
    - **worker** (model `claude-opus-5-5` by default) — implements the plan,
      working only from its `## Files` list instead of re-exploring the repo;
      if another file turns out to be needed, worker first appends it to
-     `## Files` with a one-line justification and only then edits it;
+     `## Files` with a one-line justification and only then edits it.
+     Worker ends its final answer with a `## Decisions` section: one
+     `### <title>` entry per decision with `Context:`, `Decision:` and
+     `Alternatives:` lines, or just `none`. Only a closed list counts as a
+     decision — a new external dependency, a new or changed external
+     contract, a choice between real architectural alternatives, a deviation
+     from the spec, or the reversal of an earlier decision; renames,
+     contract-preserving refactoring and naming do not. diadoche saves the
+     DONE iteration's section as `decisions.json` (see "Run logs and
+     artifacts"); a missing section is only a warning;
    - **tester** (model `claude-sonnet-5-5` by default) — reviews a `git diff`
      of the worker's changes (see "Diff-scoped tester" below) plus the plan's
      test command, writes `spec/NNN_REVIEW_M.md`, and, if the task is
@@ -518,7 +527,9 @@ Every run (except `--dry-run`) gets its own directory
     ├── iter-<N>-REVIEW.md         copy of the review of iteration N
     ├── iter-<N>-<agent>.stdout    raw stdout of the call (claude's JSON reply)
     ├── iter-<N>-<agent>.stderr    raw stderr of the call
-    └── final.diff                 the task's changes against its base commit
+    ├── final.diff                 the task's changes against its base commit
+    └── decisions.json             decisions worker reported in the DONE iteration
+                                   (JSON array of {title, context, decision, alternatives})
 ```
 
 `run.log` has one line per event, written without buffering, so
@@ -532,11 +543,13 @@ also echoed to stdout as `event: ...`:
 Events: `run_start`, `task_start`, `status` (every STATUS.md change),
 `agent_start`, `agent_end` (duration, exit code, cost, tokens), `verdict`
 (tester's DONE/NOT_DONE), `plan_rejected`, `empty_diff`, `redgreen_failed`,
-`pause`, `resume`, `commit`, `merge`, `merge_blocked`, `park`, `task_end`
+`decisions` (count of decisions worker reported), `decisions_missing`
+(worker gave no `## Decisions` section; not a failure), `pause`, `resume`, `commit`, `merge`, `merge_blocked`, `park`, `task_end`
 (final status), `run_end`, and `warning` when an artifact couldn't be
 written. A failed write never stops the run. A repeated call of the same
 agent in one iteration (a retry after a limit pause) gets a `-2`, `-3`...
-suffix. `final.diff` is written once the task ends, whatever the outcome.
+suffix. `final.diff` is written once the task ends, whatever the outcome;
+`decisions.json` only for a DONE task (`[]` when worker reported none).
 
 The `runs/` directory is added to `.git/info/exclude` of the project, so
 diadoche's own commits never pick it up.

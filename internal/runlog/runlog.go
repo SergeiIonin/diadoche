@@ -5,6 +5,10 @@
 //	.claude/diadoche/runs/<run-id>/<NNN>-<slug>/iter-<N>-REVIEW.md
 //	.claude/diadoche/runs/<run-id>/<NNN>-<slug>/iter-<N>-<agent>.stdout|.stderr
 //	.claude/diadoche/runs/<run-id>/<NNN>-<slug>/final.diff
+//	.claude/diadoche/runs/<run-id>/<NNN>-<slug>/decisions.json
+//
+// decisions.json is written by the orchestrator for DONE tasks only (see
+// package decisions).
 //
 // <run-id> is the run's start time as 20060102-150405, with a -2, -3...
 // suffix when that directory already exists. run.log holds one line per
