@@ -948,8 +948,16 @@ func Parse(args []string) (*Config, error) {
 		return nil, err
 	}
 
+	// Agents run with their work dir set to the task's worktree, so every
+	// spec path handed to them (plan, review, STATUS.md) must be absolute or
+	// they write into the worktree's copy instead of the project's.
+	absDir, err := filepath.Abs(*dir)
+	if err != nil {
+		return nil, fmt.Errorf("--dir %q: %w", *dir, err)
+	}
+
 	return &Config{
-		Dir:                *dir,
+		Dir:                absDir,
 		Iter:               *iter,
 		Langs:              splitCSV(*langs),
 		Frameworks:         splitCSV(*frameworks),

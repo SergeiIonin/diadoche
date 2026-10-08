@@ -689,3 +689,17 @@ func TestParseHelpMentionsQuestionsAndWaiting(t *testing.T) {
 		}
 	}
 }
+
+func TestParseMakesDirAbsolute(t *testing.T) {
+	cfg, err := Parse([]string{"--dir", "."})
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Dir != wd {
+		t.Errorf("Dir = %q, want absolute %q", cfg.Dir, wd)
+	}
+}
