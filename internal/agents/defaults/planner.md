@@ -1,6 +1,6 @@
 ---
 name: planner
-model: claude-opus-5
+model: claude-opus-5-5
 description: Plans the implementation of a diadoche task spec/NNN_<slug>.md.
 ---
 

@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"diadoche/internal/agents"
 )
 
 const (
@@ -153,8 +155,13 @@ const helpModels = `MODEL SELECTION
 
     This only ever picks the model; a .claude/agents/<name>.md prompt
     override (its body, not its model: field) still applies regardless of
-    which of the above set the model. An unrecognized model name is a
-    startup error, before any claude process runs.
+    which of the above set the model. A project .claude/agents/<name>.md
+    with no model: field keeps its prompt and takes the built-in default
+    model. The resolved model and its source (flag, env, frontmatter or
+    built-in default) for every agent are logged once at the start of the
+    run. An unrecognized model name, or an explicitly empty one (an empty
+    flag value, an env var set to the empty string, or a blank model:
+    field), is a startup error, before any claude process runs.
 
 `
 
@@ -234,8 +241,8 @@ const helpExamples = `EXAMPLES
         diadoche --initialize /path/to/project
 
     Save cost by running worker on a cheaper model:
-        diadoche --dir /path/to/project --worker-model claude-sonnet-5
-        DIADOCHE_WORKER_MODEL=claude-sonnet-5 diadoche --dir /path/to/project
+        diadoche --dir /path/to/project --worker-model claude-sonnet-5-5
+        DIADOCHE_WORKER_MODEL=claude-sonnet-5-5 diadoche --dir /path/to/project
 
     Keep going across claude usage-limit windows (restarts diadoche when
     the window reopens; see diadoche-restarter --help):
@@ -259,15 +266,16 @@ type Config struct {
 	MaxDiffBytes int
 
 	// PlannerModel, WorkerModel, TesterModel, PreprocessorModel are model
-	// overrides resolved from --<agent>-model (if set) else
-	// DIADOCHE_<AGENT>_MODEL (if set); empty means "no override — use
-	// whatever LoadOrDefault picks up from .claude/agents/<name>.md or the
-	// built-in default". Applied via agents.ApplyModelOverride, which is
-	// also where the final model name is validated.
-	PlannerModel      string
-	WorkerModel       string
-	TesterModel       string
-	PreprocessorModel string
+	// overrides resolved from --<agent>-model (if passed) else
+	// DIADOCHE_<AGENT>_MODEL (if set), with Source recording which of the
+	// two it was. The zero value means "no override — use whatever
+	// LoadOrDefault picks up from .claude/agents/<name>.md or the built-in
+	// default"; resolution continues in agents.ResolveModel, which is also
+	// where the final model name is validated.
+	PlannerModel      agents.ModelOverride
+	WorkerModel       agents.ModelOverride
+	TesterModel       agents.ModelOverride
+	PreprocessorModel agents.ModelOverride
 
 	// MaxCallMinutes, when > 0, kills a single agent call if it runs longer
 	// than this many minutes — caps a runaway call (stuck in its own long
@@ -332,6 +340,12 @@ func Parse(args []string) (*Config, error) {
 		return nil, err
 	}
 
+	// Which model flags were actually passed, as opposed to left at their
+	// "" default — the difference between "no override" and an explicitly
+	// empty override, which is an error.
+	passed := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { passed[f.Name] = true })
+
 	if strings.TrimSpace(*initialize) != "" {
 		// --initialize is a standalone mode: scaffolding only, independent
 		// of every other flag, so no other validation applies.
@@ -355,6 +369,23 @@ func Parse(args []string) (*Config, error) {
 		return nil, fmt.Errorf("--max-call-cost must be >= 0, got %g", *maxCallCost)
 	}
 
+	plannerOverride, err := resolveModelOverride(passed, "planner-model", *plannerModel, "DIADOCHE_PLANNER_MODEL")
+	if err != nil {
+		return nil, err
+	}
+	workerOverride, err := resolveModelOverride(passed, "worker-model", *workerModel, "DIADOCHE_WORKER_MODEL")
+	if err != nil {
+		return nil, err
+	}
+	testerOverride, err := resolveModelOverride(passed, "tester-model", *testerModel, "DIADOCHE_TESTER_MODEL")
+	if err != nil {
+		return nil, err
+	}
+	preprocessorOverride, err := resolveModelOverride(passed, "preprocessor-model", *preprocessorModel, "DIADOCHE_PREPROCESSOR_MODEL")
+	if err != nil {
+		return nil, err
+	}
+
 	return &Config{
 		Dir:               *dir,
 		Iter:              *iter,
@@ -365,10 +396,10 @@ func Parse(args []string) (*Config, error) {
 		Preprocess:        *preprocess,
 		Task:              *task,
 		MaxDiffBytes:      *maxDiffBytes,
-		PlannerModel:      resolveModelOverride(*plannerModel, "DIADOCHE_PLANNER_MODEL"),
-		WorkerModel:       resolveModelOverride(*workerModel, "DIADOCHE_WORKER_MODEL"),
-		TesterModel:       resolveModelOverride(*testerModel, "DIADOCHE_TESTER_MODEL"),
-		PreprocessorModel: resolveModelOverride(*preprocessorModel, "DIADOCHE_PREPROCESSOR_MODEL"),
+		PlannerModel:      plannerOverride,
+		WorkerModel:       workerOverride,
+		TesterModel:       testerOverride,
+		PreprocessorModel: preprocessorOverride,
 		MaxCallMinutes:    *maxCallMinutes,
 		MaxCallCostUSD:    *maxCallCost,
 		AllowDirty:        *allowDirty,
@@ -376,14 +407,30 @@ func Parse(args []string) (*Config, error) {
 }
 
 // resolveModelOverride implements the flag > environment variable priority
-// for one agent's model override: a non-empty flag value always wins; only
-// when the flag was left at its default ("") does the environment variable
-// apply. Returns "" (no override) if neither is set.
-func resolveModelOverride(flagVal, envName string) string {
-	if strings.TrimSpace(flagVal) != "" {
-		return flagVal
+// for one agent's model override: a flag that was passed always wins, and
+// only when it was left out does the environment variable apply. Returns
+// the zero ModelOverride (no override — keep resolving further down the
+// chain) when neither is present.
+//
+// "Passed but empty" and "set but empty" are deliberately errors rather
+// than "no override": the user clearly meant to pick a model, and silently
+// falling back to a default would hide the mistake until the bill arrives.
+func resolveModelOverride(passed map[string]bool, flagName, flagVal, envName string) (agents.ModelOverride, error) {
+	if passed[flagName] {
+		value := strings.TrimSpace(flagVal)
+		if value == "" {
+			return agents.ModelOverride{}, fmt.Errorf("--%s must not be empty", flagName)
+		}
+		return agents.ModelOverride{Value: value, Source: agents.ModelSourceFlag}, nil
 	}
-	return strings.TrimSpace(os.Getenv(envName))
+	if envVal, ok := os.LookupEnv(envName); ok {
+		value := strings.TrimSpace(envVal)
+		if value == "" {
+			return agents.ModelOverride{}, fmt.Errorf("%s is set but empty", envName)
+		}
+		return agents.ModelOverride{Value: value, Source: agents.ModelSourceEnv}, nil
+	}
+	return agents.ModelOverride{}, nil
 }
 
 // printHelp writes the full man-page-style help text to w, including the

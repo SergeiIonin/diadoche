@@ -2,11 +2,13 @@ package preprocessor
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"diadoche/internal/agents"
 	"diadoche/internal/config"
 	"diadoche/internal/specs"
 )
@@ -50,7 +52,8 @@ func TestRunFailsFastOnUnknownPreprocessorModelOverride(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg := config.Config{Dir: dir, Task: "raw.md", DryRun: true, PreprocessorModel: "not-a-real-model"}
+	cfg := config.Config{Dir: dir, Task: "raw.md", DryRun: true,
+		PreprocessorModel: agents.ModelOverride{Value: "not-a-real-model", Source: agents.ModelSourceFlag}}
 	if err := Run(context.Background(), cfg); err == nil {
 		t.Fatal("expected Run to fail on an unknown --preprocessor-model override")
 	}
@@ -116,3 +119,72 @@ func TestRunFailsWhenCallExceedsMaxCallCost(t *testing.T) {
 // This package only wires cfg.MaxCallMinutes into CLIRunner.MaxCallDuration
 // (see Run), and TestRunWritesUsageRecordWhenNotDryRun already exercises
 // that wiring at its zero value (no limit).
+
+func TestRunLogsPreprocessorModelWithSource(t *testing.T) {
+	t.Run("env override", func(t *testing.T) {
+		dir := t.TempDir()
+		layout := specs.NewLayout(dir)
+		writeAgentFixture(t, layout.AgentsDir, "preprocessor", "claude-opus-5")
+		if err := os.WriteFile(filepath.Join(dir, "raw.md"), []byte("do several things"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		cfg := config.Config{Dir: dir, Task: "raw.md", DryRun: true,
+			PreprocessorModel: agents.ModelOverride{Value: "claude-haiku-4-5-20251001", Source: agents.ModelSourceEnv}}
+		got := captureStdout(t, func() {
+			if err := Run(context.Background(), cfg); err != nil {
+				t.Fatalf("Run failed: %v", err)
+			}
+		})
+
+		if !strings.Contains(got, "preprocessor=claude-haiku-4-5-20251001 (env)") {
+			t.Errorf("expected the log to report the model and its source; got:\n%s", got)
+		}
+	})
+
+	t.Run("built-in default", func(t *testing.T) {
+		dir := t.TempDir()
+		// No .claude/agents/preprocessor.md: the built-in default applies.
+		if err := os.WriteFile(filepath.Join(dir, "raw.md"), []byte("do several things"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		cfg := config.Config{Dir: dir, Task: "raw.md", DryRun: true}
+		got := captureStdout(t, func() {
+			if err := Run(context.Background(), cfg); err != nil {
+				t.Fatalf("Run failed: %v", err)
+			}
+		})
+
+		if !strings.Contains(got, "preprocessor=claude-opus-5 (built-in default)") {
+			t.Errorf("expected the preprocessor default to stay claude-opus-5; got:\n%s", got)
+		}
+	})
+}
+
+// captureStdout runs fn with os.Stdout replaced by a pipe and returns what
+// was written to it. Run logs to os.Stdout directly (it builds its own
+// logger), so that's the only way to assert on its output.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = orig }()
+
+	done := make(chan string, 1)
+	go func() {
+		var buf strings.Builder
+		_, _ = io.Copy(&buf, r)
+		done <- buf.String()
+	}()
+
+	fn()
+	w.Close()
+	out := <-done
+	r.Close()
+	return out
+}

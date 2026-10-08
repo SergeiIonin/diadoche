@@ -47,6 +47,18 @@ type Agent struct {
 	Model        string
 	Description  string
 	SystemPrompt string
+
+	// ModelSource records where Model ended up coming from, for the
+	// startup log. Set by LoadOrDefault and then possibly overwritten by
+	// ResolveModel when a flag or env var overrides the model.
+	ModelSource ModelSource
+
+	// modelKeyPresent says whether the parsed frontmatter had a `model:`
+	// key at all, even with a blank value. It's what lets LoadOrDefault
+	// tell "this project file only overrides the prompt" (fall back to the
+	// built-in default model) apart from "this project file asks for an
+	// empty model" (a startup error).
+	modelKeyPresent bool
 }
 
 // Load reads and parses an agent definition file.
@@ -55,25 +67,55 @@ func Load(path string) (*Agent, error) {
 	if err != nil {
 		return nil, err
 	}
-	return parse(string(data)), nil
+	a := parse(string(data))
+	if a.modelKeyPresent {
+		a.ModelSource = ModelSourceFrontmatter
+	}
+	return a, nil
 }
 
 // LoadOrDefault loads <agentsDir>/<name>.md if present, and otherwise falls
 // back to the built-in default prompt for <name> embedded in the binary.
+//
+// A project file that overrides only the prompt — no `model:` key in its
+// frontmatter — still gets the built-in default's model, so customizing a
+// prompt never silently leaves an agent without a model.
 func LoadOrDefault(agentsDir, name string) (*Agent, error) {
 	data, err := os.ReadFile(filepath.Join(agentsDir, name+".md"))
 	if err == nil {
-		return parse(string(data)), nil
+		a := parse(string(data))
+		if a.modelKeyPresent {
+			a.ModelSource = ModelSourceFrontmatter
+			return a, nil
+		}
+		a.ModelSource = ModelSourceDefault
+		if def, derr := loadDefault(name); derr == nil {
+			a.Model = def.Model
+		}
+		// A missing built-in default leaves Model empty; ResolveModel then
+		// reports it as an "empty model" error at startup.
+		return a, nil
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
 
-	data, derr := defaultsFS.ReadFile("defaults/" + name + ".md")
+	a, derr := loadDefault(name)
 	if derr != nil {
 		return nil, fmt.Errorf("no %q agent definition in %s and no built-in default", name, agentsDir)
 	}
-	return parse(string(data)), nil
+	return a, nil
+}
+
+// loadDefault parses the agent definition embedded in the binary.
+func loadDefault(name string) (*Agent, error) {
+	data, err := defaultsFS.ReadFile("defaults/" + name + ".md")
+	if err != nil {
+		return nil, err
+	}
+	a := parse(string(data))
+	a.ModelSource = ModelSourceDefault
+	return a, nil
 }
 
 func parse(content string) *Agent {
@@ -100,6 +142,7 @@ func parse(content string) *Agent {
 					a.Name = value
 				case "model":
 					a.Model = value
+					a.modelKeyPresent = true
 				case "description":
 					a.Description = value
 				}

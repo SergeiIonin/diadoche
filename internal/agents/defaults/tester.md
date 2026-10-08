@@ -1,6 +1,6 @@
 ---
 name: tester
-model: claude-opus-5
+model: claude-sonnet-5-5
 description: Tests and reviews the worker's changes and decides whether the task is done.
 ---
 

@@ -109,15 +109,15 @@ preprocessor) are guarded by a `spec/.lock` file lock, so a concurrent
    and pushed onto `spec/QUEUE.md` (this run's work queue).
 2. For each task pulled off the queue, status is set to `IN_PROGRESS`, and
    diadoche runs up to `--ITER` rounds of:
-   - **planner** (model `claude-opus-5` by default) — writes
+   - **planner** (model `claude-opus-5-5` by default) — writes
      `spec/NNN_IMPL_PLAN.md`, which must contain a `## Files` section (the
      exact paths to create/modify) and a `## Test Command` section (how to
      run this project's tests/linter). If either is missing, the iteration
      is treated as failed and planner is asked again, still within the same
      `--ITER` budget.
-   - **worker** (model `claude-opus-5` by default) — implements the plan,
+   - **worker** (model `claude-opus-5-5` by default) — implements the plan,
      working from its `## Files` list instead of re-exploring the repo;
-   - **tester** (model `claude-opus-5` by default) — reviews a `git diff`
+   - **tester** (model `claude-sonnet-5-5` by default) — reviews a `git diff`
      of the worker's changes (see "Diff-scoped tester" below) plus the plan's
      test command, writes `spec/NNN_REVIEW_M.md`, and, if the task is
      genuinely done, sets `spec/STATUS.md` to `DONE` itself.
@@ -144,9 +144,24 @@ Each agent's model is resolved in this order, first match wins:
 
 This only ever picks the model — a `.claude/agents/<name>.md` prompt
 override (its body, not its `model:` field) still applies regardless of
-which of the above set the model. An unrecognized model name is a startup
-error, before any `claude` process runs, and the resolved models are logged
-once at the start of the run.
+which of the above set the model. A project `.claude/agents/<name>.md` with
+no `model:` field keeps its prompt and takes the built-in default model.
+
+Every agent's resolved model and the source it came from (`flag`, `env`,
+`frontmatter` or `built-in default`) is logged once at the start of the run,
+e.g.:
+
+```
+models: planner=claude-opus-5-5 (built-in default) worker=claude-sonnet-5-5 (flag) tester=claude-sonnet-5-5 (env)
+```
+
+An unrecognized model name is a startup error, before any `claude` process
+runs — and so is an explicitly empty one: `--planner-model ""`,
+`DIADOCHE_PLANNER_MODEL=` (set to the empty string) or a blank `model:`
+field all fail the run rather than quietly falling back to a default.
+
+Built-in defaults: planner `claude-opus-5-5`, worker `claude-opus-5-5`,
+tester `claude-sonnet-5-5`, preprocessor `claude-opus-5`.
 
 ## Per-call budget
 

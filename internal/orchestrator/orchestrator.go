@@ -89,24 +89,24 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("load planner agent: %w", err)
 	}
-	if err := agents.ApplyModelOverride(planner, o.Cfg.PlannerModel); err != nil {
+	if err := agents.ResolveModel(planner, o.Cfg.PlannerModel); err != nil {
 		return err
 	}
 	worker, err := agents.LoadOrDefault(o.Layout.AgentsDir, "worker")
 	if err != nil {
 		return fmt.Errorf("load worker agent: %w", err)
 	}
-	if err := agents.ApplyModelOverride(worker, o.Cfg.WorkerModel); err != nil {
+	if err := agents.ResolveModel(worker, o.Cfg.WorkerModel); err != nil {
 		return err
 	}
 	tester, err := agents.LoadOrDefault(o.Layout.AgentsDir, "tester")
 	if err != nil {
 		return fmt.Errorf("load tester agent: %w", err)
 	}
-	if err := agents.ApplyModelOverride(tester, o.Cfg.TesterModel); err != nil {
+	if err := agents.ResolveModel(tester, o.Cfg.TesterModel); err != nil {
 		return err
 	}
-	o.Log.Printf("models: planner=%s worker=%s tester=%s", planner.Model, worker.Model, tester.Model)
+	o.Log.Printf("models: planner=%s worker=%s tester=%s", planner.ModelDescription(), worker.ModelDescription(), tester.ModelDescription())
 
 	// Usage accounting writes real claude-CLI JSON output to disk; skip it
 	// entirely in --dry-run, where there's no real usage to record and no

@@ -46,10 +46,10 @@ func Run(ctx context.Context, cfg config.Config) error {
 	if err != nil {
 		return fmt.Errorf("load preprocessor agent: %w", err)
 	}
-	if err := agents.ApplyModelOverride(agent, cfg.PreprocessorModel); err != nil {
+	if err := agents.ResolveModel(agent, cfg.PreprocessorModel); err != nil {
 		return err
 	}
-	logger.Printf("model: preprocessor=%s", agent.Model)
+	logger.Printf("model: preprocessor=%s", agent.ModelDescription())
 
 	var runner agents.Runner
 	if cfg.DryRun {

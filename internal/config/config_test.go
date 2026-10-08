@@ -6,6 +6,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"diadoche/internal/agents"
 )
 
 func TestParseInitializeIsStandalone(t *testing.T) {
@@ -109,17 +111,22 @@ func TestParseModelFlagsSetOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.PlannerModel != "claude-sonnet-5" {
-		t.Errorf("PlannerModel = %q", cfg.PlannerModel)
+	want := map[string]agents.ModelOverride{
+		"planner":      {Value: "claude-sonnet-5", Source: agents.ModelSourceFlag},
+		"worker":       {Value: "claude-haiku-4-5-20251001", Source: agents.ModelSourceFlag},
+		"tester":       {Value: "claude-fable-5-1", Source: agents.ModelSourceFlag},
+		"preprocessor": {Value: "claude-opus-5", Source: agents.ModelSourceFlag},
 	}
-	if cfg.WorkerModel != "claude-haiku-4-5-20251001" {
-		t.Errorf("WorkerModel = %q", cfg.WorkerModel)
+	got := map[string]agents.ModelOverride{
+		"planner":      cfg.PlannerModel,
+		"worker":       cfg.WorkerModel,
+		"tester":       cfg.TesterModel,
+		"preprocessor": cfg.PreprocessorModel,
 	}
-	if cfg.TesterModel != "claude-fable-5-1" {
-		t.Errorf("TesterModel = %q", cfg.TesterModel)
-	}
-	if cfg.PreprocessorModel != "claude-opus-5" {
-		t.Errorf("PreprocessorModel = %q", cfg.PreprocessorModel)
+	for agent, w := range want {
+		if got[agent] != w {
+			t.Errorf("%s model override = %+v, want %+v", agent, got[agent], w)
+		}
 	}
 }
 
@@ -129,8 +136,8 @@ func TestParseModelEnvVarsApplyWhenFlagAbsent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.PlannerModel != "claude-sonnet-5" {
-		t.Fatalf("PlannerModel = %q, want claude-sonnet-5 from env", cfg.PlannerModel)
+	if cfg.PlannerModel.Value != "claude-sonnet-5" || cfg.PlannerModel.Source != agents.ModelSourceEnv {
+		t.Fatalf("PlannerModel = %+v, want claude-sonnet-5 from env", cfg.PlannerModel)
 	}
 }
 
@@ -140,8 +147,8 @@ func TestParseModelFlagTakesPriorityOverEnvVar(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.PlannerModel != "claude-opus-5" {
-		t.Fatalf("PlannerModel = %q, want flag value claude-opus-5 to win over env", cfg.PlannerModel)
+	if cfg.PlannerModel.Value != "claude-opus-5" || cfg.PlannerModel.Source != agents.ModelSourceFlag {
+		t.Fatalf("PlannerModel = %+v, want flag value claude-opus-5 to win over env", cfg.PlannerModel)
 	}
 }
 
@@ -150,8 +157,67 @@ func TestParseNoModelOverrideLeavesFieldEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.PlannerModel != "" || cfg.WorkerModel != "" || cfg.TesterModel != "" || cfg.PreprocessorModel != "" {
-		t.Fatalf("expected all model overrides empty by default, got %+v", cfg)
+	if cfg.PlannerModel.IsSet() || cfg.WorkerModel.IsSet() || cfg.TesterModel.IsSet() || cfg.PreprocessorModel.IsSet() {
+		t.Fatalf("expected all model overrides unset by default, got %+v", cfg)
+	}
+}
+
+func TestParseModelFlagExplicitlyEmptyIsError(t *testing.T) {
+	for _, args := range [][]string{
+		{"--planner-model="},
+		{"--worker-model", ""},
+		{"--tester-model", "   "},
+	} {
+		if _, err := Parse(args); err == nil {
+			t.Errorf("Parse(%q): expected an error for an explicitly empty model flag", args)
+		} else if !strings.Contains(err.Error(), "must not be empty") {
+			t.Errorf("Parse(%q): error = %v, want it to say the flag must not be empty", args, err)
+		}
+	}
+}
+
+func TestParseModelEnvSetButEmptyIsError(t *testing.T) {
+	t.Setenv("DIADOCHE_TESTER_MODEL", "")
+	_, err := Parse(nil)
+	if err == nil {
+		t.Fatal("expected an error for DIADOCHE_TESTER_MODEL set to the empty string")
+	}
+	if !strings.Contains(err.Error(), "DIADOCHE_TESTER_MODEL") {
+		t.Errorf("error = %v, want it to name DIADOCHE_TESTER_MODEL", err)
+	}
+}
+
+// TestParseModelEnvSetButEmptyIsOverriddenByFlag guards the priority order
+// at the point where it matters most: a broken env var must not sink a run
+// that explicitly passes the flag.
+func TestParseModelEnvSetButEmptyIsOverriddenByFlag(t *testing.T) {
+	t.Setenv("DIADOCHE_TESTER_MODEL", "")
+	cfg, err := Parse([]string{"--tester-model", "claude-sonnet-5-5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TesterModel.Value != "claude-sonnet-5-5" || cfg.TesterModel.Source != agents.ModelSourceFlag {
+		t.Fatalf("TesterModel = %+v, want the flag value", cfg.TesterModel)
+	}
+}
+
+// TestParseModelEnvUnsetIsNoOverride pins the LookupEnv (not Getenv)
+// distinction an empty-is-an-error rule depends on: unset is not "set but
+// empty".
+func TestParseModelEnvUnsetIsNoOverride(t *testing.T) {
+	// t.Setenv first so the ambient value, whatever it is, is restored at
+	// cleanup; then unset it for the duration of this test.
+	t.Setenv("DIADOCHE_TESTER_MODEL", "placeholder")
+	if err := os.Unsetenv("DIADOCHE_TESTER_MODEL"); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Parse(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TesterModel.IsSet() {
+		t.Fatalf("TesterModel = %+v, want no override when the env var is unset", cfg.TesterModel)
 	}
 }
 

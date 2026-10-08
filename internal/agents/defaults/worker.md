@@ -1,6 +1,6 @@
 ---
 name: worker
-model: claude-opus-5
+model: claude-opus-5-5
 description: Implements a diadoche task's implementation plan in the repository.
 ---
 

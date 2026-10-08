@@ -356,7 +356,8 @@ func TestRunFailsFastOnUnknownModelOverride(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg := config.Config{Dir: dir, Iter: 1, DryRun: true, PlannerModel: "not-a-real-model"}
+	cfg := config.Config{Dir: dir, Iter: 1, DryRun: true,
+		PlannerModel: agents.ModelOverride{Value: "not-a-real-model", Source: agents.ModelSourceFlag}}
 	o := &Orchestrator{
 		Cfg:    cfg,
 		Layout: layout,
@@ -381,7 +382,8 @@ func TestRunLogsResolvedModels(t *testing.T) {
 	}
 
 	var logBuf strings.Builder
-	cfg := config.Config{Dir: dir, Iter: 1, DryRun: true, WorkerModel: "claude-sonnet-5"}
+	cfg := config.Config{Dir: dir, Iter: 1, DryRun: true,
+		WorkerModel: agents.ModelOverride{Value: "claude-sonnet-5", Source: agents.ModelSourceFlag}}
 	o := &Orchestrator{
 		Cfg:    cfg,
 		Layout: layout,
@@ -393,11 +395,73 @@ func TestRunLogsResolvedModels(t *testing.T) {
 	}
 
 	got := logBuf.String()
-	if !strings.Contains(got, "models:") || !strings.Contains(got, "planner="+testAgentModel) {
-		t.Errorf("expected log to report resolved planner model; got:\n%s", got)
+	if !strings.Contains(got, "models:") || !strings.Contains(got, "planner="+testAgentModel+" (frontmatter)") {
+		t.Errorf("expected log to report the planner model and its source; got:\n%s", got)
 	}
-	if !strings.Contains(got, "worker=claude-sonnet-5") {
-		t.Errorf("expected log to report the --worker-model override, got:\n%s", got)
+	if !strings.Contains(got, "worker=claude-sonnet-5 (flag)") {
+		t.Errorf("expected log to report the --worker-model override and its source, got:\n%s", got)
+	}
+}
+
+func TestRunFailsFastOnEmptyModelOverride(t *testing.T) {
+	dir := t.TempDir()
+	layout := specs.NewLayout(dir)
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	writeAgentFixtures(t, layout.AgentsDir)
+	if err := os.WriteFile(filepath.Join(layout.SpecDir, "001_example.md"), []byte("# Example\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Config{Dir: dir, Iter: 1, DryRun: true,
+		PlannerModel: agents.ModelOverride{Value: "", Source: agents.ModelSourceFlag}}
+	o := &Orchestrator{
+		Cfg:    cfg,
+		Layout: layout,
+		Runner: neverCalledRunner{t: t},
+		Log:    log.New(io.Discard, "", 0),
+	}
+
+	if err := o.Run(context.Background()); err == nil {
+		t.Fatal("expected Run to fail on an explicitly empty --planner-model override")
+	}
+}
+
+// TestRunUsesBuiltInDefaultModelsWhenNoOverride is the "no flags" half of
+// the spec's acceptance criteria: with no project agent files and no
+// overrides, every agent runs on its built-in default.
+func TestRunUsesBuiltInDefaultModelsWhenNoOverride(t *testing.T) {
+	dir := t.TempDir()
+	layout := specs.NewLayout(dir)
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately no writeAgentFixtures: nothing in .claude/agents.
+	if err := os.WriteFile(filepath.Join(layout.SpecDir, "001_example.md"), []byte("# Example\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var logBuf strings.Builder
+	o := &Orchestrator{
+		Cfg:    config.Config{Dir: dir, Iter: 1, DryRun: true},
+		Layout: layout,
+		Runner: newRecordingRunner(layout),
+		Log:    log.New(&logBuf, "", 0),
+	}
+	if err := o.Run(context.Background()); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	got := logBuf.String()
+	for _, want := range []string{
+		"planner=claude-opus-5-5 (built-in default)",
+		"worker=claude-opus-5-5 (built-in default)",
+		"tester=claude-sonnet-5-5 (built-in default)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expected log to contain %q; got:\n%s", want, got)
+		}
 	}
 }
 
