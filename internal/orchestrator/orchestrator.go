@@ -2,6 +2,11 @@
 // then for each queued task run planner -> worker -> tester for up to
 // cfg.Iter iterations, until the tester marks the task DONE in STATUS.md or
 // the iteration budget is exhausted (FAILED).
+//
+// With cfg.Worktree each task runs in its own git worktree and branch
+// (see worktree.go), merged into the current branch once DONE; without it
+// tasks run in the main working tree and FAILED changes are parked (see
+// park.go).
 package orchestrator
 
 import (
@@ -78,6 +83,11 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	if !o.Cfg.DryRun {
 		if err := gitutil.EnsureRepo(ctx, o.Cfg.Dir); err != nil {
 			return fmt.Errorf("ensure git repo: %w", err)
+		}
+		if o.Cfg.Worktree {
+			if err := o.prepareWorktreeRun(ctx); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -208,7 +218,11 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 	var ws *workspace
 	if !o.Cfg.DryRun {
 		var err error
-		ws, err = o.prepareWorkspace(ctx, specFile, num)
+		if o.Cfg.Worktree {
+			ws, err = o.prepareWorktree(ctx, specFile, num)
+		} else {
+			ws, err = o.prepareWorkspace(ctx, specFile, num)
+		}
 		if err != nil {
 			return &fatalError{err}
 		}
@@ -223,12 +237,15 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 		// Not a failure: the account's usage window ran out. Nothing is
 		// parked and the task stays IN_PROGRESS, so the next run (e.g. by
 		// diadoche-restarter once the window reopens) resumes it with its
-		// changes still in the working tree.
+		// changes still in the working tree (or its worktree).
 		o.Log.Printf("task %s: interrupted by a claude usage limit; leaving it IN_PROGRESS with its changes in place", specFile)
 		return &fatalError{cause}
 	}
 	if done {
 		o.Log.Printf("task %s: DONE", specFile)
+		if ws != nil && ws.worktree {
+			return o.finishDoneWorktree(ctx, specFile, ws)
+		}
 		if ws != nil {
 			ws.removeBaseFile()
 		}
@@ -268,7 +285,10 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 
 	for iter := startIter; iter <= o.Cfg.Iter; iter++ {
 		o.Log.Printf("--- %s iteration %d/%d ---", specFile, iter, o.Cfg.Iter)
-		call := agentCall{specFile: specFile, iter: iter, uw: uw, tally: &iterationTally{}}
+		call := agentCall{specFile: specFile, iter: iter, workDir: o.Cfg.Dir, uw: uw, tally: &iterationTally{}}
+		if ws != nil {
+			call.workDir = ws.dir
+		}
 
 		reviewFile := fmt.Sprintf("%s_REVIEW_%d.md", num, iter)
 		reviewPath := filepath.Join(o.Layout.SpecDir, reviewFile)
@@ -411,11 +431,13 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 }
 
 // agentCall is where in the loop one agent turn happens: which task and
-// iteration it belongs to, where its usage is recorded, and the running
-// token/cost tally of the iteration it's part of.
+// iteration it belongs to, the directory the agent runs in, where its
+// usage is recorded, and the running token/cost tally of the iteration
+// it's part of.
 type agentCall struct {
 	specFile string
 	iter     int
+	workDir  string
 	uw       *usage.Writer
 	tally    *iterationTally
 }
@@ -436,7 +458,7 @@ func (o *Orchestrator) runAgent(ctx context.Context, c agentCall, a *agents.Agen
 	o.Log.Printf("%s started (model=%s)", prefix, a.Model)
 
 	stopHeartbeat := o.startHeartbeat(prefix)
-	result, err := o.Runner.Run(ctx, o.Cfg.Dir, a, prompt)
+	result, err := o.Runner.Run(ctx, c.workDir, a, prompt)
 	stopHeartbeat()
 	o.recordUsage(c.uw, c.specFile, a.Name, c.iter, a.Model, result)
 

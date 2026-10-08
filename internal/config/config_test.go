@@ -347,3 +347,21 @@ func TestParseStableSystemPromptDefaultsOnAndCanBeDisabled(t *testing.T) {
 		t.Error("StableSystemPrompt = true, want false when explicitly disabled")
 	}
 }
+
+func TestParseWorktreeDefaultsOnAndCanBeDisabled(t *testing.T) {
+	cfg, err := Parse(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Worktree {
+		t.Error("Worktree = false, want true by default")
+	}
+
+	cfg, err = Parse([]string{"--worktree=false"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Worktree {
+		t.Error("Worktree = true, want false when explicitly disabled")
+	}
+}

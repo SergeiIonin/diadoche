@@ -37,9 +37,11 @@ DESCRIPTION
 
       1. stops diadoche (and any claude call it has in flight) right away,
          before it fails the rest of the queue against an exhausted account;
-      2. removes every task that isn't DONE from spec/STATUS.md, so the next
+      2. removes every task from spec/STATUS.md except DONE, BLOCKED and
+         parked FAILED ones (those with a spec/<NNN>_FAILED.md), so the next
          run re-queues them instead of treating them as FAILED — diadoche
-         then resumes each one from the plan/reviews already on disk;
+         then resumes each one from the plan/reviews already on disk (and,
+         with --worktree, in its worktree);
       3. sleeps until the reset time from the error message (plus
          --reset-buffer), or --fallback-wait if it has none;
       4. starts diadoche again with the same flags.

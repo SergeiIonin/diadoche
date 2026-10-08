@@ -74,9 +74,15 @@ Flags:
   this many minutes (default 0 = no limit). See "Per-call budget" below.
 - `--max-call-cost` — fail the task if a single agent call's cost (USD)
   exceeds this (default 0 = no limit). See "Per-call budget" below.
-- `--allow-dirty` — start a task even if the working tree already has
-  uncommitted changes; those files are never parked if the task fails. See
-  "FAILED tasks" below.
+- `--worktree` — run each task in its own git worktree
+  `.claude/diadoche/worktrees/<NNN>-<slug>` on branch
+  `diadoche/<NNN>-<slug>`, merging it into the current branch once `DONE`
+  (default `true`). `--worktree=false` works in the main working tree and
+  parks a `FAILED` task's changes instead. See "Worktrees" below.
+- `--allow-dirty` — skip the dirty-working-tree check (at run start with
+  `--worktree`, before each task with `--worktree=false`); with
+  `--worktree=false` those files are never parked if the task fails. See
+  "Worktrees" and "FAILED tasks (`--worktree=false`)" below.
 - `--stable-system-prompt` — pass `claude`
   `--exclude-dynamic-system-prompt-sections`, so per-machine sections (cwd,
   env info, memory paths, git status) stay out of the system prompt and the
@@ -135,10 +141,11 @@ preprocessor) are guarded by a `spec/.lock` file lock, so a concurrent
      of the worker's changes (see "Diff-scoped tester" below) plus the plan's
      test command, writes `spec/NNN_REVIEW_M.md`, and, if the task is
      genuinely done, sets `spec/STATUS.md` to `DONE` itself.
-3. Once tester marks a task `DONE`, diadoche moves on to the next task in
+3. Once tester marks a task `DONE`, diadoche commits it (with `--worktree`,
+   on the task's branch, then merges it) and moves on to the next task in
    the queue. If iterations run out without `DONE`, diadoche itself sets
-   `FAILED` and parks the task's changes on a side branch (see "FAILED
-   tasks" below).
+   `FAILED` and keeps the task's changes on a `diadoche/failed/...` branch
+   (see "Worktrees" and "FAILED tasks" below).
 4. From the 2nd iteration on, planner and worker also get the previous
    `spec/NNN_REVIEW_M.md` in their context.
 
@@ -223,9 +230,54 @@ size only, and the index is never touched to produce any of this).
   task's base commit, and an instruction to open just the files it needs
   itself, e.g. `git diff <base> -- <path>`.
 
-## FAILED tasks
+## Worktrees
 
-Every task starts from a clean working tree, and the work of a failed task
+By default (`--worktree`) every task runs in its own git worktree, so an
+unfinished or failed task never leaves anything behind in the main working
+tree:
+
+1. When a task starts, diadoche creates branch `diadoche/<NNN>-<slug>` from
+   the current HEAD of the branch checked out in the main working tree, and
+   a worktree for it in `.claude/diadoche/worktrees/<NNN>-<slug>`.
+   `<NNN>-<slug>` comes from the spec file name, as in the
+   `diadoche/failed/...` branch names.
+2. planner, worker and tester all run with that worktree as their working
+   directory, and tester's diff is computed inside it. diadoche's
+   bookkeeping (`spec/`, `STATUS.md`, `QUEUE.md`, `usage.jsonl`, plans and
+   reviews) stays in the main working tree, as before.
+3. `DONE`: the task's changes (except `.claude/diadoche/` and
+   `.claude/agents/`) are committed on its branch, with the task's heading
+   (the spec's first line without `# ` and the number) as the message. The
+   branch is then merged into the current branch: a fast-forward when
+   possible, otherwise a merge commit. After that the worktree is removed
+   (`git worktree remove`) and the branch is deleted. The bookkeeping is
+   committed separately as `diadoche: complete <spec>`.
+4. Merge conflict: the merge is aborted (`git merge --abort`), so the main
+   branch keeps no trace of it. The task becomes `BLOCKED`, with the reason
+   in the Status cell of `STATUS.md` (`BLOCKED: <reason>`); its worktree
+   and branch are kept for a human to resolve, and the run moves on to the
+   next task. `BLOCKED` tasks are never re-queued (like `FAILED` ones).
+5. `FAILED`: the task's changes are committed on its branch, the worktree
+   is removed and the branch is renamed to `diadoche/failed/<NNN>-<slug>`
+   (with a `-2`, `-3`, ... suffix if that name is taken).
+   `spec/NNN_FAILED.md` names the branch.
+
+A usage-limit interruption leaves the worktree in place, and the next run
+resumes the task in it. `.claude/diadoche/worktrees/` is added to
+`.git/info/exclude` automatically, so the main tree never sees the
+worktrees as untracked files.
+
+Before the run starts, diadoche checks the main working tree. If it has
+uncommitted changes outside `.claude/diadoche/` and `.claude/agents/`, the
+run exits with an error listing them and no agent is started. diadoche
+never runs `git stash`: commit the changes first, or pass `--allow-dirty`
+to skip the check (or `--worktree=false`). A repository without any commit
+yet has nothing to branch from, so such a run falls back to
+`--worktree=false`.
+
+## FAILED tasks (`--worktree=false`)
+
+This section describes the in-place mode, `--worktree=false`. Every task starts from a clean working tree, and the work of a failed task
 isn't lost. When a task becomes `FAILED` (iterations ran out, an agent call
 errored, `--max-call-cost` was exceeded, ...), diadoche parks its changes:
 
@@ -253,7 +305,7 @@ A claude usage-limit error is not a failure. Nothing is parked: the task
 stays `IN_PROGRESS` with its changes in the working tree, and diadoche
 exits, so `diadoche-restarter` (or the next manual run) resumes it.
 
-Before a task starts from scratch, diadoche checks the working tree. If
+With `--worktree=false`, before a task starts from scratch, diadoche checks the working tree. If
 there are uncommitted changes outside `.claude/diadoche/` and
 `.claude/agents/`, it doesn't start the task and exits with an error that
 lists the files: if the task failed, they would be parked along with the
@@ -324,6 +376,7 @@ sees one, it:
    diadoche doesn't go on to fail the rest of the queue against an
    exhausted account;
 2. removes every task that isn't `DONE` from `spec/STATUS.md`, except
+   `BLOCKED` tasks (they wait for a human to resolve their merge) and
    `FAILED` tasks that diadoche already parked (they have a
    `spec/NNN_FAILED.md`). Otherwise the next run could see the interrupted
    task as `FAILED` and never pick it up. The next sync re-adds those tasks as `QUEUED`, and each one

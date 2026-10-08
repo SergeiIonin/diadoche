@@ -1,9 +1,10 @@
 // Package restarter keeps diadoche running across claude usage-limit
 // windows: it runs diadoche as a child process, watches its output for the
 // claude CLI's "you've hit your limit" error, and when that shows up kills
-// diadoche, drops every non-DONE row from STATUS.md (so the next run
-// re-queues those tasks instead of seeing them as FAILED), sleeps until the
-// window reopens and starts diadoche again.
+// diadoche, drops every row from STATUS.md that isn't DONE, BLOCKED or a
+// parked FAILED (so the next run re-queues those tasks instead of seeing
+// them as FAILED), sleeps until the window reopens and starts diadoche
+// again.
 package restarter
 
 import (
@@ -79,7 +80,7 @@ func (r *Restarter) Run(ctx context.Context) error {
 			return fmt.Errorf("reset %s: %w", r.Layout.StatusPath, err)
 		}
 		if len(removed) > 0 {
-			r.Log.Printf("restarter: removed non-DONE task(s) from STATUS.md so they're re-queued: %v", removed)
+			r.Log.Printf("restarter: removed unfinished task(s) from STATUS.md so they're re-queued: %v", removed)
 		}
 
 		now := r.now()
@@ -232,7 +233,10 @@ func sleepUntil(ctx context.Context, wake time.Time, now func() time.Time, poll 
 // removed specs. The next diadoche run's sync re-adds those task files as
 // QUEUED, and resumes each one from the plan/reviews already on disk. A
 // FAILED task whose changes diadoche already parked (it has a
-// spec/<NNN>_FAILED.md) genuinely failed, so it's kept as is.
+// spec/<NNN>_FAILED.md) genuinely failed, so it's kept as is. So is a
+// BLOCKED task (with its reason): it waits for a human to resolve its
+// merge, and re-queuing it would rerun the task while its worktree and
+// branch are still there.
 func ResetStatus(l specs.Layout) ([]string, error) {
 	lock, err := speclock.Acquire(l.SpecDir, lockTimeout)
 	if err != nil {
@@ -255,7 +259,8 @@ func ResetStatus(l specs.Layout) ([]string, error) {
 	var kept []specs.Row
 	var removed []string
 	for _, row := range rows {
-		if row.Status == specs.StatusDone || row.Status == specs.StatusFailed && parked(l, row.Spec) {
+		if row.Status == specs.StatusDone || row.Status == specs.StatusBlocked ||
+			row.Status == specs.StatusFailed && parked(l, row.Spec) {
 			kept = append(kept, row)
 		} else {
 			removed = append(removed, row.Spec)

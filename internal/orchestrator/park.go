@@ -17,16 +17,26 @@ import (
 
 // fatalError stops Run altogether instead of moving on to the next task:
 // the working tree isn't in a state the next task can safely start from
-// (a dirty tree, a FAILED task whose changes couldn't be parked), or the
-// claude account hit its usage limit.
+// (a dirty tree, a FAILED task whose changes couldn't be parked, a task
+// worktree that couldn't be set up or cleaned up), or the claude account
+// hit its usage limit.
 type fatalError struct{ err error }
 
 func (e *fatalError) Error() string { return e.err.Error() }
 func (e *fatalError) Unwrap() error { return e.err }
 
-// workspace is a task's git state: the commit its changes are diffed
-// against, and what must never be parked with them.
+// workspace is a task's git state: where it runs, the commit its changes
+// are diffed against, and what must never be parked with them.
 type workspace struct {
+	// dir is where the task's agents run and its diff is computed: the
+	// project root, or in worktree mode the task's own worktree.
+	dir string
+
+	// worktree is set in worktree mode, where branch
+	// (diadoche/<NNN>-<slug>) is the task's branch checked out in dir.
+	worktree bool
+	branch   string
+
 	// base is the commit (or, before the repo's first commit, git's empty
 	// tree) HEAD pointed at when the task first started. Persisted in
 	// baseFile, so a task resumed after a restart keeps diffing against
@@ -57,6 +67,7 @@ func (w *workspace) removeBaseFile() { _ = os.Remove(w.baseFile) }
 // skips the check, because the changes in the tree are its own.
 func (o *Orchestrator) prepareWorkspace(ctx context.Context, specFile, num string) (*workspace, error) {
 	ws := &workspace{
+		dir:         o.Cfg.Dir,
 		baseFile:    filepath.Join(o.Layout.SpecDir, num+"_BASE"),
 		exclude:     relExcludeDirs(o.Cfg.Dir, o.Layout.Root, o.Layout.AgentsDir),
 		preexisting: map[string]bool{},
@@ -124,7 +135,8 @@ func (o *Orchestrator) hasPriorProgress(num string) bool {
 	return lastReview(o.Layout.SpecDir, num) != ""
 }
 
-// failTask marks specFile FAILED and parks its changes (see park); cause
+// failTask marks specFile FAILED and parks its changes (see park, or
+// failWorktree in worktree mode); cause
 // (nil when the iteration budget ran out) is recorded in _FAILED.md. A
 // broken STATUS.md write is only logged: it mustn't stop the parking, and
 // leaving a task IN_PROGRESS within a still-running process would make
@@ -136,6 +148,9 @@ func (o *Orchestrator) failTask(ctx context.Context, specFile, num string, ws *w
 	}
 	if ws == nil { // --dry-run
 		return nil
+	}
+	if ws.worktree {
+		return o.failWorktree(ctx, specFile, num, ws, cause)
 	}
 	return o.park(ctx, specFile, num, ws, cause)
 }
@@ -204,7 +219,7 @@ func (o *Orchestrator) park(ctx context.Context, specFile, num string, ws *works
 	}
 
 	failedPath := filepath.Join(o.Layout.SpecDir, num+"_FAILED.md")
-	if err := os.WriteFile(failedPath, []byte(o.failedReport(specFile, num, branch, stat, restorable, cause)), 0o644); err != nil {
+	if err := os.WriteFile(failedPath, []byte(o.failedReport(specFile, num, branch, stat, restorable, cause, false)), 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", failedPath, err)
 	}
 	ws.removeBaseFile()
@@ -218,8 +233,9 @@ func (o *Orchestrator) park(ctx context.Context, specFile, num string, ws *works
 	return nil
 }
 
-// failedReport renders spec/<num>_FAILED.md.
-func (o *Orchestrator) failedReport(specFile, num, branch, stat string, restorable []string, cause error) string {
+// failedReport renders spec/<num>_FAILED.md. inWorktree says the task ran
+// in its own worktree, whose branch was renamed to branch.
+func (o *Orchestrator) failedReport(specFile, num, branch, stat string, restorable []string, cause error, inWorktree bool) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# %s: FAILED\n\n", specFile)
 	if cause != nil {
@@ -238,7 +254,15 @@ func (o *Orchestrator) failedReport(specFile, num, branch, stat string, restorab
 		b.WriteString("The task made no code changes, so no branch was created.\n")
 		return b.String()
 	}
-	fmt.Fprintf(&b, "Code changes were parked on branch `%s`; the working tree was reverted to the task's starting point.\n\n", branch)
+	if inWorktree {
+		if strings.TrimSpace(stat) == "" {
+			fmt.Fprintf(&b, "The task made no code changes; its branch was kept as `%s` anyway.\n", branch)
+			return b.String()
+		}
+		fmt.Fprintf(&b, "The task's changes were committed on its branch, renamed to `%s`; its worktree was removed and the main working tree was never touched.\n\n", branch)
+	} else {
+		fmt.Fprintf(&b, "Code changes were parked on branch `%s`; the working tree was reverted to the task's starting point.\n\n", branch)
+	}
 	fmt.Fprintf(&b, "```\n%s```\n\n", stat)
 	if len(restorable) > 0 && len(restorable) <= 20 {
 		fmt.Fprintf(&b, "To bring the changes back: `git checkout %s -- %s` (or `git merge %s`, which also replays deletions).\n",
@@ -251,17 +275,23 @@ func (o *Orchestrator) failedReport(specFile, num, branch, stat string, restorab
 
 var unsafeRefChars = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
 
+// taskID returns <num>-<slug> for specFile (just <num> without a slug),
+// safe to use in a branch name or as a directory name.
+func taskID(specFile, num string) string {
+	slug := strings.TrimSuffix(specFile, filepath.Ext(specFile))
+	slug = strings.TrimLeft(strings.TrimPrefix(slug, num), "_-")
+	slug = strings.Trim(unsafeRefChars.ReplaceAllString(slug, "-"), ".-")
+	if slug == "" {
+		return num
+	}
+	return num + "-" + slug
+}
+
 // failedBranchName returns diadoche/failed/<num>-<slug>, with a -2, -3...
 // suffix if a branch of that name already exists (a task that FAILED
 // again after being retried), so earlier parked work is never overwritten.
 func (o *Orchestrator) failedBranchName(ctx context.Context, specFile, num string) string {
-	slug := strings.TrimSuffix(specFile, filepath.Ext(specFile))
-	slug = strings.TrimLeft(strings.TrimPrefix(slug, num), "_-")
-	slug = strings.Trim(unsafeRefChars.ReplaceAllString(slug, "-"), ".-")
-	name := "diadoche/failed/" + num
-	if slug != "" {
-		name += "-" + slug
-	}
+	name := "diadoche/failed/" + taskID(specFile, num)
 	candidate := name
 	for n := 2; gitutil.BranchExists(ctx, o.Cfg.Dir, candidate); n++ {
 		candidate = fmt.Sprintf("%s-%d", name, n)

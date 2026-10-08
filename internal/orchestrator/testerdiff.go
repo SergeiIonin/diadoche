@@ -50,15 +50,15 @@ type testerDiff struct {
 }
 
 // buildTesterDiff computes the worker's changes since the task's base
-// commit, in the shape tester should see them. plan is the task's
+// commit, in the task's working directory (its worktree, if it has one), in the shape tester should see them. plan is the task's
 // IMPL_PLAN.md, used for its "## Files" list when the diff has to be cut
 // down.
 func (o *Orchestrator) buildTesterDiff(ctx context.Context, ws *workspace, plan string) (testerDiff, error) {
-	diff, err := gitutil.DiffSinceExcluding(ctx, o.Cfg.Dir, ws.base, ws.exclude...)
+	diff, err := gitutil.DiffSinceExcluding(ctx, ws.dir, ws.base, ws.exclude...)
 	if err != nil {
 		return testerDiff{}, fmt.Errorf("git diff: %w", err)
 	}
-	untrackedAll, err := gitutil.UntrackedFiles(ctx, o.Cfg.Dir)
+	untrackedAll, err := gitutil.UntrackedFiles(ctx, ws.dir)
 	if err != nil {
 		return testerDiff{}, fmt.Errorf("git ls-files: %w", err)
 	}
@@ -68,7 +68,7 @@ func (o *Orchestrator) buildTesterDiff(ctx context.Context, ws *workspace, plan 
 		return testerDiff{Empty: true}, nil
 	}
 
-	files, err := gitutil.ReadUntracked(o.Cfg.Dir, untracked)
+	files, err := gitutil.ReadUntracked(ws.dir, untracked)
 	if err != nil {
 		return testerDiff{}, err
 	}
@@ -81,7 +81,7 @@ func (o *Orchestrator) buildTesterDiff(ctx context.Context, ws *workspace, plan 
 		return testerDiff{Body: join(diff, withContent)}, nil
 	}
 
-	stat, err := gitutil.DiffStatSinceExcluding(ctx, o.Cfg.Dir, ws.base, ws.exclude...)
+	stat, err := gitutil.DiffStatSinceExcluding(ctx, ws.dir, ws.base, ws.exclude...)
 	if err != nil {
 		return testerDiff{}, fmt.Errorf("git diff --stat: %w", err)
 	}
@@ -89,7 +89,7 @@ func (o *Orchestrator) buildTesterDiff(ctx context.Context, ws *workspace, plan 
 
 	// The plan's own files may well be where the huge change is, in which
 	// case including their diff would defeat the whole point of the limit.
-	restricted, err := gitutil.DiffSinceForFiles(ctx, o.Cfg.Dir, ws.base, implplan.Files(plan))
+	restricted, err := gitutil.DiffSinceForFiles(ctx, ws.dir, ws.base, implplan.Files(plan))
 	if err != nil {
 		return testerDiff{}, fmt.Errorf("git diff for plan files: %w", err)
 	}

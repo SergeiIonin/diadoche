@@ -2,6 +2,7 @@ package gitutil
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -307,5 +308,246 @@ func TestReadUntrackedReturnsTextContentAndFlagsBinary(t *testing.T) {
 	}
 	if files[1].Size != int64(len(binContent)) {
 		t.Errorf("blob.bin size = %d, want %d", files[1].Size, len(binContent))
+	}
+}
+
+// newCommittedRepo returns a temp repo with a.txt committed on its
+// current branch.
+func newCommittedRepo(t *testing.T) string {
+	t.Helper()
+	requireGit(t)
+	setTestGitEnv(t)
+	dir := t.TempDir()
+	ctx := context.Background()
+	if err := EnsureRepo(ctx, dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CommitAll(ctx, dir, "initial"); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func git(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func writeTestFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// addTaskWorktree creates worktree wt on branch "task" and commits a
+// change to file with content in it.
+func addTaskWorktree(t *testing.T, dir, file, content string) string {
+	t.Helper()
+	ctx := context.Background()
+	wt := filepath.Join(dir, "wts", "task")
+	head := git(t, dir, "rev-parse", "HEAD")
+	if err := WorktreeAdd(ctx, dir, wt, "task", head); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(wt, file), content)
+	if _, err := CommitAllExcluding(ctx, wt, "task change"); err != nil {
+		t.Fatal(err)
+	}
+	return wt
+}
+
+func TestWorktreeAddRemoveAndReattach(t *testing.T) {
+	dir := newCommittedRepo(t)
+	ctx := context.Background()
+	wt := filepath.Join(dir, "wts", "task")
+	head := git(t, dir, "rev-parse", "HEAD")
+
+	if err := WorktreeAdd(ctx, dir, wt, "task", head); err != nil {
+		t.Fatal(err)
+	}
+	if !BranchExists(ctx, dir, "task") || !IsWorktree(ctx, dir, wt) {
+		t.Fatal("branch and worktree should exist")
+	}
+	if got := git(t, wt, "symbolic-ref", "--short", "HEAD"); got != "task" {
+		t.Errorf("worktree branch = %q", got)
+	}
+	writeTestFile(t, filepath.Join(wt, "b.txt"), "b\n")
+	if _, err := CommitAllExcluding(ctx, wt, "b"); err != nil {
+		t.Fatal(err)
+	}
+	tip := git(t, dir, "rev-parse", "task")
+
+	if err := WorktreeRemove(ctx, dir, wt); err != nil {
+		t.Fatal(err)
+	}
+	if IsWorktree(ctx, dir, wt) {
+		t.Error("IsWorktree should be false after removal")
+	}
+	if _, err := os.Stat(wt); !os.IsNotExist(err) {
+		t.Errorf("worktree dir should be gone, stat err = %v", err)
+	}
+	// Removing again is not an error.
+	if err := WorktreeRemove(ctx, dir, wt); err != nil {
+		t.Errorf("second WorktreeRemove: %v", err)
+	}
+
+	// The kept branch is attached again, not recreated at head.
+	if err := WorktreeAdd(ctx, dir, wt, "task", head); err != nil {
+		t.Fatal(err)
+	}
+	if got := git(t, wt, "rev-parse", "HEAD"); got != tip {
+		t.Errorf("reattached worktree HEAD = %s, want branch tip %s", got, tip)
+	}
+	if base, err := MergeBase(ctx, dir, "HEAD", "task"); err != nil || base != head {
+		t.Errorf("MergeBase = %q, %v; want %s", base, err, head)
+	}
+}
+
+func TestCommitAllExcludingSkipsExcludedDirs(t *testing.T) {
+	dir := newCommittedRepo(t)
+	ctx := context.Background()
+	writeTestFile(t, filepath.Join(dir, "code.txt"), "code\n")
+	writeTestFile(t, filepath.Join(dir, ".claude", "diadoche", "spec", "x.md"), "bookkeeping\n")
+
+	committed, err := CommitAllExcluding(ctx, dir, "task", ".claude/diadoche", ".claude/agents")
+	if err != nil || !committed {
+		t.Fatalf("committed=%v err=%v", committed, err)
+	}
+	files := git(t, dir, "show", "--name-only", "--format=", "HEAD")
+	if files != "code.txt" {
+		t.Errorf("commit should hold only code.txt, has %q", files)
+	}
+	committed, err = CommitAllExcluding(ctx, dir, "nothing", ".claude/diadoche")
+	if err != nil || committed {
+		t.Errorf("nothing to commit: committed=%v err=%v", committed, err)
+	}
+}
+
+func TestMergeFastForward(t *testing.T) {
+	dir := newCommittedRepo(t)
+	ctx := context.Background()
+	addTaskWorktree(t, dir, "b.txt", "b\n")
+
+	ff, err := Merge(ctx, dir, "task", "Merge task")
+	if err != nil || !ff {
+		t.Fatalf("ff=%v err=%v", ff, err)
+	}
+	if git(t, dir, "rev-parse", "HEAD") != git(t, dir, "rev-parse", "task") {
+		t.Error("HEAD should equal the branch tip after a fast-forward")
+	}
+}
+
+func TestMergeCreatesMergeCommitWhenDiverged(t *testing.T) {
+	dir := newCommittedRepo(t)
+	ctx := context.Background()
+	addTaskWorktree(t, dir, "b.txt", "b\n")
+	writeTestFile(t, filepath.Join(dir, "c.txt"), "c\n")
+	if err := CommitAll(ctx, dir, "main change"); err != nil {
+		t.Fatal(err)
+	}
+
+	ff, err := Merge(ctx, dir, "task", "Merge task")
+	if err != nil || ff {
+		t.Fatalf("ff=%v err=%v", ff, err)
+	}
+	if parents := strings.Fields(git(t, dir, "log", "-1", "--format=%P")); len(parents) != 2 {
+		t.Errorf("HEAD parents = %v, want a merge commit", parents)
+	}
+	if msg := git(t, dir, "log", "-1", "--format=%s"); msg != "Merge task" {
+		t.Errorf("merge message = %q", msg)
+	}
+}
+
+func TestMergeConflictIsAborted(t *testing.T) {
+	dir := newCommittedRepo(t)
+	ctx := context.Background()
+	addTaskWorktree(t, dir, "a.txt", "from task\n")
+	writeTestFile(t, filepath.Join(dir, "a.txt"), "from main\n")
+	if err := CommitAll(ctx, dir, "main change"); err != nil {
+		t.Fatal(err)
+	}
+	head := git(t, dir, "rev-parse", "HEAD")
+
+	_, err := Merge(ctx, dir, "task", "Merge task")
+	var mErr *MergeError
+	if !errors.As(err, &mErr) || !mErr.Conflict {
+		t.Fatalf("err = %v, want a conflict *MergeError", err)
+	}
+	if _, err := exec.Command("git", "-C", dir, "rev-parse", "-q", "--verify", "MERGE_HEAD").Output(); err == nil {
+		t.Error("MERGE_HEAD should be gone after the abort")
+	}
+	if st := git(t, dir, "status", "--porcelain"); st != "" {
+		t.Errorf("tree should be clean after the abort, got:\n%s", st)
+	}
+	if got := git(t, dir, "rev-parse", "HEAD"); got != head {
+		t.Errorf("HEAD moved to %s", got)
+	}
+}
+
+func TestRenameAndDeleteBranch(t *testing.T) {
+	dir := newCommittedRepo(t)
+	ctx := context.Background()
+	git(t, dir, "branch", "one")
+	if err := RenameBranch(ctx, dir, "one", "x/two"); err != nil {
+		t.Fatal(err)
+	}
+	if BranchExists(ctx, dir, "one") || !BranchExists(ctx, dir, "x/two") {
+		t.Fatal("rename did not happen")
+	}
+	if err := DeleteBranch(ctx, dir, "x/two"); err != nil {
+		t.Fatal(err)
+	}
+	if BranchExists(ctx, dir, "x/two") {
+		t.Error("branch should be deleted")
+	}
+}
+
+func TestChangedPathsBetweenSkipsDeletions(t *testing.T) {
+	dir := newCommittedRepo(t)
+	ctx := context.Background()
+	base := git(t, dir, "rev-parse", "HEAD")
+	writeTestFile(t, filepath.Join(dir, "b.txt"), "b\n")
+	if err := os.Remove(filepath.Join(dir, "a.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := CommitAll(ctx, dir, "change"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ChangedPathsBetween(ctx, dir, base, "HEAD")
+	if err != nil || len(got) != 1 || got[0] != "b.txt" {
+		t.Errorf("got %v, %v; want [b.txt]", got, err)
+	}
+}
+
+func TestEnsureInfoExcludeIsIdempotent(t *testing.T) {
+	dir := newCommittedRepo(t)
+	ctx := context.Background()
+	const pattern = "/.claude/diadoche/worktrees/"
+	for range 2 {
+		if err := EnsureInfoExclude(ctx, dir, pattern); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(dir, ".git", "info", "exclude"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(data), pattern+"\n"); n != 1 {
+		t.Errorf("pattern appears %d times, want 1:\n%s", n, data)
+	}
+	writeTestFile(t, filepath.Join(dir, ".claude", "diadoche", "worktrees", "x", "f.txt"), "x\n")
+	if st := git(t, dir, "status", "--porcelain", "--untracked-files=all"); st != "" {
+		t.Errorf("excluded dir should be ignored, status:\n%s", st)
 	}
 }

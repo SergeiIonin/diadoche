@@ -3,7 +3,9 @@ package specs
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestDiscoverTaskFilesExcludesGenerated(t *testing.T) {
@@ -200,5 +202,105 @@ func TestNewLayoutPrefixPath(t *testing.T) {
 	want := filepath.Join(dir, ".claude", "diadoche", "prefix.md")
 	if got := NewLayout(dir).PrefixPath; got != want {
 		t.Errorf("PrefixPath = %q, want %q", got, want)
+	}
+}
+
+func TestStatusReasonRoundTripsAndIsSanitized(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "STATUS.md")
+	rows := []Row{
+		{Num: "001", Spec: "001_a.md", Status: StatusBlocked, Reason: "merge failed: conflict in a|b\nsecond  line"},
+		{Num: "002", Spec: "002_b.md", Status: StatusDone},
+	}
+	if err := WriteStatus(path, rows); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "| BLOCKED: merge failed: conflict in a b second line |") {
+		t.Errorf("STATUS.md should carry the sanitized reason in the Status cell, got:\n%s", raw)
+	}
+	if strings.Contains(string(raw), "DONE:") {
+		t.Errorf("a row without a reason must not get a ':', got:\n%s", raw)
+	}
+	got, err := ReadStatus(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Row{
+		{Num: "001", Spec: "001_a.md", Status: StatusBlocked, Reason: "merge failed: conflict in a b second line"},
+		{Num: "002", Spec: "002_b.md", Status: StatusDone},
+	}
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+}
+
+func TestLongReasonIsCapped(t *testing.T) {
+	r := sanitizeReason(strings.Repeat("é", 400))
+	if len(r) > maxReasonLen+len("…") || !strings.HasSuffix(r, "…") || !utf8.ValidString(r) {
+		t.Errorf("reason not capped on a rune boundary: %d bytes, %q", len(r), r[len(r)-10:])
+	}
+}
+
+func TestSetStatusClearsReason(t *testing.T) {
+	l := NewLayout(t.TempDir())
+	if err := l.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteStatus(l.StatusPath, []Row{{Num: "001", Spec: "001_a.md", Status: StatusQueued}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetStatusReason(l, "001_a.md", StatusBlocked, "conflict"); err != nil {
+		t.Fatal(err)
+	}
+	rows, _ := ReadStatus(l.StatusPath)
+	if rows[0].Status != StatusBlocked || rows[0].Reason != "conflict" {
+		t.Fatalf("got %+v", rows[0])
+	}
+	if err := SetStatus(l, "001_a.md", StatusQueued); err != nil {
+		t.Fatal(err)
+	}
+	rows, _ = ReadStatus(l.StatusPath)
+	if rows[0].Status != StatusQueued || rows[0].Reason != "" {
+		t.Fatalf("SetStatus should clear the reason, got %+v", rows[0])
+	}
+}
+
+func TestSyncDoesNotRequeueBlocked(t *testing.T) {
+	l := NewLayout(t.TempDir())
+	if err := l.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"001_blocked.md", "002_failed.md", "003_queued.md"} {
+		if err := os.WriteFile(filepath.Join(l.SpecDir, f), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := WriteStatus(l.StatusPath, []Row{
+		{Num: "001", Spec: "001_blocked.md", Status: StatusBlocked, Reason: "merge conflict"},
+		{Num: "002", Spec: "002_failed.md", Status: StatusFailed},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rows, queue, err := Sync(l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(queue) != 1 || queue[0] != "003_queued.md" {
+		t.Errorf("queue = %v, want only 003_queued.md", queue)
+	}
+	onDisk, _ := ReadQueue(l.QueuePath)
+	if len(onDisk) != 1 || onDisk[0] != "003_queued.md" {
+		t.Errorf("QUEUE.md = %v, want only 003_queued.md", onDisk)
+	}
+	if rows[0].Status != StatusBlocked || rows[0].Reason != "merge conflict" {
+		t.Errorf("BLOCKED row changed by Sync: %+v", rows[0])
+	}
+	persisted, _ := ReadStatus(l.StatusPath)
+	if persisted[0].Status != StatusBlocked || persisted[0].Reason != "merge conflict" {
+		t.Errorf("BLOCKED row not persisted: %+v", persisted[0])
 	}
 }

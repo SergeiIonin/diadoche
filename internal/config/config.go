@@ -44,7 +44,7 @@ const helpSynopsis = `SYNOPSIS
              [--planner-model <name>] [--worker-model <name>]
              [--tester-model <name>] [--max-call-minutes <n>]
              [--max-call-cost <usd>] [--allow-dirty]
-             [--stable-system-prompt=<bool>]
+             [--stable-system-prompt=<bool>] [--worktree=<bool>]
     diadoche --preprocess --task <path> [--dir <path>] [--claude-bin <path>]
              [--preprocessor-model <name>]
     diadoche --initialize <project-path>
@@ -62,7 +62,8 @@ const helpDescription = `DESCRIPTION
     of planner (writes an implementation plan) -> worker (implements it) ->
     tester (reviews it and, once the task is genuinely done, marks it DONE
     in spec/STATUS.md). Once the tester marks a task DONE, diadoche commits
-    the changes and moves on to the next task; if --ITER rounds run out
+    the changes (and, with --worktree, merges them; see WORKTREES below)
+    and moves on to the next task; if --ITER rounds run out
     without a DONE verdict, diadoche itself marks the task FAILED. Once the
     queue drains, diadoche checks spec/ for new task files once more before
     exiting, so tasks added concurrently (e.g. by --preprocess) are picked
@@ -110,7 +111,32 @@ const helpDescription = `DESCRIPTION
     fits the limit, the base commit, and an instruction for tester to open
     the files it needs itself.
 
-    FAILED TASKS: every task starts from a clean working tree. When a task
+    WORKTREES (--worktree, on by default): each task runs in its own git
+    worktree, .claude/diadoche/worktrees/<NNN>-<slug>, on its own branch
+    diadoche/<NNN>-<slug>, created from the current HEAD of the branch
+    checked out in the main working tree. planner, worker and tester all
+    run with that worktree as their working directory, and tester's diff is
+    computed inside it; diadoche's bookkeeping (spec/, STATUS.md, QUEUE.md,
+    usage.jsonl, plans, reviews) stays in the main working tree.
+    .claude/diadoche/worktrees/ is added to .git/info/exclude.
+      DONE: the task's changes are committed on its branch, with the
+      task's heading (its first line, without "# " and the number) as the
+      message, then merged into the current branch — a fast-forward when
+      possible, otherwise a merge commit. The worktree and the branch are
+      then removed.
+      Merge conflict: the merge is aborted, the task becomes BLOCKED with
+      the reason in STATUS.md ("BLOCKED: <reason>"), its worktree and
+      branch are kept for a human to resolve, and the run moves on to the
+      next task. BLOCKED tasks are never re-queued.
+      FAILED: the task's changes are committed on its branch, the worktree
+      is removed and the branch is renamed to
+      diadoche/failed/<NNN>-<slug>; spec/<NNN>_FAILED.md names it.
+    A usage-limit interruption leaves the worktree in place; the next run
+    resumes the task in it. A repository without any commit yet has
+    nothing to branch from, so such a run falls back to --worktree=false.
+
+    FAILED TASKS (--worktree=false): every task starts from a clean working
+    tree. When a task
     becomes FAILED (iterations exhausted, an agent error, --max-call-cost),
     its changes since the diff base (outside .claude/diadoche/ and
     .claude/agents/) are committed to a new branch
@@ -136,12 +162,16 @@ const helpDescription = `DESCRIPTION
     doesn't know that flag. See docs/prompt-caching.md for what cannot be
     unified and why.
 
-    Before a task starts from scratch, diadoche refuses to run if the
-    working tree already has uncommitted changes outside .claude/diadoche/
-    and .claude/agents/ (they would otherwise be parked with the task's
-    own). --allow-dirty skips this check; such files are then never
-    parked. A task resumed after a restart keeps its own changes and the
-    diff base recorded in spec/<NNN>_BASE at its first start.
+    DIRTY TREE: with --worktree, the run refuses to start if the main
+    working tree has uncommitted changes outside .claude/diadoche/ and
+    .claude/agents/ (each task's changes are merged into the current
+    branch, so it has to be clean); diadoche never stashes them — commit
+    them first. With --worktree=false the same check runs before each task
+    that starts from scratch (the changes would otherwise be parked with
+    the task's own), and such files are never parked under --allow-dirty.
+    --allow-dirty skips the check in both modes. A task resumed after a
+    restart keeps its own changes and the diff base recorded in
+    spec/<NNN>_BASE at its first start.
 
 `
 
@@ -215,7 +245,8 @@ const helpFiles = `
 FILES
     <project>/.claude/diadoche/spec/STATUS.md
         Source of truth for every task's status: QUEUED, IN_PROGRESS,
-        DONE or FAILED.
+        DONE, FAILED or BLOCKED. A BLOCKED row carries its reason in the
+        Status cell ("BLOCKED: <reason>").
 
     <project>/.claude/diadoche/spec/QUEUE.md
         This run's work queue, rebuilt from STATUS.md on every sync.
@@ -245,6 +276,11 @@ FILES
     <project>/.claude/diadoche/spec/NNN_FAILED.md
         Written when a task FAILED: the branch its changes were parked on,
         their diff --stat, the last review, and how to restore them.
+
+    <project>/.claude/diadoche/worktrees/<NNN>-<slug>/
+        With --worktree, the git worktree a task runs in (branch
+        diadoche/<NNN>-<slug>). Removed once the task is DONE or FAILED;
+        kept while it is IN_PROGRESS or BLOCKED.
 
     <project>/.claude/diadoche/usage.jsonl
         One JSON line per agent call: time, task, agent, iteration, model,
@@ -330,10 +366,16 @@ type Config struct {
 	// for a claude CLI that doesn't have that flag.
 	StableSystemPrompt bool
 
-	// AllowDirty lets a task start even though the working tree already
-	// has uncommitted changes outside diadoche's own directories. Those
-	// files are then left alone when a FAILED task is parked.
+	// AllowDirty skips the dirty-working-tree check: at run start with
+	// Worktree, before each task without it. Without Worktree those files
+	// are then left alone when a FAILED task is parked.
 	AllowDirty bool
+
+	// Worktree runs each task in its own git worktree and branch, merging
+	// the branch into the current one once the task is DONE (default on).
+	// false gives the old in-place behaviour: tasks work in the main
+	// working tree and a FAILED task's changes are parked.
+	Worktree bool
 }
 
 // TaskPath resolves --task relative to --dir, unless it's already absolute.
@@ -366,7 +408,8 @@ func Parse(args []string) (*Config, error) {
 	testerModel := fs.String("tester-model", "", "override the tester agent's model (else $DIADOCHE_TESTER_MODEL, else .claude/agents/tester.md, else built-in default)")
 	preprocessorModel := fs.String("preprocessor-model", "", "override the preprocessor agent's model (else $DIADOCHE_PREPROCESSOR_MODEL, else .claude/agents/preprocessor.md, else built-in default)")
 	maxCallMinutes := fs.Int("max-call-minutes", 0, "kill a single agent call if it runs longer than this many minutes (0 = no limit)")
-	allowDirty := fs.Bool("allow-dirty", false, "start a task even if the working tree already has uncommitted changes; those files are never parked when the task FAILS")
+	allowDirty := fs.Bool("allow-dirty", false, "skip the dirty-working-tree check (at run start with --worktree, before each task with --worktree=false); with --worktree=false those files are never parked when the task FAILS")
+	worktree := fs.Bool("worktree", true, "run each task in its own git worktree .claude/diadoche/worktrees/<NNN>-<slug> on branch diadoche/<NNN>-<slug>, merging it into the current branch once DONE; --worktree=false works in the main working tree and parks FAILED changes instead")
 	stableSystemPrompt := fs.Bool("stable-system-prompt", true, "pass claude --exclude-dynamic-system-prompt-sections, keeping the shared prompt prefix identical between calls; set to false for a claude CLI without that flag")
 	maxCallCost := fs.Float64("max-call-cost", 0, "fail the task if a single agent call's cost in USD exceeds this — checked after the call returns, so it cannot preempt the spend (0 = no limit)")
 
@@ -453,6 +496,7 @@ func Parse(args []string) (*Config, error) {
 		MaxCallMinutes:     *maxCallMinutes,
 		MaxCallCostUSD:     *maxCallCost,
 		AllowDirty:         *allowDirty,
+		Worktree:           *worktree,
 		StableSystemPrompt: *stableSystemPrompt,
 	}, nil
 }

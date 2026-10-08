@@ -1,6 +1,10 @@
 // Package specs manages the diadoche spec directory: STATUS.md (source of
 // truth for task status) and QUEUE.md (work queue for the current run), plus
 // discovery of new task spec files (spec/NNN_<slug>.md).
+//
+// A task's status is QUEUED, IN_PROGRESS, DONE, FAILED or BLOCKED (DONE by
+// tester, but its worktree branch couldn't be merged; it waits for a
+// human). Only QUEUED and IN_PROGRESS tasks are pending.
 package specs
 
 import (
@@ -13,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 const (
@@ -20,6 +25,7 @@ const (
 	StatusInProgress = "IN_PROGRESS"
 	StatusDone       = "DONE"
 	StatusFailed     = "FAILED"
+	StatusBlocked    = "BLOCKED"
 )
 
 // Row is one line of the STATUS.md table.
@@ -27,6 +33,29 @@ type Row struct {
 	Num    string
 	Spec   string
 	Status string
+
+	// Reason explains Status, e.g. why a task is BLOCKED. It shares the
+	// Status cell, written as "STATUS: reason", so STATUS.md stays a
+	// three-column table; a cell without ":" has no reason.
+	Reason string
+}
+
+// maxReasonLen caps a Reason written to STATUS.md, in bytes.
+const maxReasonLen = 300
+
+// sanitizeReason makes reason fit in a single table cell: no "|" or line
+// breaks, whitespace collapsed, at most maxReasonLen bytes.
+func sanitizeReason(reason string) string {
+	reason = strings.NewReplacer("|", " ", "\r", " ", "\n", " ").Replace(reason)
+	reason = strings.Join(strings.Fields(reason), " ")
+	if len(reason) <= maxReasonLen {
+		return reason
+	}
+	cut := maxReasonLen
+	for cut > 0 && !utf8.RuneStart(reason[cut]) {
+		cut--
+	}
+	return strings.TrimSpace(reason[:cut]) + "…"
 }
 
 // Layout is the set of paths diadoche reads/writes for a given project root.
@@ -146,7 +175,8 @@ func ReadStatus(path string) ([]Row, error) {
 		if strings.Trim(cells[0], "- ") == "" {
 			continue // separator row
 		}
-		rows = append(rows, Row{Num: cells[0], Spec: cells[1], Status: cells[2]})
+		status, reason, _ := strings.Cut(cells[2], ":")
+		rows = append(rows, Row{Num: cells[0], Spec: cells[1], Status: strings.TrimSpace(status), Reason: strings.TrimSpace(reason)})
 	}
 	return rows, nil
 }
@@ -156,7 +186,11 @@ func WriteStatus(path string, rows []Row) error {
 	b.WriteString("| # | Spec | Status |\n")
 	b.WriteString("|---|------|--------|\n")
 	for _, r := range rows {
-		fmt.Fprintf(&b, "| %s | %s | %s |\n", r.Num, r.Spec, r.Status)
+		status := r.Status
+		if reason := sanitizeReason(r.Reason); reason != "" {
+			status += ": " + reason
+		}
+		fmt.Fprintf(&b, "| %s | %s | %s |\n", r.Num, r.Spec, status)
 	}
 	return writeFileAtomic(path, []byte(b.String()))
 }
@@ -219,7 +253,8 @@ func writeFileAtomic(path string, data []byte) error {
 // QUEUED or IN_PROGRESS (new tasks, and any left mid-flight by a previous,
 // interrupted run), ordered by ascending task number — so a restart always
 // resumes with the lowest-numbered pending task first, regardless of what
-// order rows happen to sit in STATUS.md or the previous QUEUE.md.
+// order rows happen to sit in STATUS.md or the previous QUEUE.md. DONE,
+// FAILED and BLOCKED rows are not pending and never go back to the queue.
 func Sync(l Layout) (rows []Row, queue []string, err error) {
 	if err = l.Ensure(); err != nil {
 		return
@@ -253,7 +288,8 @@ func Sync(l Layout) (rows []Row, queue []string, err error) {
 	return
 }
 
-// pendingQueue returns the specs of every QUEUED/IN_PROGRESS row in rows,
+// pendingQueue returns the specs of every QUEUED/IN_PROGRESS row in rows
+// (DONE, FAILED and BLOCKED rows are not pending),
 // sorted ascending by numeric task number (rows whose Num isn't a plain
 // integer sort after all that are, in their original relative order).
 func pendingQueue(rows []Row) []string {
@@ -296,7 +332,14 @@ func PopQueue(l Layout) (string, error) {
 	return next, nil
 }
 
+// SetStatus sets specFile's status, clearing any reason it had.
 func SetStatus(l Layout, specFile, status string) error {
+	return SetStatusReason(l, specFile, status, "")
+}
+
+// SetStatusReason sets specFile's status together with the reason for it
+// (see Row.Reason).
+func SetStatusReason(l Layout, specFile, status, reason string) error {
 	rows, err := ReadStatus(l.StatusPath)
 	if err != nil {
 		return err
@@ -305,6 +348,7 @@ func SetStatus(l Layout, specFile, status string) error {
 	for i := range rows {
 		if rows[i].Spec == specFile {
 			rows[i].Status = status
+			rows[i].Reason = reason
 			found = true
 			break
 		}

@@ -27,6 +27,7 @@ func TestResetStatusKeepsOnlyDoneAndParkedFailed(t *testing.T) {
 		{Num: "003", Spec: "003_c.md", Status: specs.StatusInProgress},
 		{Num: "004", Spec: "004_d.md", Status: specs.StatusQueued},
 		{Num: "005", Spec: "005_e.md", Status: specs.StatusFailed},
+		{Num: "006", Spec: "006_f.md", Status: specs.StatusBlocked, Reason: "merge conflict"},
 	}
 	if err := specs.WriteStatus(l.StatusPath, rows); err != nil {
 		t.Fatal(err)
@@ -52,8 +53,8 @@ func TestResetStatusKeepsOnlyDoneAndParkedFailed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 || got[0].Spec != "001_a.md" || got[1].Spec != "005_e.md" {
-		t.Errorf("STATUS.md rows = %+v, want only 001_a.md and 005_e.md", got)
+	if len(got) != 3 || got[0].Spec != "001_a.md" || got[1].Spec != "005_e.md" || got[2] != rows[5] {
+		t.Errorf("STATUS.md rows = %+v, want only 001_a.md, 005_e.md and the BLOCKED 006_f.md with its reason", got)
 	}
 	if _, err := os.Stat(leftover); !os.IsNotExist(err) {
 		t.Errorf("interrupted-write temp file not cleaned up: %v", err)

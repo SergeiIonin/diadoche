@@ -1,0 +1,5 @@
+- 007_red_green_test_check.md
+- 008_limit_pause_and_budgets.md
+- 009_idempotent_restart_state.md
+- 010_run_logs_and_artifacts.md
+- 011_dry_run_no_side_effects.md
