@@ -19,6 +19,11 @@
 //
 // Every method is safe on a nil *Run (a no-op), so a run whose directory
 // couldn't be created just goes on without artifacts.
+//
+// A Run is safe for concurrent use, as the tasks of a --parallel run share
+// one: every event is a single Write under its mutex, CallName's counters
+// are under the same mutex, and each task's artifacts live in its own
+// directory.
 package runlog
 
 import (

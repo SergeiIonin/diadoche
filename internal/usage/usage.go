@@ -37,7 +37,9 @@ type Record struct {
 }
 
 // Writer appends Records to a usage.jsonl file, one JSON object per line,
-// and accumulates them into Summary for the end-of-run report.
+// and accumulates them into Summary for the end-of-run report. It is safe
+// for concurrent use (the tasks of a --parallel run share one): every
+// Append is a single Write of a whole line, under mu.
 type Writer struct {
 	mu      sync.Mutex
 	f       *os.File

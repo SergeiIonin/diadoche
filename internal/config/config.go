@@ -223,6 +223,16 @@ const helpDescription = `DESCRIPTION
     SIGTERM stops all tasks at their next step; --shutdown-timeout applies
     once to all in-flight calls together. --dry-run shows which tasks
     could run concurrently. --parallel 1 is the one-task-at-a-time loop.
+    A usage-limit refusal in any task pauses the whole run once (see USAGE
+    LIMITS); no task starts a call meanwhile, and tasks refused during the
+    pause wait with it. Afterwards the run is degraded to one call at a
+    time and no new task until a call succeeds, then it goes back to N;
+    both transitions are logged and written to run.log as
+    event=parallelism degree=<n>. --max-cost-per-run counts all tasks
+    together: once it is crossed no new task starts, the tasks in flight
+    stop at the end of their current iteration (DONE ones are merged, the
+    others stay pending with their worktrees) and diadoche exits non-zero.
+    --max-cost-per-task and --max-call-cost stay per task and per call.
 
     FAILED TASKS (--worktree=false): every task starts from a clean working
     tree. When a task
@@ -369,7 +379,9 @@ const helpCallBudget = `PER-CALL BUDGET
     exceeded diadoche stops after the current agent call, the current task
     stays pending (not FAILED) with its changes in place, the reason is
     logged, and diadoche exits non-zero. A task the tester already marked
-    DONE in that call is still finished (committed/merged) first.
+    DONE in that call is still finished (committed/merged) first. With
+    --parallel > 1 the run budget counts every task together and is
+    checked at the end of each iteration instead of after every call.
 
 `
 
@@ -386,7 +398,8 @@ const helpUsageLimits = `USAGE LIMITS
     the task is IN_PROGRESS again and the backoff starts over at 5 minutes.
     SIGINT/SIGTERM interrupts the wait at once (already the first signal,
     no --shutdown-timeout wait): the task stays PAUSED and is resumed (like
-    IN_PROGRESS) by the next run.
+    IN_PROGRESS) by the next run. With --parallel > 1 there is one pause
+    for the whole run, with one shared backoff (see PARALLEL TASKS).
 
     diadoche-restarter works alongside: diadoche's own pause log lines are
     never claude limit messages and the claude error text of a refused call
@@ -977,7 +990,7 @@ func Parse(args []string) (*Config, error) {
 	escalationModel := fs.String("escalation-model", "", "model of planner and worker in the escalated round of --on-fail escalate (else $DIADOCHE_ESCALATION_MODEL, else "+onfail.DefaultEscalationModel+")")
 	adrOn := fs.Bool("adr", false, "after a task is DONE and merged, turn its ## Decisions into docs/adr/ ADRs via the adr-writer agent; a failure is only a warning")
 	adrModel := fs.String("adr-model", "", "override the adr-writer agent's model (else $DIADOCHE_ADR_MODEL, else .claude/agents/adr-writer.md, else built-in default)")
-	maxCostPerRun := fs.Float64("max-cost-per-run", 0, "stop the run after the current agent call once this run's recorded cost exceeds this many USD; the current task stays pending and diadoche exits non-zero (0 = no limit)")
+	maxCostPerRun := fs.Float64("max-cost-per-run", 0, "stop the run after the current agent call (with --parallel > 1: at the end of the in-flight tasks' current iteration) once this run's recorded cost exceeds this many USD; the current task stays pending and diadoche exits non-zero (0 = no limit)")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {

@@ -84,8 +84,9 @@ Flags:
   and run budgets" below.
 - `--max-cost-per-run` — stop the run after the current agent call once
   this run's recorded cost (USD) exceeds this; the task stays pending and
-  diadoche exits non-zero (default 0 = no limit). See "Task and run
-  budgets" below.
+  diadoche exits non-zero (default 0 = no limit). With `--parallel` > 1 it
+  counts every task together, and the tasks in flight stop at the end of
+  their current iteration instead. See "Task and run budgets" below.
 - `--worktree` — run each task in its own git worktree
   `.claude/diadoche/worktrees/<NNN>-<slug>` on branch
   `diadoche/<NNN>-<slug>`, merging it into the current branch once `DONE`
@@ -446,6 +447,13 @@ checked after every agent call, and are off in `--dry-run` (no cost data).
   logged (`run budget exhausted`), and diadoche exits with status 1. A task
   the tester marked `DONE` in that very call is still finished
   (committed/merged) first; the run then stops before the next task.
+- With `--parallel` > 1 the run budget counts every task together and is
+  checked at the end of each iteration rather than after every call: once
+  one task's spend crosses it, no new task starts, every task in flight
+  ends its current iteration (a `DONE` one is merged, the others stay
+  pending with their worktrees), and diadoche exits with status 1 and the
+  same message. `--max-cost-per-task` and `--max-call-cost` stay per task
+  and per call.
 
 ## Usage limits and pauses
 
@@ -470,6 +478,9 @@ SIGINT/SIGTERM interrupts the pause at once, already on the first signal
 and without waiting for `--shutdown-timeout` (diadoche exits with status
 130): the task stays `PAUSED`, and the next run re-queues it like an
 `IN_PROGRESS` one and resumes it with its changes in place.
+
+With `--parallel` > 1 there is one pause for the whole run, with one shared
+backoff: see "Parallel tasks" below.
 
 ## Open questions and WAITING (`--resume-waiting`)
 
@@ -738,6 +749,24 @@ with its own iterations. `--parallel` greater than 1 requires
   applies once to all in-flight calls together.
 - `--dry-run` shows which tasks could run concurrently, in waves, and
   starts nothing; the merge order depends on which task finishes first.
+- A usage-limit refusal in any task pauses the whole run once: no task
+  starts a call while it is paused, and a task whose call is refused during
+  the pause waits with it (a `pause_wait` event, not a second `pause`), then
+  retries its call. After the pause the run is degraded to an effective
+  parallelism of 1 — one call at a time and no new task; the tasks in
+  flight go on — until a call that started after the pause succeeds; then
+  it is back to N. Both transitions are logged and written to `run.log` as
+  `event=parallelism degree=<n>` (with `reason=usage_limit` or
+  `reason=recovered`).
+- `--max-cost-per-run` counts every task together; once it is crossed no
+  new task starts and the tasks in flight stop at the end of their current
+  iteration (see "Task and run budgets").
+- Shared state is either behind a mutex or has a single owner:
+  `usage.jsonl` and the run's cost totals, `run.log` and the
+  `STATUS.md`/`QUEUE.md` read-modify-writes use a mutex; every task writes
+  only its own artifacts directory; the spec lock, merges and the ADR step
+  belong to the merge owner, so ADR numbers are assigned one task at a
+  time.
 
 ## FAILED tasks (`--worktree=false`)
 
@@ -835,7 +864,9 @@ Events: `run_start`, `task_start`, `status` (every STATUS.md change),
 `agent_start`, `agent_end` (duration, exit code, cost, tokens), `verdict`
 (tester's DONE/NOT_DONE), `plan_rejected`, `empty_diff`, `redgreen_failed`,
 `decisions` (count of decisions worker reported), `decisions_missing`
-(worker gave no `## Decisions` section; not a failure), `pause`, `resume`, `commit`, `merge`, `merge_blocked`, `park`, `task_end`
+(worker gave no `## Decisions` section; not a failure), `pause`, `pause_wait` (a `--parallel` task refused while the run is
+already paused), `resume`, `parallelism` (the effective `--parallel`
+degree changed, `degree=<n>`), `commit`, `merge`, `merge_blocked`, `park`, `task_end`
 (final status), `run_end`, and `warning` when an artifact couldn't be
 written. A failed write never stops the run. A repeated call of the same
 agent in one iteration (a retry after a limit pause) gets a `-2`, `-3`...

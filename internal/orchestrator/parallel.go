@@ -15,8 +15,38 @@ package orchestrator
 //
 // Every task works through its own shallow copy of the Orchestrator, its
 // "view" (see taskView): the view's log lines carry the task's id, and its
-// cur record and pause backoff are its own. What all views share sits
-// behind the runShared pointer.
+// cur record is its own. What all views share sits behind the runShared
+// pointer.
+//
+// Usage limits: one limit gate per run (see limitgate.go). A limit refusal
+// in any task pauses the whole run once; tasks refused meanwhile wait with
+// it, and no call starts while paused. Afterwards the effective
+// parallelism is 1 — no new task starts and one call runs at a time —
+// until a call that started after the pause succeeds; both transitions
+// are logged and written to run.log as event=parallelism.
+//
+// Budgets: --max-cost-per-run counts every task together. Once it is
+// crossed no new task starts, and the tasks in flight stop at the end of
+// their current iteration (see runIterations), DONE ones being merged.
+// --max-cost-per-task and --max-call-cost stay per task and per call.
+//
+// What the tasks share is either behind a mutex or has a single owner:
+//   - usage.Writer and usage.Summary (usage.jsonl and the run's totals):
+//     mutex; every record is one Write of a whole line.
+//   - priorCosts (previous runs' totals): set once by Run before any task
+//     goroutine, read-only afterwards.
+//   - run.log (runlog.Run): mutex; every event is one Write of a line.
+//   - run artifacts: every task writes its own directory only, from its
+//     own goroutine or the owner after it; CallName's counters are under
+//     runlog.Run's mutex, the decisions map under runShared.mu.
+//   - cost bookkeeping: an iterationTally belongs to one task goroutine;
+//     budgets read the mutex-guarded usage.Summary; the limit gate (pause
+//     state, shared backoff, counters) has its own mutex.
+//   - STATUS.md / QUEUE.md: diadoche's read-modify-writes go through
+//     runShared.specMu (mutex); the spec-directory lock (speclock) is taken
+//     only by the merge owner, never once per task goroutine.
+//   - the ADR step and docs/adr/: single owner, it runs in finishTask on
+//     the merge owner, so ADR numbers are assigned one task at a time.
 
 import (
 	"context"
@@ -66,6 +96,10 @@ type runShared struct {
 	// calls, like the first signal: a fatal error in one task.
 	stop     chan struct{}
 	stopOnce sync.Once
+
+	// gate is the run's usage-limit gate, every agent call goes through
+	// it (see limitgate.go); it has its own mutex.
+	gate *limitGate
 }
 
 // ownerJob is work a task goroutine needs done by the merge owner (the
@@ -79,9 +113,16 @@ type ownerJob struct {
 // before any task goroutine exists).
 func (o *Orchestrator) shared() *runShared {
 	if o.sh == nil {
-		o.sh = &runShared{stop: make(chan struct{})}
+		o.sh = &runShared{stop: make(chan struct{}), gate: newLimitGate()}
 	}
 	return o.sh
+}
+
+// effectiveParallel is how many tasks may be in flight now: parallel(),
+// but 1 while the limit gate is paused or degraded (see limitgate.go).
+// runParallel's dispatcher is the only place that applies it.
+func (o *Orchestrator) effectiveParallel() int {
+	return o.shared().gate.effective(o.parallel())
 }
 
 // parallel is how many tasks run at once: --parallel, but 1 without
@@ -94,14 +135,13 @@ func (o *Orchestrator) parallel() int {
 }
 
 // taskView is o for one task of a parallel run: its log lines start with
-// "[<NNN>-<slug>] ", and it has its own run-state record and pause
-// backoff; everything else is shared with o.
+// "[<NNN>-<slug>] ", and it has its own run-state record; everything else,
+// the limit gate included, is shared with o.
 func (o *Orchestrator) taskView(specFile string) *Orchestrator {
 	v := *o
 	id := taskID(specFile, specs.TaskNumber(specFile))
 	v.Log = log.New(o.Log.Writer(), o.Log.Prefix()+"["+id+"] ", o.Log.Flags()|log.Lmsgprefix)
 	v.cur = nil
-	v.pauseBackoff = 0
 	return &v
 }
 
@@ -260,6 +300,20 @@ func (o *Orchestrator) runParallel(ctx context.Context, planner, worker, tester 
 			return
 		}
 		v.Log.Printf("task %s: error: %v", spec, err)
+		// The shared run budget ran out: no new task starts, but the
+		// tasks in flight end their current iteration (see
+		// runIterations) rather than being stopped at their next call.
+		if errors.Is(err, ErrRunBudgetExceeded) {
+			if budgetErr == nil {
+				var fatal *fatalError
+				budgetErr = err
+				if errors.As(err, &fatal) {
+					budgetErr = fatal.err
+				}
+				o.Log.Printf("run budget exceeded: no new task starts; waiting for %d in-flight task(s) to end their iteration", len(inflight))
+			}
+			return
+		}
 		var fatal *fatalError
 		if errors.As(err, &fatal) {
 			if fatalErr == nil {
@@ -365,7 +419,7 @@ func (o *Orchestrator) runParallel(ctx context.Context, planner, worker, tester 
 				continue
 			}
 			blocking[next] = true
-			if len(inflight) >= n {
+			if len(inflight) >= o.effectiveParallel() {
 				continue
 			}
 			// --max-cost-per-run crossed by a call so far: start nothing
@@ -405,7 +459,7 @@ func (o *Orchestrator) runParallel(ctx context.Context, planner, worker, tester 
 		}
 		canLaunch := !stopping && fatalErr == nil && budgetErr == nil && loopErr == nil && abortErr == nil
 		startFailed = false
-		if canLaunch && len(inflight) < n {
+		if canLaunch && len(inflight) < o.effectiveParallel() {
 			fill()
 		}
 		if len(inflight) == 0 {
@@ -435,6 +489,9 @@ func (o *Orchestrator) runParallel(ctx context.Context, planner, worker, tester 
 		case job := <-jobs:
 			job.fn()
 			close(job.done)
+		case <-o.shared().gate.wake:
+			// The limit gate opened again after a pause: fill the slots
+			// it freed.
 		}
 	}
 

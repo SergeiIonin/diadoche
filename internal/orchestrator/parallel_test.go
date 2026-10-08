@@ -109,13 +109,15 @@ func TestParallelOneReproducesSerialSequence(t *testing.T) {
 // out-<num>.txt in its work dir, tester writes the review the prompt asks
 // for and marks the task DONE through the guarded o.setStatus. before, when
 // set, runs first (n counts the calls of that spec and agent) and may
-// replace the call's outcome. It records every call and the most task
-// spans (first call to tester exit) open at once.
+// replace the call's outcome. cost, when set, gives each call a parsed
+// cost. It records every call, the most task spans (first call to tester
+// exit) open at once, and how many calls were running at each call start.
 type parRunner struct {
 	layout specs.Layout
 	o      *Orchestrator
 
 	before func(ctx context.Context, c stepCall, dir, prompt string, n int) (*agents.RunResult, error)
+	cost   func(c stepCall, n int) float64
 
 	mu        sync.Mutex
 	calls     []stepCall
@@ -123,6 +125,9 @@ type parRunner struct {
 	open      map[string]bool
 	maxOpen   int
 	plannerIn map[string][]string // planner prompts per spec
+	inCall    int
+	maxInCall int
+	callConc  []int // inCall right after each call started, in call order
 }
 
 var parReviewPathRe = regexp.MustCompile("[^\\s`]+_REVIEW_\\d+\\.md")
@@ -136,6 +141,9 @@ func (r *parRunner) Run(ctx context.Context, dir string, a *agents.Agent, prompt
 	r.calls = append(r.calls, c)
 	r.counts[c]++
 	n := r.counts[c]
+	r.inCall++
+	r.maxInCall = max(r.maxInCall, r.inCall)
+	r.callConc = append(r.callConc, r.inCall)
 	if a.Name == "planner" {
 		r.plannerIn[c.spec] = append(r.plannerIn[c.spec], prompt)
 	}
@@ -151,11 +159,17 @@ func (r *parRunner) Run(ctx context.Context, dir string, a *agents.Agent, prompt
 	}
 	r.mu.Unlock()
 	res, err := r.run(ctx, c, dir, prompt, n)
-	if a.Name == "tester" || err != nil {
-		r.mu.Lock()
-		r.open[c.spec] = false
-		r.mu.Unlock()
+	if r.cost != nil {
+		if usd := r.cost(c, n); usd != 0 {
+			res.Parsed, res.TotalCostUSD = true, usd
+		}
 	}
+	r.mu.Lock()
+	r.inCall--
+	if a.Name == "tester" || err != nil {
+		r.open[c.spec] = false
+	}
+	r.mu.Unlock()
 	return res, err
 }
 

@@ -10,7 +10,9 @@ package orchestrator
 // "Superseded by" status line, assigns the real numbers, rebuilds the index
 // docs/adr/README.md and makes sure CLAUDE.md points at it. Like a hook,
 // the step never fails the task: a failure rolls docs/adr/ back and is a
-// warning fragment in STATUS.md.
+// warning fragment in STATUS.md. The step runs on the merge owner
+// (finishTask), so with --parallel two tasks' ADR steps never overlap and
+// adr.AssignNumbers always sees the previous task's numbered ADRs.
 
 import (
 	"context"

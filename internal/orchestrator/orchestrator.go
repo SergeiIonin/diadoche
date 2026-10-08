@@ -124,12 +124,10 @@ type Orchestrator struct {
 	Now   func() time.Time
 	Sleep func(ctx context.Context, d time.Duration) error
 
-	// pauseBackoff is the wait of the next time-less limit pause; 0 means
-	// pauseInitialBackoff. Reset by every successful agent call.
-	pauseBackoff time.Duration
-
 	// priorCosts is the spend usage.jsonl held when the run started, for
-	// --max-cost-per-task.
+	// --max-cost-per-task. Set once by Run before any task goroutine
+	// starts and read-only afterwards, so the views share it without a
+	// lock.
 	priorCosts usage.Costs
 
 	// StopRequested, once closed, asks the run to stop at the next point
@@ -605,6 +603,11 @@ func (o *Orchestrator) runTask(ctx context.Context, tr *taskRun, planner, worker
 	// Every outcome of its escalated iteration is then handled below like
 	// the same outcome of a normal one.
 	var onFail onFailResult
+	if !done && cause == nil && o.parallel() > 1 {
+		// The run budget ran out meanwhile: the task stays pending, its
+		// --on-fail chain would only spend more.
+		cause = o.runBudgetExceeded(uw)
+	}
 	if !done && cause == nil && len(o.Cfg.OnFail) > 0 && !o.Cfg.DryRun {
 		onFail = o.applyOnFail(ctx, onFailInput{specFile: specFile, num: num, ws: ws, planner: planner, worker: worker, tester: tester, uw: uw})
 		done, cause = onFail.done, onFail.cause
@@ -805,6 +808,15 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 		})
 		if done || err != nil {
 			return done, err
+		}
+		// With --parallel the run budget is shared by every task in
+		// flight: one crossed by any of them stops this task here, at the
+		// end of its iteration (see checkBudgets).
+		if o.parallel() > 1 {
+			if err := o.runBudgetExceeded(uw); err != nil {
+				o.Log.Printf("%s: run budget exceeded; stopping at the end of iteration %d", specFile, iter)
+				return false, err
+			}
 		}
 	}
 

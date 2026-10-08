@@ -454,3 +454,34 @@ func TestMaxCostPerRunFinishesATaskThatReachedDone(t *testing.T) {
 		t.Errorf("planner calls = %d, want 1 (task 002 never started)", runner.calls["planner"])
 	}
 }
+
+// TestSerialPauseEmitsNoParallelismEvent: at --parallel 1 the run-wide
+// limit gate pauses exactly like the serial loop always did — one pause,
+// the same log lines — and writes no parallelism event.
+func TestSerialPauseEmitsNoParallelismEvent(t *testing.T) {
+	requireGit(t)
+	setTestGitEnv(t)
+	o, runner, sleeper, buf := newPauseFixture(t, config.Config{Iter: 1}, "001_example.md")
+	runner.refuseAgent = "worker"
+	runner.refusals = []string{sessionLimitText}
+
+	if err := o.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v\n%s", err, buf.String())
+	}
+	if len(sleeper.sleeps) != 1 || o.shared().gate.pauseCount() != 1 {
+		t.Errorf("sleeps = %v, pauses = %d; want one of each", sleeper.sleeps, o.shared().gate.pauseCount())
+	}
+	logText := buf.String()
+	for _, want := range []string{"[worker] paused: claude usage window exhausted (backoff), retrying the same call in 5m0s", "[worker] resumed after pause"} {
+		if !strings.Contains(logText, want) {
+			t.Errorf("log lacks %q:\n%s", want, logText)
+		}
+	}
+	if strings.Contains(logText, "parallelism") || strings.Contains(logText, "pause_wait") {
+		t.Errorf("serial run logged a parallel-only event:\n%s", logText)
+	}
+	if st := statusRow(t, o.Layout, "001_example.md").Status; st != specs.StatusDone {
+		t.Errorf("status = %s, want DONE", st)
+	}
+	assertNoRestarterTrigger(t, logText)
+}

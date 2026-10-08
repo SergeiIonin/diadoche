@@ -100,17 +100,31 @@ func sleepWallClock(ctx context.Context, until time.Time) error {
 
 // runAgentPausing is runAgent that waits out claude usage and rate limits:
 // a call refused by one (see usagelimit.Detect) marks the task PAUSED,
-// sleeps until the reset time from the reply (else an exponential backoff)
+// waits until the reset time from the reply (else an exponential backoff)
 // and retries the very same call, so the refusal spends no iteration. Any
-// other error is returned as is. The log lines it writes are diadoche's
-// own wording and never quote the claude error, so diadoche-restarter
-// (usagelimit.IsLimitLine) doesn't kill a pausing diadoche.
+// other error is returned as is. The wait is the run's, not the task's:
+// every call goes through the run's limit gate (see limitgate.go), so with
+// --parallel the first refused call's task sleeps once for the whole run,
+// tasks refused meanwhile wait with it, and no call starts while paused.
+// The log lines it writes are diadoche's own wording and never quote the
+// claude error, so diadoche-restarter (usagelimit.IsLimitLine) doesn't
+// kill a pausing diadoche.
 func (o *Orchestrator) runAgentPausing(ctx context.Context, c agentCall, a *agents.Agent, prompt string) (agents.RunResult, error) {
 	prefix := c.logPrefix(o.Cfg.Iter, a.Name)
+	sh := o.shared()
+	gate := sh.gate
 	paused := false
 	for {
+		t, err := gate.acquire(ctx, o.StopRequested, sh.stop)
+		if err != nil {
+			if paused {
+				return agents.RunResult{}, &pauseInterruptedError{err}
+			}
+			return agents.RunResult{}, err
+		}
 		result, err := o.runAgent(ctx, c, a, prompt)
 		if err == nil {
+			recovered := gate.done(t, true)
 			if paused {
 				if err := o.setStatus(c.specFile, specs.StatusInProgress); err != nil {
 					o.Log.Printf("%s could not set status back to %s: %v", prefix, specs.StatusInProgress, err)
@@ -120,9 +134,13 @@ func (o *Orchestrator) runAgentPausing(ctx context.Context, c agentCall, a *agen
 				o.Log.Printf("%s resumed after pause", prefix)
 				o.event(c.specFile, c.iter, a.Name, "resume")
 			}
-			o.pauseBackoff = 0
+			if recovered && o.parallel() > 1 {
+				o.Log.Printf("parallel: a call succeeded after the pause; effective parallelism back to %d", o.parallel())
+				o.event("", 0, "", "parallelism", runlog.F("degree", o.parallel()), runlog.F("reason", "recovered"))
+			}
 			return result, nil
 		}
+		gate.done(t, false)
 		if ctx.Err() != nil {
 			return result, err
 		}
@@ -130,6 +148,12 @@ func (o *Orchestrator) runAgentPausing(ctx context.Context, c agentCall, a *agen
 		hit, ok := usagelimit.Detect(err.Error()+"\n"+result.Output, result.ExitCode, now)
 		if !ok {
 			return result, err
+		}
+
+		leader, degradedNow, released := gate.refused()
+		if degradedNow && o.parallel() > 1 {
+			o.Log.Printf("parallel: a call was refused by a claude limit; effective parallelism 1 until a call succeeds after the pause")
+			o.event("", 0, "", "parallelism", runlog.F("degree", 1), runlog.F("reason", "usage_limit"))
 		}
 
 		var wait time.Duration
@@ -142,12 +166,8 @@ func (o *Orchestrator) runAgentPausing(ctx context.Context, c agentCall, a *agen
 			}
 			reason += ", resumes at " + hit.ResetAt.Format(time.RFC3339)
 			until = "until " + hit.ResetAt.Format(time.RFC3339)
-		} else {
-			wait = o.pauseBackoff
-			if wait <= 0 {
-				wait = pauseInitialBackoff
-			}
-			o.pauseBackoff = min(wait*2, pauseMaxBackoff)
+		} else if leader {
+			wait = gate.nextBackoff()
 		}
 
 		if err := o.setStatusReason(c.specFile, specs.StatusPaused, reason); err != nil {
@@ -155,14 +175,28 @@ func (o *Orchestrator) runAgentPausing(ctx context.Context, c agentCall, a *agen
 		} else {
 			o.event(c.specFile, c.iter, a.Name, "status", runlog.F("status", specs.StatusPaused))
 		}
-		o.Log.Printf("%s paused: claude %s (%s), retrying the same call in %s", prefix, hit.Kind, until, wait)
-		untilField := "-"
-		if hit.HasReset {
-			untilField = hit.ResetAt.Format(time.RFC3339)
-		}
-		o.event(c.specFile, c.iter, a.Name, "pause", runlog.F("kind", hit.Kind), runlog.F("wait", wait), runlog.F("until", untilField))
 		sctx, cancel := o.gracefulCtx(ctx)
-		err = o.sleep(sctx, wait)
+		if leader {
+			o.Log.Printf("%s paused: claude %s (%s), retrying the same call in %s", prefix, hit.Kind, until, wait)
+			untilField := "-"
+			if hit.HasReset {
+				untilField = hit.ResetAt.Format(time.RFC3339)
+			}
+			o.event(c.specFile, c.iter, a.Name, "pause", runlog.F("kind", hit.Kind), runlog.F("wait", wait), runlog.F("until", untilField))
+			err = o.sleep(sctx, wait)
+			gate.endPause()
+		} else {
+			// A follower: the run is paused already, by another task's
+			// refusal; one sleep is enough for all of them.
+			o.Log.Printf("%s paused: the run is already paused, waiting with it", prefix)
+			o.event(c.specFile, c.iter, a.Name, "pause_wait", runlog.F("kind", hit.Kind))
+			select {
+			case <-released:
+				err = nil
+			case <-sctx.Done():
+				err = sctx.Err()
+			}
+		}
 		cancel()
 		if err != nil {
 			return result, &pauseInterruptedError{err}
@@ -173,10 +207,15 @@ func (o *Orchestrator) runAgentPausing(ctx context.Context, c agentCall, a *agen
 
 // checkBudgets enforces --max-cost-per-run (this run's recorded spend) and
 // --max-cost-per-task (the task's recorded spend, previous runs included)
-// after an agent call. A nil uw (--dry-run) has no cost data: no check.
+// after an agent call. With --parallel > 1 the run budget is not checked
+// here: it is shared by every task in flight, which stop at the end of
+// their iteration instead (see runIterations). A nil uw (--dry-run) has no
+// cost data: no check.
 func (o *Orchestrator) checkBudgets(specFile string, uw *usage.Writer) error {
-	if err := o.runBudgetExceeded(uw); err != nil {
-		return err
+	if o.parallel() == 1 {
+		if err := o.runBudgetExceeded(uw); err != nil {
+			return err
+		}
 	}
 	if uw == nil || o.Cfg.MaxCostPerTaskUSD <= 0 {
 		return nil
