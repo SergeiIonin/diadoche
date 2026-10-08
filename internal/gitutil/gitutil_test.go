@@ -652,3 +652,61 @@ func TestDiffUntrackedRendersNewFilePatches(t *testing.T) {
 		t.Error("DiffUntracked of a missing file: want an error")
 	}
 }
+
+func TestApplyCommitBringsBackParkedChangesUncommitted(t *testing.T) {
+	dir := newCommittedRepo(t)
+	ctx := context.Background()
+	head := git(t, dir, "rev-parse", "HEAD")
+	writeTestFile(t, filepath.Join(dir, "a.txt"), "a edited\n")
+	writeTestFile(t, filepath.Join(dir, "new", "b.txt"), "b\n")
+	commit, err := ParkPaths(ctx, dir, head, "parked", "park", []string{"a.txt", "new/b.txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := RestorePaths(ctx, dir, head, []string{"a.txt", "new/b.txt"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ApplyCommit(ctx, dir, "parked"); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "a.txt")); string(b) != "a edited\n" {
+		t.Errorf("a.txt = %q", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "new", "b.txt")); string(b) != "b\n" {
+		t.Errorf("new/b.txt = %q", b)
+	}
+	if got := git(t, dir, "rev-parse", "HEAD"); got != head {
+		t.Errorf("HEAD moved to %s", got)
+	}
+	if staged := git(t, dir, "diff", "--cached", "--name-only"); staged != "" {
+		t.Errorf("changes left staged: %s", staged)
+	}
+	if git(t, dir, "rev-parse", "parked") != commit {
+		t.Error("parked branch changed")
+	}
+}
+
+func TestApplyCommitAbortsOnConflict(t *testing.T) {
+	dir := newCommittedRepo(t)
+	ctx := context.Background()
+	head := git(t, dir, "rev-parse", "HEAD")
+	writeTestFile(t, filepath.Join(dir, "a.txt"), "parked version\n")
+	if _, err := ParkPaths(ctx, dir, head, "parked", "park", []string{"a.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(dir, "a.txt"), "something else\n")
+	if err := CommitAll(ctx, dir, "diverge"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ApplyCommit(ctx, dir, "parked"); err == nil {
+		t.Fatal("ApplyCommit succeeded on a conflict")
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "a.txt")); string(b) != "something else\n" {
+		t.Errorf("a.txt = %q, want the tree as it was", b)
+	}
+	if st := git(t, dir, "status", "--porcelain"); st != "" {
+		t.Errorf("tree not clean after abort:\n%s", st)
+	}
+}

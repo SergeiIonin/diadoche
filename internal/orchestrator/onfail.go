@@ -190,12 +190,14 @@ func escalatePolicy(o *Orchestrator, ctx context.Context, in onFailInput) policy
 	return policyResult{outcome: outcomeNotDone, detail: detail}
 }
 
-// resumable reports whether err leaves the task pending rather than
-// FAILED (see processTask): a signal, a pause interrupted by one, a usage
-// limit or --max-cost-per-run.
+// resumable reports whether err leaves the task pending (or WAITING)
+// rather than FAILED (see processTask): a signal, a pause interrupted by
+// one, a usage limit, --max-cost-per-run, or an agent asking a human
+// (NEEDS_HUMAN).
 func resumable(ctx context.Context, err error) bool {
 	var paused *pauseInterruptedError
-	return errors.As(err, &paused) || errors.Is(err, ErrInterrupted) || ctx.Err() != nil ||
+	var nh *needsHumanError
+	return errors.As(err, &paused) || errors.As(err, &nh) || errors.Is(err, ErrInterrupted) || ctx.Err() != nil ||
 		errors.Is(err, ErrRunBudgetExceeded) || usagelimit.Mentions(err.Error())
 }
 
@@ -231,7 +233,7 @@ func (o *Orchestrator) blockTask(ctx context.Context, specFile, num string, ws *
 	var where blockedChanges
 	if ws != nil {
 		if ws.worktree {
-			stat, err := o.blockWorktree(ctx, specFile, ws)
+			stat, err := o.blockWorktree(ctx, specFile, ws, "diadoche: BLOCKED "+specFile)
 			if err != nil {
 				return err
 			}

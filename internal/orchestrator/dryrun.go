@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 
 	"diadoche/internal/agents"
@@ -25,7 +27,10 @@ import (
 // run artifacts, and git is never touched. No status changes, no plan
 // validation, no failure counting. The --on-task-done hooks are only
 // listed per task, never run, and the --on-fail chain is only named: no
-// policy is applied and no status changes.
+// policy is applied and no status changes. No answer is inspected for
+// NEEDS_HUMAN and nothing writes QUESTIONS.md; with --resume-waiting the
+// WAITING tasks are walked too (their prompts carry their questions and
+// answers), but they stay WAITING.
 func (o *Orchestrator) dryRun(ctx context.Context) error {
 	planner, worker, tester, err := o.loadAgents()
 	if err != nil {
@@ -35,6 +40,18 @@ func (o *Orchestrator) dryRun(ctx context.Context) error {
 	queue, err := specs.PendingQueue(o.Layout)
 	if err != nil {
 		return fmt.Errorf("dry-run: read queue: %w", err)
+	}
+	if o.Cfg.ResumeWaiting {
+		waiting, err := specs.WaitingSpecs(o.Layout)
+		if err != nil {
+			return fmt.Errorf("dry-run: read waiting tasks: %w", err)
+		}
+		if len(waiting) > 0 {
+			o.Log.Printf("dry-run: would resume WAITING task(s): %s", strings.Join(waiting, ", "))
+			queue = mergeByTaskNumber(queue, waiting)
+		} else {
+			o.Log.Print("dry-run: --resume-waiting: no WAITING tasks")
+		}
 	}
 	if len(queue) == 0 {
 		o.Log.Print("dry-run: no pending tasks")
@@ -67,14 +84,15 @@ func (o *Orchestrator) dryRun(ctx context.Context) error {
 		implPlanPath := filepath.Join(o.Layout.SpecDir, implPlanFile)
 		reviewPath := filepath.Join(o.Layout.SpecDir, fmt.Sprintf("%s_REVIEW_1.md", num))
 		plan := dryRunPlan(implPlanFile)
+		questionsBlock := o.questionsBlock(specFile)
 
 		o.Log.Printf("=== [dry-run] task %s (iteration 1/%d) ===", specFile, o.Cfg.Iter)
 		calls := []struct {
 			agent  *agents.Agent
 			prompt string
 		}{
-			{planner, plannerPrompt(specFile, specContent, "", implPlanPath)},
-			{worker, workerPrompt(specFile, specContent, implPlanFile, plan, "")},
+			{planner, plannerPrompt(specFile, specContent, "", implPlanPath, questionsBlock)},
+			{worker, workerPrompt(specFile, specContent, implPlanFile, plan, "", questionsBlock)},
 			{tester, testerPrompt(testerPromptInput{
 				specFile: specFile, specContent: specContent, implPlanFile: implPlanFile, plan: plan,
 				testCommand: dryRunTestCommand, diff: dryRunDiff, guidance: normalDiffGuidance,
@@ -93,4 +111,19 @@ func (o *Orchestrator) dryRun(ctx context.Context) error {
 
 	o.Log.Print("dry-run: no state was changed")
 	return nil
+}
+
+// mergeByTaskNumber adds extra to queue, every spec sorted by ascending
+// task number (a number that isn't an integer sorts last), stably.
+func mergeByTaskNumber(queue, extra []string) []string {
+	out := append(slices.Clone(queue), extra...)
+	key := func(spec string) int {
+		n, err := strconv.Atoi(specs.TaskNumber(spec))
+		if err != nil {
+			return int(^uint(0) >> 1)
+		}
+		return n
+	}
+	slices.SortStableFunc(out, func(a, b string) int { return cmp.Compare(key(a), key(b)) })
+	return out
 }

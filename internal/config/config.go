@@ -81,6 +81,7 @@ const helpSynopsis = `SYNOPSIS
              [--fresh] [--shutdown-timeout <duration>]
              [--on-task-done <command>]... [--hook-timeout <duration>]
              [--on-fail <list>] [--escalation-model <name>]
+             [--resume-waiting]
     diadoche --preprocess --task <path> [--dir <path>] [--claude-bin <path>]
              [--preprocessor-model <name>]
     diadoche --initialize <project-path>
@@ -106,7 +107,10 @@ const helpDescription = `DESCRIPTION
     ON-FAIL POLICIES), and with --on-fail "" marks the task FAILED. Once the
     queue drains, diadoche checks spec/ for new task files once more before
     exiting, so tasks added concurrently (e.g. by --preprocess) are picked
-    up without a manual restart.
+    up without a manual restart. A planner or worker that needs a human's
+    decision asks in QUESTIONS.md and sets the task aside as WAITING; the
+    run goes on with the next task, and --resume-waiting picks it up again
+    once answered (see OPEN QUESTIONS AND WAITING).
 
     Agent prompts and models for planner/worker/tester/preprocessor are
     built into the diadoche binary, so it works in any project without
@@ -358,6 +362,54 @@ const helpUsageLimits = `USAGE LIMITS
 
 `
 
+const helpQuestions = `OPEN QUESTIONS AND WAITING
+    A run is unattended, so planner and worker make their own calls and
+    record them. The one exception is a decision that does not follow from
+    the spec, the ADRs or the code and could reasonably go either way (a
+    product choice, UX, a cost trade-off): the agent appends it to
+    QUESTIONS.md in the repository root - never rewriting it - as one
+    entry:
+
+        ## Question <NNN>-<k>: <one-line summary>
+        Task: <NNN>_<slug>.md
+        Asked-by: planner|worker
+        Question: <the question>
+        Options:
+        - A: <option>
+        - B: <option>
+        Default: <the option it picks by default>
+        Why: <why>
+        Reversible: yes|no
+        Answer:
+
+    Anything answerable from the spec, the code or an ADR, and anything
+    the agent can simply decide and record as a decision, is not a
+    question for this file. A reversible decision: the agent goes on with
+    its default. One that is not: the agent ends its answer with
+    NEEDS_HUMAN on a line of its own (trimmed, outside any code block; an
+    inline or quoted mention does not count).
+
+    NEEDS_HUMAN makes the task "WAITING: <reason>" in STATUS.md, the reason
+    pointing at QUESTIONS.md, and spends no iteration: its run-state.json
+    record is kept as it was before that call (under "waiting"). Its changes
+    are kept - with --worktree committed on its branch, worktree, branch and
+    spec/NNN_BASE kept; in place parked on diadoche/waiting/<NNN>-<slug> -
+    and spec/NNN_WAITING.md says where. The run goes on with the next task;
+    tasks that depend on a WAITING one (Depends-on) are skipped and stay
+    QUEUED. A WAITING task is not pending: neither this run, nor a restart,
+    nor diadoche-restarter picks it up again.
+
+    Write the answer after "Answer:" in QUESTIONS.md, then run diadoche
+    --resume-waiting: every WAITING task is QUEUED again and continues at
+    the iteration and agent that asked (parked changes re-applied), and
+    planner and worker get the task's questions with their answers (an
+    entry without one is labelled unanswered). QUESTIONS.md is committed
+    with diadoche's bookkeeping and never blocks a run as a dirty file.
+    --dry-run changes no status and writes no QUESTIONS.md; with
+    --resume-waiting it also prints the WAITING tasks' prompts.
+
+`
+
 const helpShutdown = `SIGNALS AND RESTART STATE
     After every step diadoche writes .claude/diadoche/run-state.json (temp
     file + rename, so it is never half-written): the run id, the current
@@ -500,7 +552,9 @@ const helpFiles = `
 FILES
     <project>/.claude/diadoche/spec/STATUS.md
         Source of truth for every task's status: QUEUED, IN_PROGRESS,
-        PAUSED, DONE, FAILED or BLOCKED. A BLOCKED or PAUSED row (and a
+        PAUSED, DONE, FAILED, BLOCKED or WAITING. A WAITING row points at
+        QUESTIONS.md ("WAITING: planner needs a human decision ..."). A
+        BLOCKED or PAUSED row (and a
         task FAILED by its budget) carries its reason in the Status cell
         ("BLOCKED: <reason>": a merge conflict, the --on-fail policies that
         were applied, the specs --on-fail split cut the task into, or the
@@ -552,10 +606,20 @@ FILES
         (worktree and branch, or the parked branch), the tasks blocked
         along with it, and how to resume.
 
+    <project>/.claude/diadoche/spec/NNN_WAITING.md
+        Written when an agent answered NEEDS_HUMAN: the reason, which agent
+        asked in which iteration, the task's questions (answered or not),
+        where the changes are (worktree and branch, or a Parked-branch:
+        line) and how to resume. Removed once the task is resumed.
+
+    <project>/QUESTIONS.md
+        Open questions of planner and worker, appended one entry each
+        (see OPEN QUESTIONS AND WAITING); a human answers after "Answer:".
+
     <project>/.claude/diadoche/worktrees/<NNN>-<slug>/
         With --worktree, the git worktree a task runs in (branch
         diadoche/<NNN>-<slug>). Removed once the task is DONE or FAILED;
-        kept while it is IN_PROGRESS or BLOCKED.
+        kept while it is IN_PROGRESS, BLOCKED or WAITING.
 
     <project>/.claude/diadoche/usage.jsonl
         One JSON line per agent call: time, task, agent, iteration, model,
@@ -579,8 +643,9 @@ FILES
     <project>/.claude/diadoche/run-state.json
         Where the run is (see SIGNALS AND RESTART STATE): run_id, task
         (spec, num, iteration, agent, agent_state pending|running|done,
-        base_commit, worktree), updated_at. "task": null when no task is in
-        progress. Kept out of git via .git/info/exclude. Not written in
+        base_commit, worktree), updated_at, and "waiting": the records of
+        WAITING tasks by spec file, as they were before the NEEDS_HUMAN call
+        (omitted when none). "task": null when no task is in progress. Kept out of git via .git/info/exclude. Not written in
         --dry-run.
 
 `
@@ -713,6 +778,10 @@ type Config struct {
 	// from the head of the queue; the file is rewritten from scratch.
 	Fresh bool
 
+	// ResumeWaiting returns the WAITING tasks to the queue at run start
+	// (--resume-waiting): a human has answered in QUESTIONS.md by then.
+	ResumeWaiting bool
+
 	// ShutdownTimeout is how long the first SIGINT/SIGTERM waits for the
 	// agent call in flight to finish before killing it; a second signal
 	// doesn't wait. 0 kills it at once. See DefaultShutdownTimeout.
@@ -778,6 +847,7 @@ func Parse(args []string) (*Config, error) {
 	maxCallCost := fs.Float64("max-call-cost", 0, "fail the task if a single agent call's cost in USD exceeds this — checked after the call returns, so it cannot preempt the spend (0 = no limit)")
 	maxCostPerTask := fs.Float64("max-cost-per-task", 0, "fail the task once the total recorded cost of the task in usage.jsonl, previous runs included, exceeds this many USD; checked after each agent call (0 = no limit)")
 	fresh := fs.Bool("fresh", false, "ignore the saved .claude/diadoche/run-state.json and start from the head of the queue (the file is rewritten from scratch)")
+	resumeWaiting := fs.Bool("resume-waiting", false, "return WAITING tasks to the queue; planner and worker get each task's questions and answers from QUESTIONS.md")
 	shutdownTimeout := fs.Duration("shutdown-timeout", DefaultShutdownTimeout, "on SIGINT/SIGTERM, wait this long for the running agent call to finish before killing it; a second signal exits immediately")
 	var onTaskDone StringList
 	fs.Var(&onTaskDone, "on-task-done", "run this shell command (sh -c) in the repository root after a task is DONE and merged; repeatable, run in the order given; a failure is only a warning")
@@ -902,6 +972,7 @@ func Parse(args []string) (*Config, error) {
 		RedGreen:           *redGreen,
 		TestGlobs:          globs,
 		Fresh:              *fresh,
+		ResumeWaiting:      *resumeWaiting,
 		ShutdownTimeout:    *shutdownTimeout,
 		OnTaskDone:         []string(onTaskDone),
 		HookTimeout:        *hookTimeout,
@@ -974,6 +1045,7 @@ func printHelp(fs *flag.FlagSet, w io.Writer) {
 	fmt.Fprint(w, helpModels)
 	fmt.Fprint(w, helpCallBudget)
 	fmt.Fprint(w, helpUsageLimits)
+	fmt.Fprint(w, helpQuestions)
 	fmt.Fprint(w, helpShutdown)
 	fmt.Fprint(w, helpHooks)
 	fmt.Fprint(w, helpOnFail)

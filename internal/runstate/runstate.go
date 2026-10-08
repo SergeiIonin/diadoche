@@ -9,6 +9,11 @@
 // them: a state that contradicts them is ignored, and without the file the
 // spec/ files (plan, reviews, NNN_BASE) are still enough to resume a task
 // at the right iteration.
+//
+// It also keeps the records of WAITING tasks (an agent answered
+// NEEDS_HUMAN, see package questions) under "waiting", each exactly as it
+// was before the call that asked a human, so --resume-waiting continues
+// such a task at that same iteration and agent.
 package runstate
 
 import (
@@ -63,6 +68,11 @@ type State struct {
 	RunID     string    `json:"run_id"`
 	Task      *Task     `json:"task"`
 	UpdatedAt time.Time `json:"updated_at"`
+
+	// Waiting are the records of WAITING tasks, keyed by spec file, each as
+	// it was right before the call that answered NEEDS_HUMAN. Omitted when
+	// empty; a file written before it existed has none.
+	Waiting map[string]Task `json:"waiting,omitempty"`
 }
 
 // Load reads the state file at path. A missing file is (nil, nil); invalid

@@ -16,16 +16,21 @@ func reviewFeedback(priorReview string) string {
 }
 
 // plannerPrompt asks planner to write (or update) the plan at implPlanPath.
-func plannerPrompt(specFile string, specContent []byte, priorReview, implPlanPath string) string {
+// questionsBlock is where QUESTIONS.md is and the task's questions and
+// answers (see questions.PromptBlock); per-task data, like the rest.
+func plannerPrompt(specFile string, specContent []byte, priorReview, implPlanPath, questionsBlock string) string {
 	return fmt.Sprintf("Task spec (%s):\n%s\n", specFile, specContent) +
 		reviewFeedback(priorReview) +
+		questionsBlock +
 		fmt.Sprintf("\nWrite (or update) the implementation plan to %s.", implPlanPath)
 }
 
-// workerPrompt asks worker to implement plan.
-func workerPrompt(specFile string, specContent []byte, implPlanFile, plan, priorReview string) string {
+// workerPrompt asks worker to implement plan; questionsBlock as for
+// plannerPrompt.
+func workerPrompt(specFile string, specContent []byte, implPlanFile, plan, priorReview, questionsBlock string) string {
 	return fmt.Sprintf("Task spec (%s):\n%s\n\nImplementation plan (%s):\n%s\n", specFile, specContent, implPlanFile, plan) +
 		reviewFeedback(priorReview) +
+		questionsBlock +
 		"\nImplement the plan in this repository."
 }
 

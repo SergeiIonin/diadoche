@@ -661,3 +661,31 @@ func TestParseHelpMentionsOnFail(t *testing.T) {
 		}
 	}
 }
+
+func TestParseResumeWaiting(t *testing.T) {
+	cfg, err := Parse(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ResumeWaiting {
+		t.Error("ResumeWaiting = true by default, want false")
+	}
+	cfg, err = Parse([]string{"--resume-waiting"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.ResumeWaiting {
+		t.Error("--resume-waiting not parsed")
+	}
+}
+
+func TestParseHelpMentionsQuestionsAndWaiting(t *testing.T) {
+	out := captureStdout(t, func() {
+		_, _ = Parse([]string{"--help"})
+	})
+	for _, want := range []string{"--resume-waiting", "OPEN QUESTIONS AND WAITING", "QUESTIONS.md", "NEEDS_HUMAN", "WAITING", "NNN_WAITING.md", "diadoche/waiting/"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("help output missing %q", want)
+		}
+	}
+}

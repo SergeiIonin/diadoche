@@ -194,3 +194,39 @@ func TestBuiltinWorkerPromptDocumentsDecisions(t *testing.T) {
 		}
 	}
 }
+
+// The QUESTIONS.md entry layout and the NEEDS_HUMAN line rule are a
+// contract with package questions, which parses both.
+func TestBuiltinPlannerAndWorkerPromptsDocumentQuestions(t *testing.T) {
+	for _, name := range []string{"planner", "worker"} {
+		b, err := DefaultPromptFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prompt := string(b)
+		for _, want := range []string{
+			"QUESTIONS.md", "append only",
+			// the entry layout
+			"## Question <NNN>-<k>: <one-line summary>", "Task: <NNN>_<slug>.md", "Asked-by: " + name,
+			"Question:", "Options:", "Default:", "Why:", "Reversible: yes|no", "Answer:",
+			// what is not a question
+			"**not** a question", "answerable from the spec, the code or an ADR", "simply decide and record as a decision",
+			// the reversible/irreversible rule and the marker
+			"reversible: continue with your default option", "not reversible", "`NEEDS_HUMAN` on a line of its own",
+			"inline", "--resume-waiting", "unanswered",
+		} {
+			if !strings.Contains(prompt, want) {
+				t.Errorf("built-in %s prompt lacks %q", name, want)
+			}
+		}
+	}
+	planner, _ := DefaultPromptFile("planner")
+	if strings.Contains(string(planner), "Do not modify any files other than the plan file.\n") {
+		t.Error("planner may not write QUESTIONS.md")
+	}
+	worker, _ := DefaultPromptFile("worker")
+	w := string(worker)
+	if i, j := strings.Index(w, "Open questions (QUESTIONS.md)"), strings.Index(w, "## Reporting your decisions"); i < 0 || j < i {
+		t.Error("worker's questions section must come before the ## Decisions rules, which end the answer")
+	}
+}

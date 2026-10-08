@@ -170,3 +170,36 @@ func TestNewRunID(t *testing.T) {
 		t.Errorf("two run ids are equal: %q", a)
 	}
 }
+
+func TestWaitingRoundTripsAndIsOmittedWhenEmpty(t *testing.T) {
+	path := Path(t.TempDir())
+	rec := Task{Spec: "001_x.md", Num: "001", Iteration: 1, Agent: "planner", AgentState: AgentPending, BaseCommit: "abc"}
+	want := State{RunID: "r", UpdatedAt: time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC), Waiting: map[string]Task{"001_x.md": rec}}
+	if err := Save(path, want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Waiting["001_x.md"] != rec || len(got.Waiting) != 1 {
+		t.Errorf("waiting = %+v, want %+v", got.Waiting, want.Waiting)
+	}
+
+	if err := Save(path, State{RunID: "r"}); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(path)
+	if strings.Contains(string(b), "waiting") {
+		t.Errorf("empty waiting not omitted:\n%s", b)
+	}
+
+	// A file written before the key existed still loads.
+	old := `{"run_id": "old", "task": null, "updated_at": "2026-10-08T12:00:00Z"}`
+	if err := os.WriteFile(path, []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if s, err := Load(path); err != nil || s.RunID != "old" || s.Waiting != nil {
+		t.Errorf("old file = %+v, %v", s, err)
+	}
+}

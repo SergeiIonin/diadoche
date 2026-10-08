@@ -20,7 +20,39 @@ The plan's `## Files` section is the exact list of files to create or modify; pl
 
 Every behaviour change needs tests, and new tests must fail without the new code: after you finish, diadoche runs the test files you added or changed on the task's base commit, and if they pass there the iteration is unsuccessful. Do not weaken existing tests (remove or loosen assertions, delete cases, skip tests) unless the plan lists those test files.
 
-`spec/STATUS.md`, `spec/QUEUE.md`, `spec/NNN_REVIEW_*.md` and the task file `spec/NNN_<slug>.md` are off-limits — planner and tester handle those. The only edit you may make to `spec/NNN_IMPL_PLAN.md` is appending bullets to its `## Files` section as described above.
+`spec/STATUS.md`, `spec/QUEUE.md`, `spec/NNN_REVIEW_*.md` and the task file `spec/NNN_<slug>.md` are off-limits — planner and tester handle those. The only edit you may make to `spec/NNN_IMPL_PLAN.md` is appending bullets to its `## Files` section as described above. The only other file outside the plan's list you may write is `QUESTIONS.md` — append only, as described below.
+
+## Open questions (QUESTIONS.md)
+
+The run is unattended: normally you make the call yourself and record it. The one exception is a decision that does not follow from the spec, the ADRs or the code and could reasonably go either way — a product choice, UX, a cost trade-off. Such a question goes to `QUESTIONS.md` in the main repository root; its absolute path is given in the request.
+
+What is **not** a question for this file:
+- anything answerable from the spec, the code or an ADR — look there first;
+- anything you can simply decide and record as a decision (under `## Decisions` in your final answer).
+
+Append the question at the end of the file — append only: never rewrite, reorder or delete existing entries, and never fill in `Answer:`, which is for a human. Create the file if it does not exist. One entry per question, exactly in this layout (diadoche parses it):
+
+```
+## Question <NNN>-<k>: <one-line summary>
+Task: <NNN>_<slug>.md
+Asked-by: worker
+Question: <the question; may continue on following lines>
+Options:
+- A: <option>
+- B: <option>
+Default: <the option you pick by default, e.g. A>
+Why: <why that option is the default>
+Reversible: yes|no
+Answer:
+```
+
+`<NNN>` is the task number and `<k>` numbers this task's questions 1, 2, … in file order; `Task:` is the task's spec file name; `Reversible:` says whether the decision could be changed later without real cost; leave `Answer:` empty.
+
+After writing the question:
+- the decision is reversible: continue with your default option — implement your default option and record it under `## Decisions`;
+- it is not reversible: stop, and put the marker `NEEDS_HUMAN` on a line of its own in your final answer — alone on the line, no backticks, no bold, no punctuation, not inside a code block. Put it before the `## Decisions` section, which must still end your answer. Mentioning the marker any other way (inline, quoted, in a code block) does not trigger it. The iteration is not spent: the task waits as WAITING until a human answers in `QUESTIONS.md` and reruns diadoche with `--resume-waiting`.
+
+When the request lists this task's questions from `QUESTIONS.md`, implement against the answers and do not ask an answered question again; an entry labelled unanswered has no answer yet — keep to its default unless that is the irreversible choice you stopped for.
 
 ## Reporting your decisions
 

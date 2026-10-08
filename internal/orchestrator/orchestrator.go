@@ -45,6 +45,12 @@
 // task is genuinely finished. A failing hook is a warning, never a task or
 // run failure.
 //
+// A planner or worker that can't decide an open question alone writes it
+// to QUESTIONS.md and, when the decision isn't reversible, ends its answer
+// with a NEEDS_HUMAN line: the task becomes WAITING without spending an
+// iteration and the run moves on; only --resume-waiting re-queues it (see
+// waiting.go).
+//
 // --dry-run never changes state: it walks the queue read-only and prints
 // the prompts each agent would get, and the hooks it would run (see
 // dryrun.go).
@@ -67,6 +73,7 @@ import (
 	"diadoche/internal/gitutil"
 	"diadoche/internal/implplan"
 	"diadoche/internal/onfail"
+	"diadoche/internal/questions"
 	"diadoche/internal/runlog"
 	"diadoche/internal/runstate"
 	"diadoche/internal/skills"
@@ -130,6 +137,11 @@ type Orchestrator struct {
 	// until processTask takes it; cur is the current task's record.
 	resume *runstate.Task
 	cur    *runstate.Task
+
+	// waiting are the run-state.json records of WAITING tasks, keyed by
+	// spec file, each as it was before the call that answered NEEDS_HUMAN
+	// (see waiting.go); a re-queued WAITING task resumes from its record.
+	waiting map[string]runstate.Task
 
 	// run is this run's directory under .claude/diadoche/runs, holding
 	// run.log and the tasks' artifacts; nil in --dry-run or when it
@@ -261,6 +273,12 @@ func (o *Orchestrator) Run(ctx context.Context) (err error) {
 		uw = w
 	}
 
+	if o.Cfg.ResumeWaiting {
+		if err := o.resumeWaitingTasks(); err != nil {
+			return err
+		}
+	}
+
 	stateInitialized := false
 	for {
 		if err := o.syncQueueLocked(); err != nil {
@@ -299,8 +317,15 @@ func (o *Orchestrator) Run(ctx context.Context) (err error) {
 			// A task that stopped being pending after QUEUE.md was built
 			// (e.g. BLOCKED because a task it depends on was) is skipped.
 			if status, err := specs.GetStatus(o.Layout, next); err == nil &&
-				(status == specs.StatusDone || status == specs.StatusFailed || status == specs.StatusBlocked) {
+				(status == specs.StatusDone || status == specs.StatusFailed || status == specs.StatusBlocked || status == specs.StatusWaiting) {
 				o.Log.Printf("skipping %s: it is %s", next, status)
+				continue
+			}
+			// A task depending on a WAITING one waits too: it stays QUEUED
+			// and runs once the WAITING task is resumed.
+			if dep, err := specs.WaitingDependency(o.Layout, next); err == nil && dep != "" {
+				o.Log.Printf("skipping %s: it depends on %s, which is %s", next, dep, specs.StatusWaiting)
+				o.event(next, 0, "", "skipped", runlog.F("reason", "waiting_dependency"), runlog.F("waiting_on", dep))
 				continue
 			}
 			// --max-cost-per-run crossed by the previous task's last call:
@@ -433,6 +458,7 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 		if resume != nil {
 			o.checkResumedWorkspace(specFile, ws, resume)
 		}
+		o.restoreWaiting(ctx, specFile, num, ws)
 	}
 	if ws != nil {
 		o.event(specFile, 0, "", "task_start", runlog.F("base", ws.base))
@@ -481,6 +507,17 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 			return &fatalError{cmp.Or(cause, ErrInterrupted)}
 		}
 		return &fatalError{fmt.Errorf("%w (%v)", ErrInterrupted, cause)}
+	}
+	var nh *needsHumanError
+	if errors.As(cause, &nh) {
+		// Not a failure and no iteration spent: the task waits for a
+		// human's answer in QUESTIONS.md, and the run moves on.
+		err := o.waitTask(ctx, specFile, num, ws, nh)
+		taskEnd(specs.StatusWaiting, "needs_human")
+		if err != nil {
+			return &fatalError{fmt.Errorf("task %s: preserve WAITING changes: %w", specFile, err)}
+		}
+		return nil
 	}
 	if errors.Is(cause, ErrRunBudgetExceeded) {
 		o.saveState()
@@ -670,6 +707,7 @@ func (o *Orchestrator) runIteration(ctx context.Context, in iterationInput) (don
 			priorReview = string(b)
 		}
 	}
+	questionsBlock := o.questionsBlock(specFile)
 
 	// At the exact resume point, an existing plan from before the crash
 	// is reused as-is rather than regenerated — the task's own request.
@@ -716,7 +754,7 @@ func (o *Orchestrator) runIteration(ctx context.Context, in iterationInput) (don
 	o.setAgentState(iter, first, runstate.AgentPending)
 
 	if !reusingPlan {
-		result, err := o.runStep(ctx, call, planner, plannerPrompt(specFile, specContent, priorReview, implPlanPath))
+		result, err := o.runStep(ctx, call, planner, plannerPrompt(specFile, specContent, priorReview, implPlanPath, questionsBlock))
 		o.copyArtifact(specFile, num, fmt.Sprintf("iter-%d-IMPL_PLAN.md", iter), implPlanPath)
 		if err := o.checkBudgets(specFile, uw); err != nil {
 			return false, err
@@ -770,7 +808,7 @@ func (o *Orchestrator) runIteration(ctx context.Context, in iterationInput) (don
 	var workerOutput string
 	workerRan := false
 	if !skipWorker {
-		workerResult, err := o.runStep(ctx, call, worker, workerPrompt(specFile, specContent, implPlanFile, plan, priorReview))
+		workerResult, err := o.runStep(ctx, call, worker, workerPrompt(specFile, specContent, implPlanFile, plan, priorReview, questionsBlock))
 		if err := o.checkBudgets(specFile, uw); err != nil {
 			return false, err
 		}
@@ -877,8 +915,15 @@ func (o *Orchestrator) runIteration(ctx context.Context, in iterationInput) (don
 // running, so a resumed run repeats it. A call killed because Run's ctx
 // was cancelled (--shutdown-timeout, a second signal) is ErrInterrupted;
 // its error deliberately leaves out claude's output, so nothing in it
-// looks like a limit line to diadoche-restarter.
+// looks like a limit line to diadoche-restarter. A planner or worker answer
+// with a NEEDS_HUMAN line is a *needsHumanError, and the record is put back
+// exactly as it was before the call: the call spent no iteration.
 func (o *Orchestrator) runStep(ctx context.Context, c agentCall, a *agents.Agent, prompt string) (agents.RunResult, error) {
+	var before *runstate.Task
+	if o.cur != nil {
+		b := *o.cur
+		before = &b
+	}
 	o.setAgentState(c.iter, a.Name, runstate.AgentRunning)
 	result, err := o.runAgentPausing(ctx, c, a, prompt)
 	if err != nil {
@@ -887,6 +932,14 @@ func (o *Orchestrator) runStep(ctx context.Context, c agentCall, a *agents.Agent
 			return result, fmt.Errorf("%s call stopped: %w", a.Name, ErrInterrupted)
 		}
 		return result, err
+	}
+	if !o.Cfg.DryRun && asksHuman(a.Name, result.Output) {
+		if before != nil && o.cur != nil {
+			*o.cur = *before
+			o.saveState()
+		}
+		o.Log.Printf("%s answered %s", c.logPrefix(o.Cfg.Iter, a.Name), questions.Marker)
+		return result, &needsHumanError{agent: a.Name, iter: c.iter}
 	}
 	o.setAgentState(c.iter, a.Name, runstate.AgentDone)
 	return result, nil

@@ -247,16 +247,16 @@ func TestDryRunSkipsDoneAndFailedTasks(t *testing.T) {
 func TestPromptsIncludeReviewFeedbackOnlyWhenGiven(t *testing.T) {
 	const feedback = "Feedback from the previous review"
 	spec := []byte("# Spec\n")
-	if p := plannerPrompt("001_a.md", spec, "", "/x/001_IMPL_PLAN.md"); strings.Contains(p, feedback) {
+	if p := plannerPrompt("001_a.md", spec, "", "/x/001_IMPL_PLAN.md", ""); strings.Contains(p, feedback) {
 		t.Errorf("planner prompt without a review has feedback:\n%s", p)
 	}
-	if p := plannerPrompt("001_a.md", spec, "fix X", "/x/001_IMPL_PLAN.md"); !strings.Contains(p, feedback+", address every point:\nfix X\n") {
+	if p := plannerPrompt("001_a.md", spec, "fix X", "/x/001_IMPL_PLAN.md", ""); !strings.Contains(p, feedback+", address every point:\nfix X\n") {
 		t.Errorf("planner prompt lacks the review:\n%s", p)
 	}
-	if p := workerPrompt("001_a.md", spec, "001_IMPL_PLAN.md", "plan", ""); strings.Contains(p, feedback) {
+	if p := workerPrompt("001_a.md", spec, "001_IMPL_PLAN.md", "plan", "", ""); strings.Contains(p, feedback) {
 		t.Errorf("worker prompt without a review has feedback:\n%s", p)
 	}
-	if p := workerPrompt("001_a.md", spec, "001_IMPL_PLAN.md", "plan", "fix X"); !strings.Contains(p, feedback+", address every point:\nfix X\n") {
+	if p := workerPrompt("001_a.md", spec, "001_IMPL_PLAN.md", "plan", "fix X", ""); !strings.Contains(p, feedback+", address every point:\nfix X\n") {
 		t.Errorf("worker prompt lacks the review:\n%s", p)
 	}
 }
@@ -350,5 +350,54 @@ func TestDryRunWithSplitInChainCallsNoPreprocessor(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "--on-fail escalate,split,block") || !strings.Contains(buf.String(), "applies none") {
 		t.Errorf("log does not name the on-fail chain:\n%s", buf.String())
+	}
+}
+
+func TestDryRunIgnoresNeedsHumanAnswer(t *testing.T) {
+	dir, layout := dryRunRepo(t)
+	statusBefore := readFile(t, layout.StatusPath)
+	asker := funcRunner(func(context.Context, string, *agents.Agent, string) (agents.RunResult, error) {
+		return agents.RunResult{Output: "NEEDS_HUMAN\n"}, nil
+	})
+	if err := newDryRunOrchestrator(dir, layout, asker, log.New(&bytes.Buffer{}, "", 0)).Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := readFile(t, layout.StatusPath); got != statusBefore {
+		t.Errorf("STATUS.md changed:\n%s\nwant:\n%s", got, statusBefore)
+	}
+	if fileExists(layout.QuestionsPath) {
+		t.Error("QUESTIONS.md written by a dry run")
+	}
+}
+
+func TestDryRunResumeWaitingShowsAnswersAndChangesNothing(t *testing.T) {
+	dir, layout := dryRunRepo(t)
+	if err := specs.SetStatusReason(layout, "001_a.md", specs.StatusWaiting, "planner needs a human decision: answer in QUESTIONS.md"); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, layout.QuestionsPath, "## Question 001-1: Storage\nTask: 001_a.md\nQuestion: Memory or disk?\nOptions:\n- A: memory\n- B: disk\nDefault: A\nWhy: simpler\nReversible: no\nAnswer: disk, please\n")
+	statusBefore, questionsBefore := readFile(t, layout.StatusPath), readFile(t, layout.QuestionsPath)
+
+	rec := &promptRecorder{}
+	var buf bytes.Buffer
+	o := newDryRunOrchestrator(dir, layout, rec, log.New(&buf, "", 0))
+	o.Cfg.ResumeWaiting = true
+	if err := o.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(rec.prompts) != 6 || !strings.Contains(rec.prompts[0], "Task spec (001_a.md)") {
+		t.Fatalf("want 001_a.md (WAITING) then 002_b.md walked, got %d prompts:\n%v", len(rec.prompts), rec.agents)
+	}
+	if !strings.Contains(rec.prompts[0], "Answer: disk, please") || !strings.Contains(rec.prompts[0], "Memory or disk?") {
+		t.Errorf("001's planner prompt lacks the question and answer:\n%s", rec.prompts[0])
+	}
+	if !strings.Contains(buf.String(), "would resume WAITING task(s): 001_a.md") {
+		t.Errorf("log lacks the WAITING tasks:\n%s", buf.String())
+	}
+	if got := readFile(t, layout.StatusPath); got != statusBefore {
+		t.Errorf("STATUS.md changed:\n%s", got)
+	}
+	if got := readFile(t, layout.QuestionsPath); got != questionsBefore {
+		t.Errorf("QUESTIONS.md changed:\n%s", got)
 	}
 }

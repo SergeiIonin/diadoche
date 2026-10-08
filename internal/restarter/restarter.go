@@ -2,8 +2,8 @@
 // windows: it runs diadoche as a child process, watches its output for the
 // claude CLI's "you've hit your limit" error, and when that shows up kills
 // diadoche, drops every row from STATUS.md that isn't DONE, BLOCKED (for
-// any reason: merge conflict, --on-fail block, blocked dependency) or a
-// parked FAILED (so the next run re-queues those tasks instead of seeing
+// any reason: merge conflict, --on-fail block, blocked dependency),
+// WAITING (for a human's answer in QUESTIONS.md) or a parked FAILED (so the next run re-queues those tasks instead of seeing
 // them as FAILED), sleeps until the window reopens and starts diadoche
 // again. A PAUSED row (a task diadoche itself is waiting out a limit on)
 // is unfinished like IN_PROGRESS, so it is dropped and re-queued too.
@@ -247,7 +247,9 @@ func sleepUntil(ctx context.Context, wake time.Time, now func() time.Time, poll 
 // BLOCKED task (with its reason), whatever blocked it — a failed merge,
 // diadoche's --on-fail block policy, or a task it depends on being BLOCKED:
 // it waits for a human, and re-queuing it would rerun the task while its
-// worktree and branch (or parked branch) are still there.
+// worktree and branch (or parked branch) are still there. A WAITING task
+// is finished for the restarter too: it waits for a human's answer in
+// QUESTIONS.md, and only diadoche --resume-waiting re-queues it.
 func ResetStatus(l specs.Layout) ([]string, error) {
 	lock, err := speclock.Acquire(l.SpecDir, lockTimeout)
 	if err != nil {
@@ -270,7 +272,7 @@ func ResetStatus(l specs.Layout) ([]string, error) {
 	var kept []specs.Row
 	var removed []string
 	for _, row := range rows {
-		if row.Status == specs.StatusDone || row.Status == specs.StatusBlocked ||
+		if row.Status == specs.StatusDone || row.Status == specs.StatusBlocked || row.Status == specs.StatusWaiting ||
 			row.Status == specs.StatusFailed && parked(l, row.Spec) {
 			kept = append(kept, row)
 		} else {

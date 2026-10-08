@@ -45,7 +45,9 @@ claude --dangerously-skip-permissions --model <model> \
 - **Role instructions moved into the user turn**, ahead of the task data.
   The text of `.claude/agents/<name>.md` (or the built-in default) is
   unchanged: it is just delivered in the first user message instead of the
-  system prompt.
+  system prompt. The same holds for the task's open questions from
+  `QUESTIONS.md` (and their answers) that planner and worker get: they are
+  per-task data in the user turn, so the shared prefix is unchanged.
 - **The skills note moved into the prefix.** "Relevant skills available
   under `.claude/skills`: …" is the same for every call of a run, so it
   belongs in the cached half; it is no longer appended to each prompt.

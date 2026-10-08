@@ -49,7 +49,8 @@ type workspace struct {
 	// exclude are diadoche's own directories (relative to the project
 	// root, normally ".claude/diadoche" and ".claude/agents"): its
 	// bookkeeping and agent config, which worker never touches and which
-	// are never part of a task's diff or parked changes.
+	// are never part of a task's diff or parked changes. In place,
+	// QUESTIONS.md is one of them too: it belongs to every task.
 	exclude []string
 
 	// preexisting are the files that were already changed when the task
@@ -76,7 +77,7 @@ func (o *Orchestrator) prepareWorkspace(ctx context.Context, specFile, num strin
 	ws := &workspace{
 		dir:         o.Cfg.Dir,
 		baseFile:    filepath.Join(o.Layout.SpecDir, num+"_BASE"),
-		exclude:     relExcludeDirs(o.Cfg.Dir, o.Layout.Root, o.Layout.AgentsDir),
+		exclude:     relExcludeDirs(o.Cfg.Dir, o.Layout.Root, o.Layout.AgentsDir, o.Layout.QuestionsPath),
 		preexisting: map[string]bool{},
 	}
 
@@ -132,7 +133,9 @@ func (o *Orchestrator) prepareWorkspace(ctx context.Context, specFile, num strin
 
 // hasPriorProgress reports whether task num already ran before (its plan
 // or a review is on disk) and hasn't been parked since: a FAILED task, or a
-// BLOCKED one re-queued by hand, starts over from a clean tree.
+// BLOCKED one re-queued by hand, starts over from a clean tree. (A WAITING
+// task parked in place keeps its progress: its parked changes are
+// re-applied on resume, see restoreWaiting.)
 func (o *Orchestrator) hasPriorProgress(num string) bool {
 	if fileExists(filepath.Join(o.Layout.SpecDir, num+"_FAILED.md")) ||
 		fileExists(filepath.Join(o.Layout.SpecDir, num+"_BLOCKED.md")) {
@@ -199,8 +202,7 @@ func (o *Orchestrator) park(ctx context.Context, specFile, num string, ws *works
 
 	// The code is already safe on its branch, so a bookkeeping commit that
 	// can't be made (e.g. .claude/diadoche is gitignored) is only logged.
-	root := relExcludeDirs(o.Cfg.Dir, o.Layout.Root)
-	if err := gitutil.CommitPaths(ctx, o.Cfg.Dir, "diadoche: FAILED "+specFile, root...); err != nil {
+	if err := gitutil.CommitPaths(ctx, o.Cfg.Dir, "diadoche: FAILED "+specFile, o.bookkeepingPaths()...); err != nil {
 		o.Log.Printf("task %s: couldn't commit its bookkeeping files: %v", specFile, err)
 	}
 	return nil
@@ -325,7 +327,8 @@ func taskID(specFile, num string) string {
 
 // failedBranchPrefix, blockedBranchPrefix and splitBranchPrefix prefix the
 // branches a FAILED task's changes, with --worktree=false a BLOCKED task's
-// changes, and a task split by --on-fail split's changes are parked on.
+// changes, and a task split by --on-fail split's changes are parked on
+// (waitingBranchPrefix, in waiting.go, a WAITING task's in place).
 const (
 	failedBranchPrefix  = "diadoche/failed/"
 	blockedBranchPrefix = "diadoche/blocked/"

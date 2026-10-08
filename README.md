@@ -194,7 +194,9 @@ still leave it pending.
   `--worktree=false` they are parked on `diadoche/blocked/<NNN>-<slug>`.
   `spec/NNN_BLOCKED.md` explains what was tried and where the changes are.
   BLOCKED tasks are never re-queued (also not by `diadoche-restarter`); set
-  the row back to `QUEUED` to retry one.
+  the row back to `QUEUED` to retry one. (`WAITING` tasks, which wait for a
+  human's answer, are never re-queued by `diadoche-restarter` either; see
+  [Open questions and WAITING](#open-questions-and-waiting---resume-waiting).)
 
 A task spec may declare dependencies on a line of its own,
 `Depends-on: 003, 007`. When a task is BLOCKED, every pending task that
@@ -367,6 +369,61 @@ SIGINT/SIGTERM interrupts the pause at once, already on the first signal
 and without waiting for `--shutdown-timeout` (diadoche exits with status
 130): the task stays `PAUSED`, and the next run re-queues it like an
 `IN_PROGRESS` one and resumes it with its changes in place.
+
+## Open questions and WAITING (`--resume-waiting`)
+
+A run is unattended, so planner and worker make their own calls and record
+them. The exception is a decision that does not follow from the spec, the
+ADRs or the code and could reasonably go either way — a product choice, UX,
+a cost trade-off. The agent appends such a question to `QUESTIONS.md` in
+the repository root (append only, one entry per question):
+
+```
+## Question 018-1: Where should the cache live
+Task: 018_cache.md
+Asked-by: planner
+Question: Keep the cache in memory or on disk?
+Options:
+- A: memory
+- B: disk
+Default: A
+Why: simpler, and the data is small
+Reversible: no
+Answer:
+```
+
+Anything answerable from the spec, the code or an ADR, and anything the
+agent can simply decide and record as a decision, does not belong there.
+After writing the question the agent continues with its default if the
+decision is reversible; if it is not, it ends its answer with `NEEDS_HUMAN`
+**on a line of its own** (trimmed, outside any code block — an inline or
+quoted mention does not count).
+
+`NEEDS_HUMAN` sets the task aside without spending an iteration, like a
+usage-limit pause:
+
+- the task becomes `WAITING: <agent> needs a human decision in iteration
+  <k>: answer in QUESTIONS.md, then rerun with --resume-waiting (…)` in
+  `STATUS.md`, and `run.log` gets a `waiting` event;
+- its `run-state.json` record is kept, exactly as before that call, under
+  `waiting`;
+- its changes are kept: with `--worktree` committed on its branch, with the
+  worktree, branch and `spec/NNN_BASE` kept; with `--worktree=false` parked
+  on `diadoche/waiting/<NNN>-<slug>`. `spec/NNN_WAITING.md` says where;
+- the run moves on to the next task. Tasks that depend on it (`Depends-on`)
+  are skipped and stay `QUEUED`.
+
+`WAITING` is not pending: neither the same run, nor a restart, nor
+`diadoche-restarter` picks the task up again. Answer after `Answer:` in
+`QUESTIONS.md` (it need not be committed: it never counts as a dirty file),
+then run `diadoche --resume-waiting`. Every `WAITING` task is `QUEUED` again
+(`resume_waiting` event) and continues at the iteration and agent that
+asked (parked changes re-applied); planner and worker get the task's
+questions with their answers in their prompts, an entry without one
+labelled as unanswered. `QUESTIONS.md` is committed with diadoche's
+bookkeeping commits. `--dry-run` changes no status and writes no
+`QUESTIONS.md`; with `--resume-waiting` it also prints the `WAITING` tasks'
+prompts.
 
 ## Restart state and graceful shutdown
 
@@ -681,7 +738,8 @@ sees one, it:
    diadoche doesn't go on to fail the rest of the queue against an
    exhausted account;
 2. removes every task that isn't `DONE` from `spec/STATUS.md`, except
-   `BLOCKED` tasks (they wait for a human to resolve their merge) and
+   `BLOCKED` tasks (they wait for a human to resolve their merge),
+   `WAITING` tasks (they wait for a human's answer in `QUESTIONS.md`) and
    `FAILED` tasks that diadoche already parked (they have a
    `spec/NNN_FAILED.md`). Otherwise the next run could see the interrupted
    task as `FAILED` and never pick it up. The next sync re-adds those tasks as `QUEUED`, and each one

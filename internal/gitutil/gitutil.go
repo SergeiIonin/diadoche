@@ -746,3 +746,34 @@ func DiffUntracked(ctx context.Context, dir string, paths []string) (string, err
 	}
 	return b.String(), nil
 }
+
+// ApplyCommit applies commit's changes (against its parent, or against
+// nothing for a root commit) to dir's working tree without committing or
+// staging them: the way a parked branch's tip is brought back. The patch is
+// applied with `git apply`, which is all or nothing: on a conflict the tree
+// is left exactly as it was and the error is returned.
+func ApplyCommit(ctx context.Context, dir, commit string) error {
+	patch, err := run(ctx, dir, "show", "--binary", "--no-color", "--no-ext-diff", "--format=", commit)
+	if err != nil {
+		return fmt.Errorf("git show %s: %w: %s", commit, err, firstNonEmptyLine(patch))
+	}
+	if strings.TrimSpace(patch) == "" {
+		return nil
+	}
+	f, err := os.CreateTemp("", "diadoche-apply-*.patch")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.WriteString(patch); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if out, err := run(ctx, dir, "apply", "--binary", f.Name()); err != nil {
+		return fmt.Errorf("git apply %s: %w: %s", commit, err, firstNonEmptyLine(out))
+	}
+	return nil
+}

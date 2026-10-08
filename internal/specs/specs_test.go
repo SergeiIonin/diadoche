@@ -792,3 +792,137 @@ func TestApplySplit(t *testing.T) {
 		t.Error("ApplySplit of a spec missing from STATUS.md: no error")
 	}
 }
+
+func TestNewLayoutQuestionsPath(t *testing.T) {
+	dir := t.TempDir()
+	if got, want := NewLayout(dir).QuestionsPath, filepath.Join(dir, "QUESTIONS.md"); got != want {
+		t.Errorf("QuestionsPath = %q, want %q", got, want)
+	}
+}
+
+func TestDiscoverTaskFilesIgnoresWaitingReport(t *testing.T) {
+	dir := t.TempDir()
+	for _, f := range []string{"001_example.md", "001_WAITING.md"} {
+		writeSpec(t, filepath.Join(dir, f), "x")
+	}
+	got, err := DiscoverTaskFiles(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "001_example.md" {
+		t.Errorf("DiscoverTaskFiles = %v, want only 001_example.md", got)
+	}
+}
+
+// waitingLayout has 001 WAITING, 002 depending on 001, 003 depending on
+// 002, and 004 independent; 002–004 QUEUED.
+func waitingLayout(t *testing.T) Layout {
+	t.Helper()
+	l := NewLayout(t.TempDir())
+	if err := l.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	writeSpec(t, filepath.Join(l.SpecDir, "001_ask.md"), "# ask\n")
+	writeSpec(t, filepath.Join(l.SpecDir, "002_dep.md"), "# dep\nDepends-on: 001\n")
+	writeSpec(t, filepath.Join(l.SpecDir, "003_dep2.md"), "# dep2\nDepends-on: 2\n")
+	writeSpec(t, filepath.Join(l.SpecDir, "004_free.md"), "# free\n")
+	if err := WriteStatus(l.StatusPath, []Row{
+		{Num: "001", Spec: "001_ask.md", Status: StatusWaiting, Reason: "planner needs a human decision: answer in QUESTIONS.md"},
+		{Num: "002", Spec: "002_dep.md", Status: StatusQueued},
+		{Num: "003", Spec: "003_dep2.md", Status: StatusQueued},
+		{Num: "004", Spec: "004_free.md", Status: StatusQueued},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return l
+}
+
+func TestWaitingIsNotPending(t *testing.T) {
+	l := waitingLayout(t)
+	pending, err := PendingQueue(l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(pending, ",") != "002_dep.md,003_dep2.md,004_free.md" {
+		t.Errorf("PendingQueue = %v, want no 001_ask.md", pending)
+	}
+	rows, queue, err := Sync(l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(queue, ",") != "002_dep.md,003_dep2.md,004_free.md" {
+		t.Errorf("Sync queue = %v, want no 001_ask.md", queue)
+	}
+	if rows[0].Status != StatusWaiting || !strings.Contains(rows[0].Reason, "QUESTIONS.md") {
+		t.Errorf("WAITING row changed by Sync: %+v", rows[0])
+	}
+	if got, _ := WaitingSpecs(l); len(got) != 1 || got[0] != "001_ask.md" {
+		t.Errorf("WaitingSpecs = %v", got)
+	}
+	// A blocked task's dependents never touch a WAITING row.
+	if _, err := BlockDependents(l, "004_free.md"); err != nil {
+		t.Fatal(err)
+	}
+	if s, _ := GetStatus(l, "001_ask.md"); s != StatusWaiting {
+		t.Errorf("001 = %s, want WAITING", s)
+	}
+}
+
+func TestResumeWaiting(t *testing.T) {
+	l := waitingLayout(t)
+	got, err := ResumeWaiting(l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "001_ask.md" {
+		t.Fatalf("ResumeWaiting = %v", got)
+	}
+	rows, _ := ReadStatus(l.StatusPath)
+	if rows[0].Status != StatusQueued || rows[0].Reason != "" {
+		t.Errorf("row = %+v, want QUEUED without a reason", rows[0])
+	}
+	_, queue, err := Sync(l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(queue) == 0 || queue[0] != "001_ask.md" {
+		t.Errorf("queue = %v, want 001_ask.md first", queue)
+	}
+	before, _ := os.ReadFile(l.StatusPath)
+	if got, err := ResumeWaiting(l); err != nil || got != nil {
+		t.Errorf("second ResumeWaiting = %v, %v; want nothing", got, err)
+	}
+	after, _ := os.ReadFile(l.StatusPath)
+	if string(before) != string(after) {
+		t.Error("ResumeWaiting without WAITING rows rewrote STATUS.md")
+	}
+}
+
+func TestWaitingDependency(t *testing.T) {
+	l := waitingLayout(t)
+	for spec, want := range map[string]string{
+		"002_dep.md":  "001_ask.md",
+		"003_dep2.md": "001_ask.md",
+		"004_free.md": "",
+	} {
+		got, err := WaitingDependency(l, spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Errorf("WaitingDependency(%s) = %q, want %q", spec, got, want)
+		}
+	}
+	// A Depends-on cycle ends.
+	writeSpec(t, filepath.Join(l.SpecDir, "004_free.md"), "# free\nDepends-on: 4, 5\n")
+	writeSpec(t, filepath.Join(l.SpecDir, "005_loop.md"), "# loop\nDepends-on: 4\n")
+	if err := SetStatus(l, "001_ask.md", StatusQueued); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Sync(l); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := WaitingDependency(l, "004_free.md"); err != nil || got != "" {
+		t.Errorf("WaitingDependency over a cycle = %q, %v", got, err)
+	}
+}

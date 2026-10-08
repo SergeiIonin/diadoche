@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -54,7 +55,7 @@ func (o *Orchestrator) gracefulCtx(ctx context.Context) (context.Context, contex
 // sync (queue is QUEUE.md then). It is off in --dry-run (which never gets
 // here, see dryrun.go) and in a test's simulated loop, so neither makes a
 // real run resume from fake progress. With --fresh the saved state
-// is ignored; otherwise a saved, unfinished task that still agrees with
+// is ignored (except the WAITING tasks' records); otherwise a saved, unfinished task that still agrees with
 // STATUS.md and QUEUE.md becomes o.resume and is moved to the head of the
 // queue. A state that doesn't agree is ignored with a warning: the spec/
 // files are then the fallback, as without the file.
@@ -75,17 +76,23 @@ func (o *Orchestrator) initRunState(ctx context.Context, queue []string) {
 		}
 	}
 
+	saved, err := runstate.Load(o.statePath)
+	if err != nil {
+		o.Log.Printf("warning: ignoring %s: %v", runstate.FileName, err)
+		saved = nil
+	}
+	// The WAITING tasks' records are kept even with --fresh: those tasks
+	// are not in the queue, and --resume-waiting continues them.
+	if saved != nil {
+		o.loadWaiting(saved.Waiting)
+	}
+
 	if o.Cfg.Fresh {
 		o.Log.Printf("--fresh: ignoring any saved %s", runstate.FileName)
 		o.saveState()
 		return
 	}
 
-	saved, err := runstate.Load(o.statePath)
-	if err != nil {
-		o.Log.Printf("warning: ignoring %s: %v", runstate.FileName, err)
-		saved = nil
-	}
 	if saved != nil && saved.Task != nil {
 		if reason := o.contradiction(*saved.Task, queue); reason != "" {
 			o.Log.Printf("warning: ignoring %s: %s", runstate.FileName, reason)
@@ -148,6 +155,9 @@ func (o *Orchestrator) saveState() {
 		task = o.resume
 	}
 	s := runstate.State{RunID: o.runID, UpdatedAt: o.now().UTC()}
+	if len(o.waiting) > 0 {
+		s.Waiting = maps.Clone(o.waiting)
+	}
 	if task != nil {
 		t := *task
 		s.Task = &t
@@ -181,20 +191,28 @@ func (o *Orchestrator) setAgentState(iter int, agent, state string) {
 }
 
 // closeTaskState ends the current task's record: it's DONE, FAILED or
-// BLOCKED, so there's nothing left to resume.
+// BLOCKED, so there's nothing left to resume. A WAITING task's record is
+// not closed but moved to o.waiting (see waitTask).
 func (o *Orchestrator) closeTaskState() {
 	o.cur = nil
 	o.saveState()
 }
 
-// takeResume returns and clears the resume record if it is specFile's.
+// takeResume returns and clears the resume record if it is specFile's,
+// else the record specFile kept while it was WAITING (re-queued by
+// --resume-waiting, or by hand), if any.
 func (o *Orchestrator) takeResume(specFile string) *runstate.Task {
 	r := o.resume
-	if r == nil || r.Spec != specFile {
-		return nil
+	if r != nil && r.Spec == specFile {
+		o.resume = nil
+		return r
 	}
-	o.resume = nil
-	return r
+	if w, ok := o.waiting[specFile]; ok {
+		delete(o.waiting, specFile)
+		o.saveState()
+		return &w
+	}
+	return nil
 }
 
 // seedBaseFromResume writes spec/<num>_BASE from the resumed record when

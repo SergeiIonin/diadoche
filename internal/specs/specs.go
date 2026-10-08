@@ -6,8 +6,12 @@
 // usage or rate limit, see Row.Reason for when it resumes), DONE, FAILED or
 // BLOCKED (waits for a human: DONE by tester, but its worktree branch
 // couldn't be merged; not DONE after the --on-fail chain ended in block; or
-// it depends on a BLOCKED task, see ParseDependsOn and BlockDependents).
-// Only QUEUED, IN_PROGRESS and PAUSED tasks are pending.
+// it depends on a BLOCKED task, see ParseDependsOn and BlockDependents) or
+// WAITING (planner or worker asked a human in QUESTIONS.md and answered
+// NEEDS_HUMAN; the reason points at QUESTIONS.md, and only --resume-waiting
+// re-queues it, see ResumeWaiting). Only QUEUED, IN_PROGRESS and PAUSED
+// tasks are pending: neither a run nor a restart picks up a WAITING task on
+// its own.
 package specs
 
 import (
@@ -31,6 +35,7 @@ const (
 	StatusDone       = "DONE"
 	StatusFailed     = "FAILED"
 	StatusBlocked    = "BLOCKED"
+	StatusWaiting    = "WAITING"
 )
 
 // Row is one line of the STATUS.md table.
@@ -75,6 +80,10 @@ type Layout struct {
 	// PrefixPath is the optional per-project override of the shared
 	// prompt prefix every agent of a run is given: <root>/prefix.md.
 	PrefixPath string
+
+	// QuestionsPath is the open questions file in the repository root:
+	// <project>/QUESTIONS.md (see package questions).
+	QuestionsPath string
 }
 
 func NewLayout(projectDir string) Layout {
@@ -88,6 +97,8 @@ func NewLayout(projectDir string) Layout {
 		AgentsDir:  filepath.Join(projectDir, ".claude", "agents"),
 		SkillsDir:  filepath.Join(projectDir, ".claude", "skills"),
 		PrefixPath: filepath.Join(root, "prefix.md"),
+
+		QuestionsPath: filepath.Join(projectDir, "QUESTIONS.md"),
 	}
 }
 
@@ -109,8 +120,8 @@ var taskFileRe = regexp.MustCompile(`^(\d+)[_-](.+)\.md$`)
 
 // generatedRe matches slugs produced by diadoche itself, which are not
 // user-authored task specs: NNN_IMPL_PLAN.md, NNN_REVIEW_<M>.md,
-// NNN_FAILED.md and NNN_BLOCKED.md.
-var generatedRe = regexp.MustCompile(`(?i)^(IMPL_PLAN|REVIEW_\d+|FAILED|BLOCKED)$`)
+// NNN_FAILED.md, NNN_BLOCKED.md and NNN_WAITING.md.
+var generatedRe = regexp.MustCompile(`(?i)^(IMPL_PLAN|REVIEW_\d+|FAILED|BLOCKED|WAITING)$`)
 
 // DiscoverTaskFiles lists user-authored task spec filenames in specDir,
 // excluding STATUS.md, QUEUE.md and diadoche-generated files.
@@ -269,8 +280,8 @@ func WriteFileAtomic(path string, data []byte) error {
 // resumes with the lowest-numbered pending task first, regardless of what
 // order rows happen to sit in STATUS.md or the previous QUEUE.md — except
 // that a spec with a Split-from line sorts at its original's position (see
-// pendingQueue). DONE, FAILED and BLOCKED rows are not pending and never go
-// back to the queue.
+// pendingQueue). DONE, FAILED, BLOCKED and WAITING rows are not pending and
+// never go back to the queue (a WAITING one only by ResumeWaiting).
 func Sync(l Layout) (rows []Row, queue []string, err error) {
 	if err = l.Ensure(); err != nil {
 		return
@@ -327,7 +338,7 @@ func mergedRows(l Layout) ([]Row, error) {
 }
 
 // pendingQueue returns the specs of every QUEUED/IN_PROGRESS/PAUSED row in rows
-// (DONE, FAILED and BLOCKED rows are not pending),
+// (DONE, FAILED, BLOCKED and WAITING rows are not pending),
 // sorted ascending by numeric task number (rows whose Num isn't a plain
 // integer sort after all that are, in their original relative order). A
 // spec whose file has a Split-from line sorts right where the spec it was
@@ -611,7 +622,7 @@ func sameTaskNumber(a, b string) bool {
 // blockedSpec — and, transitively, every pending task depending on one of
 // those. Each newly blocked row's reason names its direct blocker. DONE,
 // FAILED and BLOCKED rows are left alone, as is a row whose spec file can't
-// be read. STATUS.md is written once, and only if something changed; the
+// be read; so are WAITING rows. STATUS.md is written once, and only if something changed; the
 // newly blocked rows are returned in STATUS.md order.
 func BlockDependents(l Layout, blockedSpec string) ([]Row, error) {
 	rows, err := ReadStatus(l.StatusPath)
@@ -666,4 +677,80 @@ func BlockDependents(l Layout, blockedSpec string) ([]Row, error) {
 		}
 	}
 	return out, nil
+}
+
+// ResumeWaiting returns every WAITING task to the queue (--resume-waiting):
+// its row becomes QUEUED with the reason cleared. STATUS.md is written
+// once, and only if something changed; the resumed specs are returned in
+// STATUS.md order. The caller holds the spec lock.
+func ResumeWaiting(l Layout) ([]string, error) {
+	rows, err := ReadStatus(l.StatusPath)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for i := range rows {
+		if rows[i].Status == StatusWaiting {
+			rows[i].Status, rows[i].Reason = StatusQueued, ""
+			out = append(out, rows[i].Spec)
+		}
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	if err := WriteStatus(l.StatusPath, rows); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// WaitingSpecs lists the WAITING tasks in STATUS.md order, writing nothing.
+func WaitingSpecs(l Layout) ([]string, error) {
+	rows, err := ReadStatus(l.StatusPath)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, r := range rows {
+		if r.Status == StatusWaiting {
+			out = append(out, r.Spec)
+		}
+	}
+	return out, nil
+}
+
+// WaitingDependency follows spec's Depends-on lines, transitively, and
+// returns the first WAITING task it reaches ("" when none): such a task
+// can't start before a human answered. An unreadable spec file has no
+// dependencies.
+func WaitingDependency(l Layout, spec string) (string, error) {
+	rows, err := ReadStatus(l.StatusPath)
+	if err != nil {
+		return "", err
+	}
+	seen := map[string]bool{spec: true}
+	frontier := []string{spec}
+	for len(frontier) > 0 {
+		var next []string
+		for _, s := range frontier {
+			b, err := os.ReadFile(filepath.Join(l.SpecDir, s))
+			if err != nil {
+				continue
+			}
+			for _, d := range ParseDependsOn(b) {
+				for _, r := range rows {
+					if seen[r.Spec] || !sameTaskNumber(TaskNumber(r.Spec), d) {
+						continue
+					}
+					if r.Status == StatusWaiting {
+						return r.Spec, nil
+					}
+					seen[r.Spec] = true
+					next = append(next, r.Spec)
+				}
+			}
+		}
+		frontier = next
+	}
+	return "", nil
 }
