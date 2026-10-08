@@ -412,3 +412,36 @@ func TestParseHelpMentionsRedGreen(t *testing.T) {
 		}
 	}
 }
+
+func TestParseBudgetFlags(t *testing.T) {
+	cfg, err := Parse(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxCostPerTaskUSD != 0 || cfg.MaxCostPerRunUSD != 0 {
+		t.Errorf("budgets = %v/%v, want 0/0 (disabled by default)", cfg.MaxCostPerTaskUSD, cfg.MaxCostPerRunUSD)
+	}
+	cfg, err = Parse([]string{"--max-cost-per-task", "2.5", "--max-cost-per-run", "10"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxCostPerTaskUSD != 2.5 || cfg.MaxCostPerRunUSD != 10 {
+		t.Errorf("budgets = %v/%v, want 2.5/10", cfg.MaxCostPerTaskUSD, cfg.MaxCostPerRunUSD)
+	}
+	for _, flag := range []string{"--max-cost-per-task", "--max-cost-per-run"} {
+		if _, err := Parse([]string{flag, "-1"}); err == nil {
+			t.Errorf("expected an error for a negative %s", flag)
+		}
+	}
+}
+
+func TestParseHelpMentionsBudgetsAndPauses(t *testing.T) {
+	out := captureStdout(t, func() {
+		_, _ = Parse([]string{"--help"})
+	})
+	for _, want := range []string{"--max-cost-per-task", "--max-cost-per-run", "USAGE LIMITS", "PAUSED"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("help output missing %q", want)
+		}
+	}
+}

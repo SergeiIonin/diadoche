@@ -295,11 +295,12 @@ func TestUsageLimitParksNothingAndTaskResumes(t *testing.T) {
 	headBefore := gitOut(t, dir, "rev-parse", "HEAD")
 
 	o := newTestOrchestrator(dir, layout, limitRunner{layout: layout}, config.Config{})
+	o.Sleep = interruptPause // the run is stopped (SIGINT) while waiting out the limit
 	if err := o.Run(context.Background()); err == nil {
 		t.Fatal("expected Run to stop on a usage limit")
 	}
-	if status, _ := specs.GetStatus(layout, "001_example.md"); status != specs.StatusInProgress {
-		t.Errorf("status = %s, want IN_PROGRESS", status)
+	if status, _ := specs.GetStatus(layout, "001_example.md"); status != specs.StatusPaused {
+		t.Errorf("status = %s, want PAUSED", status)
 	}
 	if got := readFile(t, filepath.Join(dir, "edit.txt")); got != "edited by worker\n" {
 		t.Errorf("edit.txt = %q, the task's changes must stay in the tree", got)

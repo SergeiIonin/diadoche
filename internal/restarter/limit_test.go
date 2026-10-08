@@ -20,6 +20,12 @@ func TestIsLimitLine(t *testing.T) {
 		{`error: You've hit your monthly spend limit.`, false},
 		{`error: You've hit your team's shared budget. Switch to another model`, false},
 		{`task 001_x.md: error: planner: exit status 1: overloaded`, false},
+		// diadoche's own in-loop pause log lines (orchestrator.runAgentPausing,
+		// processTask) are not limit lines: a pausing diadoche is left alone.
+		{`2026/09/24 10:00:00 001_x.md iter 1/3: [planner] paused: claude usage window exhausted (until 2026-09-24T19:00:00Z), retrying the same call in 4h0m0s`, false},
+		{`2026/09/24 10:00:00 001_x.md iter 1/3: [worker] paused: claude rate limited (backoff), retrying the same call in 5m0s`, false},
+		{`2026/09/24 10:00:00 task 001_x.md: interrupted while paused; it stays PAUSED and is resumed by the next run`, false},
+		{`2026/09/24 10:00:00 task 001_x.md: error: interrupted while paused: context canceled`, false},
 	}
 	for _, c := range cases {
 		if got := IsLimitLine(c.line); got != c.want {

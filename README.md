@@ -74,6 +74,13 @@ Flags:
   this many minutes (default 0 = no limit). See "Per-call budget" below.
 - `--max-call-cost` — fail the task if a single agent call's cost (USD)
   exceeds this (default 0 = no limit). See "Per-call budget" below.
+- `--max-cost-per-task` — fail the task once its total recorded cost (USD,
+  previous runs included) exceeds this (default 0 = no limit). See "Task
+  and run budgets" below.
+- `--max-cost-per-run` — stop the run after the current agent call once
+  this run's recorded cost (USD) exceeds this; the task stays pending and
+  diadoche exits non-zero (default 0 = no limit). See "Task and run
+  budgets" below.
 - `--worktree` — run each task in its own git worktree
   `.claude/diadoche/worktrees/<NNN>-<slug>` on branch
   `diadoche/<NNN>-<slug>`, merging it into the current branch once `DONE`
@@ -211,6 +218,47 @@ upgrading never silently kills a call that used to be allowed to run long.
   tester call that already reached `DONE` is never retroactively failed
   over cost, since there's nothing left to prevent and the work is real.
 
+### Task and run budgets
+
+`--max-cost-per-task` and `--max-cost-per-run` cap the sum of the costs
+recorded in `usage.jsonl`, in USD. Both are `0` (no limit) by default, are
+checked after every agent call, and are off in `--dry-run` (no cost data).
+
+- `--max-cost-per-task` counts every call of the current task, including
+  calls made by earlier runs (read from `usage.jsonl` at startup). Once
+  exceeded, the task becomes `FAILED: budget exceeded: task cost $… over
+  --max-cost-per-task=$…` and is parked like any other failed task; the run
+  moves on to the next one.
+- `--max-cost-per-run` counts this run's calls. Once exceeded, diadoche
+  stops right after the current agent call: the current task stays pending
+  (`IN_PROGRESS`, not `FAILED`) with its changes in place, the reason is
+  logged (`run budget exhausted`), and diadoche exits with status 1. A task
+  the tester marked `DONE` in that very call is still finished
+  (committed/merged) first; the run then stops before the next task.
+
+## Usage limits and pauses
+
+An agent call refused by a claude usage limit (the subscription's usage
+window is exhausted) or by rate limiting (HTTP 429, `rate_limit_error`) is
+not a failure and does not spend an iteration. diadoche recognizes it by
+the call's exit code (or the JSON result's `"is_error":true`) together with
+the error text (`internal/usagelimit.Detect`); spend limits and team
+budgets are excluded, since waiting doesn't lift them. Then:
+
+1. the task becomes `PAUSED` in `STATUS.md`, with the expected resume time
+   when the reply carries one (`PAUSED: claude usage window exhausted,
+   resumes at 2026-10-08T19:00:00Z`), else without it;
+2. diadoche waits until that reset time (`resets 7pm (Europe/Moscow)`, the
+   legacy `usage limit reached|<unix time>`, ...), or, without one, for
+   5 minutes, doubling on every further time-less pause up to 1 hour;
+3. it retries the same call of the same agent in the same iteration. After
+   a successful call the task is `IN_PROGRESS` again and the backoff starts
+   over at 5 minutes.
+
+SIGINT/SIGTERM interrupts the pause at once (diadoche exits with status
+130): the task stays `PAUSED`, and the next run re-queues it like an
+`IN_PROGRESS` one and resumes it with its changes in place.
+
 ## Diff-scoped tester
 
 When a task first starts, diadoche records the current commit (or, before
@@ -301,8 +349,9 @@ tree:
    (with a `-2`, `-3`, ... suffix if that name is taken).
    `spec/NNN_FAILED.md` names the branch.
 
-A usage-limit interruption leaves the worktree in place, and the next run
-resumes the task in it. `.claude/diadoche/worktrees/` is added to
+A usage-limit error pauses the task in place (see "Usage limits and
+pauses"); a run stopped while a task is pending leaves its worktree in
+place, and the next run resumes the task in it. `.claude/diadoche/worktrees/` is added to
 `.git/info/exclude` automatically, so the main tree never sees the
 worktrees as untracked files.
 
@@ -318,7 +367,8 @@ yet has nothing to branch from, so such a run falls back to
 
 This section describes the in-place mode, `--worktree=false`. Every task starts from a clean working tree, and the work of a failed task
 isn't lost. When a task becomes `FAILED` (iterations ran out, an agent call
-errored, `--max-call-cost` was exceeded, ...), diadoche parks its changes:
+errored, `--max-call-cost` or `--max-cost-per-task` was exceeded, ...),
+diadoche parks its changes:
 
 1. Every change since the task's diff base (modified, deleted and new
    non-ignored files), except `.claude/diadoche/` and `.claude/agents/`, is
@@ -340,9 +390,10 @@ errored, `--max-call-cost` was exceeded, ...), diadoche parks its changes:
 If the task changed no code, no branch is created, and `_FAILED.md` says
 so. Parking logs one line with the branch name and the number of files.
 
-A claude usage-limit error is not a failure. Nothing is parked: the task
-stays `IN_PROGRESS` with its changes in the working tree, and diadoche
-exits, so `diadoche-restarter` (or the next manual run) resumes it.
+A claude usage-limit error is not a failure: the task pauses in place (see
+"Usage limits and pauses"). Nothing is parked, and if the run is stopped
+meanwhile, the task stays pending with its changes in the working tree, so
+the next run resumes it.
 
 With `--worktree=false`, before a task starts from scratch, diadoche checks the working tree. If
 there are uncommitted changes outside `.claude/diadoche/` and
@@ -429,6 +480,18 @@ sees one, it:
 Only a usage-limit error triggers a restart. For any other exit, the
 restarter exits with diadoche's own exit status. Spend limits and team
 budgets are not restarted, because waiting doesn't lift them.
+
+**Working together with diadoche's own pause.** diadoche now waits out
+usage and rate limits in-process (see "Usage limits and pauses"), and the
+two schemes don't conflict without any extra flag: diadoche's pause log
+lines are deliberately worded so they are never a claude limit message
+(`001_x.md iter 1/3: [planner] paused: claude usage window exhausted
+(until 2026-10-08T19:00:00Z), retrying the same call in 4h0m0s`), and the
+claude error text of a refused call is never printed. So the restarter
+does not kill a diadoche that is pausing. It stays a fallback for limit
+errors that escape the pause and for crashes. When it does reset
+`STATUS.md`, it treats `PAUSED` like `IN_PROGRESS`: the task is removed
+and re-queued by the next run.
 
 Flags:
 

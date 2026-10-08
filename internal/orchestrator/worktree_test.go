@@ -354,11 +354,12 @@ func TestWorktreeResumesExistingWorktree(t *testing.T) {
 	dir, layout := seedRepo(t)
 	var firstDir string
 	o := newTestOrchestrator(dir, layout, worktreeLimitRunner{limitRunner{layout: layout}, &firstDir}, config.Config{Worktree: true})
+	o.Sleep = interruptPause // the run is stopped (SIGINT) while waiting out the limit
 	if err := o.Run(context.Background()); err == nil {
 		t.Fatal("expected Run to stop on a usage limit")
 	}
-	if status, _ := specs.GetStatus(layout, "001_example.md"); status != specs.StatusInProgress {
-		t.Errorf("status = %s, want IN_PROGRESS", status)
+	if status, _ := specs.GetStatus(layout, "001_example.md"); status != specs.StatusPaused {
+		t.Errorf("status = %s, want PAUSED", status)
 	}
 	if got := readFile(t, filepath.Join(wtPath(layout), "edit.txt")); got != "edited by worker\n" {
 		t.Errorf("worktree edit.txt = %q, the change must stay in the worktree", got)

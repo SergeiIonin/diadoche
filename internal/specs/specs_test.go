@@ -346,3 +346,34 @@ func TestHasNoTestsMarker(t *testing.T) {
 		}
 	}
 }
+
+func TestSyncRequeuesPaused(t *testing.T) {
+	l := NewLayout(t.TempDir())
+	if err := l.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"001_done.md", "002_paused.md", "003_queued.md"} {
+		if err := os.WriteFile(filepath.Join(l.SpecDir, f), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reason := "claude usage window exhausted, resumes at 2026-10-08T19:00:00+03:00"
+	if err := WriteStatus(l.StatusPath, []Row{
+		{Num: "003", Spec: "003_queued.md", Status: StatusQueued},
+		{Num: "001", Spec: "001_done.md", Status: StatusDone},
+		{Num: "002", Spec: "002_paused.md", Status: StatusPaused, Reason: reason},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, queue, err := Sync(l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(queue) != 2 || queue[0] != "002_paused.md" || queue[1] != "003_queued.md" {
+		t.Errorf("queue = %v, want [002_paused.md 003_queued.md]", queue)
+	}
+	persisted, _ := ReadStatus(l.StatusPath)
+	if persisted[2].Status != StatusPaused || persisted[2].Reason != reason {
+		t.Errorf("PAUSED row not round-tripped: %+v", persisted[2])
+	}
+}

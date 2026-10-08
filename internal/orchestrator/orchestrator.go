@@ -9,6 +9,11 @@
 // (see worktree.go), merged into the current branch once DONE; without it
 // tasks run in the main working tree and FAILED changes are parked (see
 // park.go).
+//
+// An agent call refused by a claude usage or rate limit pauses the task
+// (PAUSED in STATUS.md) and is retried once the limit lifts, without
+// spending an iteration; --max-cost-per-task and --max-cost-per-run are
+// checked after every agent call (see pause.go).
 package orchestrator
 
 import (
@@ -55,6 +60,20 @@ type Orchestrator struct {
 	// HeartbeatInterval is how often runAgent logs that an agent is still
 	// running; zero means defaultHeartbeatInterval.
 	HeartbeatInterval time.Duration
+
+	// Now and Sleep are the clock and the wait of a usage-limit pause,
+	// overridable for tests; nil means the real clock and an interruptible
+	// wall-clock sleep.
+	Now   func() time.Time
+	Sleep func(ctx context.Context, d time.Duration) error
+
+	// pauseBackoff is the wait of the next time-less limit pause; 0 means
+	// pauseInitialBackoff. Reset by every successful agent call.
+	pauseBackoff time.Duration
+
+	// priorCosts is the spend usage.jsonl held when the run started, for
+	// --max-cost-per-task.
+	priorCosts usage.Costs
 }
 
 func New(cfg config.Config) *Orchestrator {
@@ -142,7 +161,13 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	// writing into yet.
 	var uw *usage.Writer
 	if !o.Cfg.DryRun {
-		w, err := usage.Open(filepath.Join(o.Layout.Root, "usage.jsonl"))
+		usagePath := filepath.Join(o.Layout.Root, "usage.jsonl")
+		costs, err := usage.LoadCosts(usagePath)
+		if err != nil {
+			o.Log.Printf("warning: could not read earlier costs from %s (task budgets count this run only): %v", usagePath, err)
+		}
+		o.priorCosts = costs
+		w, err := usage.Open(usagePath)
 		if err != nil {
 			return fmt.Errorf("open usage log: %w", err)
 		}
@@ -164,6 +189,14 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			}
 			if next == "" {
 				break
+			}
+			// --max-cost-per-run crossed by the previous task's last call:
+			// stop before starting another. The popped task stays QUEUED in
+			// STATUS.md, so the next run's sync puts it back in the queue.
+			if err := o.runBudgetExceeded(uw); err != nil {
+				o.Log.Printf("run stopped before task %s: %v", next, err)
+				o.printUsageSummary(uw)
+				return err
 			}
 			processedAny = true
 			if err := o.processTask(ctx, next, planner, worker, tester, uw); err != nil {
@@ -235,6 +268,15 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 	}
 
 	done, cause := o.runIterations(ctx, specFile, num, ws, planner, worker, tester, uw)
+	if errors.Is(cause, ErrRunBudgetExceeded) {
+		o.Log.Printf("task %s: run budget exhausted; leaving it pending with its changes in place", specFile)
+		return &fatalError{cause}
+	}
+	var interrupted *pauseInterruptedError
+	if errors.As(cause, &interrupted) {
+		o.Log.Printf("task %s: interrupted while paused; it stays PAUSED and is resumed by the next run", specFile)
+		return &fatalError{cause}
+	}
 	if cause != nil && usagelimit.Mentions(cause.Error()) {
 		// Not a failure: the account's usage window ran out. Nothing is
 		// parked and the task stays IN_PROGRESS, so the next run (e.g. by
@@ -329,7 +371,10 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 			}
 			plannerPrompt += fmt.Sprintf("\nWrite (or update) the implementation plan to %s.", implPlanPath)
 
-			result, err := o.runAgent(ctx, call, planner, plannerPrompt)
+			result, err := o.runAgentPausing(ctx, call, planner, plannerPrompt)
+			if err := o.checkBudgets(specFile, uw); err != nil {
+				return false, err
+			}
 			if err != nil {
 				return false, fmt.Errorf("planner: %w", err)
 			}
@@ -372,7 +417,10 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 		}
 		workerPrompt += "\nImplement the plan in this repository."
 
-		workerResult, err := o.runAgent(ctx, call, worker, workerPrompt)
+		workerResult, err := o.runAgentPausing(ctx, call, worker, workerPrompt)
+		if err := o.checkBudgets(specFile, uw); err != nil {
+			return false, err
+		}
 		if err != nil {
 			return false, fmt.Errorf("worker: %w", err)
 		}
@@ -429,7 +477,7 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 				"update the row for %q in %s to status DONE.",
 			specFile, specContent, implPlanFile, plan, testCommand, diffNote, diffForTester, guidance, reviewPath, specFile, o.Layout.StatusPath)
 
-		testerResult, err := o.runAgent(ctx, call, tester, testerPrompt)
+		testerResult, err := o.runAgentPausing(ctx, call, tester, testerPrompt)
 		if err != nil {
 			return false, fmt.Errorf("tester: %w", err)
 		}
@@ -444,6 +492,9 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 			// benefit, since there's no further spend left to prevent this
 			// iteration was the last call regardless.
 			return true, nil
+		}
+		if err := o.checkBudgets(specFile, uw); err != nil {
+			return false, err
 		}
 		if err := o.checkCallCost("tester", testerResult); err != nil {
 			return false, err

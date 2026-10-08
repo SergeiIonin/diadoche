@@ -18,8 +18,9 @@ import (
 // fatalError stops Run altogether instead of moving on to the next task:
 // the working tree isn't in a state the next task can safely start from
 // (a dirty tree, a FAILED task whose changes couldn't be parked, a task
-// worktree that couldn't be set up or cleaned up), or the claude account
-// hit its usage limit.
+// worktree that couldn't be set up or cleaned up), the claude account hit
+// a usage limit the in-loop pause didn't catch, --max-cost-per-run was
+// exceeded, or the run was interrupted while a task was paused.
 type fatalError struct{ err error }
 
 func (e *fatalError) Error() string { return e.err.Error() }
@@ -143,7 +144,14 @@ func (o *Orchestrator) hasPriorProgress(num string) bool {
 // every later sync re-queue it forever. The returned error is a parking
 // failure, after which the next task can't safely start.
 func (o *Orchestrator) failTask(ctx context.Context, specFile, num string, ws *workspace, cause error) error {
-	if err := specs.SetStatus(o.Layout, specFile, specs.StatusFailed); err != nil {
+	// A task failed by --max-cost-per-task says so in STATUS.md, so it isn't
+	// mistaken for one that simply ran out of iterations.
+	reason := ""
+	var budget *budgetError
+	if errors.As(cause, &budget) && budget.task {
+		reason = cause.Error()
+	}
+	if err := specs.SetStatusReason(o.Layout, specFile, specs.StatusFailed, reason); err != nil {
 		o.Log.Printf("task %s: also failed to record FAILED status: %v", specFile, err)
 	}
 	if ws == nil { // --dry-run

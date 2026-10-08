@@ -2,9 +2,10 @@
 // truth for task status) and QUEUE.md (work queue for the current run), plus
 // discovery of new task spec files (spec/NNN_<slug>.md).
 //
-// A task's status is QUEUED, IN_PROGRESS, DONE, FAILED or BLOCKED (DONE by
-// tester, but its worktree branch couldn't be merged; it waits for a
-// human). Only QUEUED and IN_PROGRESS tasks are pending.
+// A task's status is QUEUED, IN_PROGRESS, PAUSED (waiting out a claude
+// usage or rate limit, see Row.Reason for when it resumes), DONE, FAILED or
+// BLOCKED (DONE by tester, but its worktree branch couldn't be merged; it
+// waits for a human). Only QUEUED, IN_PROGRESS and PAUSED tasks are pending.
 package specs
 
 import (
@@ -23,6 +24,7 @@ import (
 const (
 	StatusQueued     = "QUEUED"
 	StatusInProgress = "IN_PROGRESS"
+	StatusPaused     = "PAUSED"
 	StatusDone       = "DONE"
 	StatusFailed     = "FAILED"
 	StatusBlocked    = "BLOCKED"
@@ -257,8 +259,8 @@ func writeFileAtomic(path string, data []byte) error {
 
 // Sync discovers new task spec files that aren't in STATUS.md yet, appends
 // them as QUEUED rows, and rebuilds QUEUE.md from scratch: every row still
-// QUEUED or IN_PROGRESS (new tasks, and any left mid-flight by a previous,
-// interrupted run), ordered by ascending task number — so a restart always
+// QUEUED, IN_PROGRESS or PAUSED (new tasks, and any left mid-flight by a
+// previous, interrupted run), ordered by ascending task number — so a restart always
 // resumes with the lowest-numbered pending task first, regardless of what
 // order rows happen to sit in STATUS.md or the previous QUEUE.md. DONE,
 // FAILED and BLOCKED rows are not pending and never go back to the queue.
@@ -295,7 +297,7 @@ func Sync(l Layout) (rows []Row, queue []string, err error) {
 	return
 }
 
-// pendingQueue returns the specs of every QUEUED/IN_PROGRESS row in rows
+// pendingQueue returns the specs of every QUEUED/IN_PROGRESS/PAUSED row in rows
 // (DONE, FAILED and BLOCKED rows are not pending),
 // sorted ascending by numeric task number (rows whose Num isn't a plain
 // integer sort after all that are, in their original relative order).
@@ -306,7 +308,7 @@ func pendingQueue(rows []Row) []string {
 	}
 	var items []pending
 	for _, r := range rows {
-		if r.Status != StatusQueued && r.Status != StatusInProgress {
+		if r.Status != StatusQueued && r.Status != StatusInProgress && r.Status != StatusPaused {
 			continue
 		}
 		n, err := strconv.Atoi(r.Num)

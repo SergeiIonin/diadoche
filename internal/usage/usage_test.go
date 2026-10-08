@@ -183,3 +183,62 @@ func TestOpenCreatesParentDirectory(t *testing.T) {
 		t.Fatalf("expected usage.jsonl to exist: %v", err)
 	}
 }
+
+func TestLoadCostsMissingFile(t *testing.T) {
+	c, err := LoadCosts(filepath.Join(t.TempDir(), "usage.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Total != 0 || len(c.ByTask) != 0 {
+		t.Errorf("got %+v, want empty", c)
+	}
+}
+
+func TestLoadCostsSumsPerTaskAndSkipsGarbage(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.jsonl")
+	content := `{"task":"001_a.md","agent":"planner","cost_usd":0.5}
+{"task":"001_a.md","agent":"worker","cost_usd":0.25}
+not json at all
+{"task":"002_b.md","agent":"planner","cost_usd":1}
+{"task":"","agent":"preprocessor","cost_usd":0.125}
+{"task":"003_c.md","cost_u`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadCosts(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Total != 1.875 {
+		t.Errorf("Total = %v, want 1.875", c.Total)
+	}
+	if c.ByTask["001_a.md"] != 0.75 || c.ByTask["002_b.md"] != 1 || len(c.ByTask) != 2 {
+		t.Errorf("ByTask = %v", c.ByTask)
+	}
+}
+
+func TestSummaryCostLookups(t *testing.T) {
+	w, err := Open(filepath.Join(t.TempDir(), "usage.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	for _, r := range []Record{
+		{Task: "001_a.md", Agent: "planner", CostUSD: 0.5},
+		{Task: "001_a.md", Agent: "worker", CostUSD: 0.25},
+		{Task: "002_b.md", Agent: "planner", CostUSD: 1},
+	} {
+		if err := w.Append(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := w.Summary.CostUSD(); got != 1.75 {
+		t.Errorf("CostUSD() = %v, want 1.75", got)
+	}
+	if got := w.Summary.TaskCostUSD("001_a.md"); got != 0.75 {
+		t.Errorf("TaskCostUSD(001) = %v, want 0.75", got)
+	}
+	if got := w.Summary.TaskCostUSD("999_x.md"); got != 0 {
+		t.Errorf("TaskCostUSD(unknown) = %v, want 0", got)
+	}
+}

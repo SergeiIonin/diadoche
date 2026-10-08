@@ -28,6 +28,8 @@ func TestResetStatusKeepsOnlyDoneAndParkedFailed(t *testing.T) {
 		{Num: "004", Spec: "004_d.md", Status: specs.StatusQueued},
 		{Num: "005", Spec: "005_e.md", Status: specs.StatusFailed},
 		{Num: "006", Spec: "006_f.md", Status: specs.StatusBlocked, Reason: "merge conflict"},
+		// PAUSED is unfinished, like IN_PROGRESS: re-queued.
+		{Num: "007", Spec: "007_g.md", Status: specs.StatusPaused, Reason: "claude usage window exhausted, resumes at 2026-09-24T19:00:00Z"},
 	}
 	if err := specs.WriteStatus(l.StatusPath, rows); err != nil {
 		t.Fatal(err)
@@ -46,7 +48,7 @@ func TestResetStatusKeepsOnlyDoneAndParkedFailed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"002_b.md", "003_c.md", "004_d.md"}; fmt.Sprint(removed) != fmt.Sprint(want) {
+	if want := []string{"002_b.md", "003_c.md", "004_d.md", "007_g.md"}; fmt.Sprint(removed) != fmt.Sprint(want) {
 		t.Errorf("removed = %v, want %v", removed, want)
 	}
 	got, err := specs.ReadStatus(l.StatusPath)

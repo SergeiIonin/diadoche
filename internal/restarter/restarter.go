@@ -4,7 +4,10 @@
 // diadoche, drops every row from STATUS.md that isn't DONE, BLOCKED or a
 // parked FAILED (so the next run re-queues those tasks instead of seeing
 // them as FAILED), sleeps until the window reopens and starts diadoche
-// again.
+// again. A PAUSED row (a task diadoche itself is waiting out a limit on)
+// is unfinished like IN_PROGRESS, so it is dropped and re-queued too.
+// diadoche's own pause log lines are never limit messages (see
+// IsLimitLine), so a diadoche pausing in-process is left alone.
 package restarter
 
 import (

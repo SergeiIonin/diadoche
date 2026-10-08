@@ -4,7 +4,9 @@
 package usage
 
 import (
+	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -151,6 +153,58 @@ func (s *Summary) Calls() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.Overall.Calls
+}
+
+// CostUSD is the total cost of every Record added so far.
+func (s *Summary) CostUSD() float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Overall.CostUSD
+}
+
+// TaskCostUSD is the total cost of the Records added so far for task.
+func (s *Summary) TaskCostUSD(task string) float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if t := s.ByTask[task]; t != nil {
+		return t.CostUSD
+	}
+	return 0
+}
+
+// Costs is the spend already recorded in a usage.jsonl file.
+type Costs struct {
+	Total  float64
+	ByTask map[string]float64
+}
+
+// LoadCosts sums the cost of every Record in the usage.jsonl file at path,
+// overall and per task. A missing file means no spend yet; lines that are
+// not valid Records (e.g. one cut short by a killed process) are skipped.
+func LoadCosts(path string) (Costs, error) {
+	c := Costs{ByTask: map[string]float64{}}
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return c, nil
+	}
+	if err != nil {
+		return c, err
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	for sc.Scan() {
+		var rec Record
+		if json.Unmarshal(sc.Bytes(), &rec) != nil {
+			continue
+		}
+		c.Total += rec.CostUSD
+		if rec.Task != "" {
+			c.ByTask[rec.Task] += rec.CostUSD
+		}
+	}
+	return c, sc.Err()
 }
 
 // Format renders a human-readable end-of-run usage report.

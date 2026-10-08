@@ -44,7 +44,8 @@ const helpSynopsis = `SYNOPSIS
              [--tester-diff-limit <n>]
              [--planner-model <name>] [--worker-model <name>]
              [--tester-model <name>] [--max-call-minutes <n>]
-             [--max-call-cost <usd>] [--allow-dirty]
+             [--max-call-cost <usd>] [--max-cost-per-task <usd>]
+             [--max-cost-per-run <usd>] [--allow-dirty]
              [--stable-system-prompt=<bool>] [--worktree=<bool>]
              [--red-green=<bool>] [--test-globs <list>]
     diadoche --preprocess --task <path> [--dir <path>] [--claude-bin <path>]
@@ -133,22 +134,24 @@ const helpDescription = `DESCRIPTION
       FAILED: the task's changes are committed on its branch, the worktree
       is removed and the branch is renamed to
       diadoche/failed/<NNN>-<slug>; spec/<NNN>_FAILED.md names it.
-    A usage-limit interruption leaves the worktree in place; the next run
-    resumes the task in it. A repository without any commit yet has
+    A usage-limit error pauses the task in place (see USAGE LIMITS); a run
+    interrupted while a task is pending leaves its worktree in place, and
+    the next run resumes the task in it. A repository without any commit yet has
     nothing to branch from, so such a run falls back to --worktree=false.
 
     FAILED TASKS (--worktree=false): every task starts from a clean working
     tree. When a task
-    becomes FAILED (iterations exhausted, an agent error, --max-call-cost),
+    becomes FAILED (iterations exhausted, an agent error, --max-call-cost,
+    --max-cost-per-task),
     its changes since the diff base (outside .claude/diadoche/ and
     .claude/agents/) are committed to a new branch
     diadoche/failed/<NNN>-<slug> without switching branches, then reverted
     in the working tree. The task's bookkeeping (plan, reviews, STATUS.md,
     ...) is committed to the current branch as "diadoche: FAILED <spec>",
     and spec/<NNN>_FAILED.md names the branch and how to bring the changes
-    back. A usage-limit error is not a failure: nothing is parked, the task
-    stays IN_PROGRESS and diadoche exits, so diadoche-restarter can resume
-    it later with its changes in place.
+    back. A usage-limit error is not a failure: it pauses the task in place
+    (see USAGE LIMITS); nothing is parked, and a run stopped meanwhile
+    leaves the task pending with its changes in place.
 
     PROMPT CACHING: every agent of a run is given the same shared prompt
     prefix — byte for byte — as its system prompt (claude's
@@ -262,6 +265,39 @@ const helpCallBudget = `PER-CALL BUDGET
     failed right away instead of continuing to the next agent/iteration,
     so you find out immediately rather than after the fact.
 
+    BUDGETS: --max-cost-per-task and --max-cost-per-run cap the sum of the
+    costs recorded in usage.jsonl, in USD; both are 0 (no limit) by
+    default, are checked after every agent call, and are off in --dry-run.
+    --max-cost-per-task counts every call of the current task, previous
+    runs included; once exceeded the task becomes FAILED with the reason
+    "budget exceeded: ..." in STATUS.md and is parked like any other
+    failed task. --max-cost-per-run counts this run's calls only; once
+    exceeded diadoche stops after the current agent call, the current task
+    stays pending (not FAILED) with its changes in place, the reason is
+    logged, and diadoche exits non-zero. A task the tester already marked
+    DONE in that call is still finished (committed/merged) first.
+
+`
+
+const helpUsageLimits = `USAGE LIMITS
+    An agent call refused by a claude usage limit (subscription window
+    exhausted) or by rate limiting (HTTP 429) - recognized by the call's
+    exit code plus the error text / JSON result - does not spend an
+    iteration. The task becomes "PAUSED: claude <kind>, resumes at <time>"
+    in STATUS.md (without the time when the reply doesn't carry one), and
+    diadoche waits: until the reset time from the reply ("resets 7pm",
+    legacy "usage limit reached|<unix time>"), else 5 minutes, doubling on
+    each further time-less pause up to 1 hour. Then the same call of the
+    same agent in the same iteration is retried; after a successful call
+    the task is IN_PROGRESS again and the backoff starts over at 5 minutes.
+    SIGINT/SIGTERM interrupts the wait at once: the task stays PAUSED and
+    is resumed (like IN_PROGRESS) by the next run.
+
+    diadoche-restarter works alongside: diadoche's own pause log lines are
+    never claude limit messages and the claude error text of a refused call
+    is not printed, so the restarter does not kill a pausing diadoche; it
+    remains a fallback for crashes and limit errors that escape the pause.
+
 `
 
 const helpFlagsHeader = `FLAGS
@@ -272,8 +308,9 @@ const helpFiles = `
 FILES
     <project>/.claude/diadoche/spec/STATUS.md
         Source of truth for every task's status: QUEUED, IN_PROGRESS,
-        DONE, FAILED or BLOCKED. A BLOCKED row carries its reason in the
-        Status cell ("BLOCKED: <reason>").
+        PAUSED, DONE, FAILED or BLOCKED. A BLOCKED or PAUSED row (and a
+        task FAILED by its budget) carries its reason in the Status cell
+        ("BLOCKED: <reason>").
 
     <project>/.claude/diadoche/spec/QUEUE.md
         This run's work queue, rebuilt from STATUS.md on every sync. A
@@ -389,6 +426,16 @@ type Config struct {
 	// more expensive than expected. 0 = no limit (default).
 	MaxCallCostUSD float64
 
+	// MaxCostPerTaskUSD, when > 0, fails the current task once the total
+	// cost recorded for it in usage.jsonl (previous runs included) exceeds
+	// it. Checked after each agent call. 0 = no limit (default).
+	MaxCostPerTaskUSD float64
+
+	// MaxCostPerRunUSD, when > 0, stops the run after the current agent
+	// call once this run's recorded cost exceeds it; the current task stays
+	// pending and diadoche exits non-zero. 0 = no limit (default).
+	MaxCostPerRunUSD float64
+
 	// StableSystemPrompt passes claude's
 	// --exclude-dynamic-system-prompt-sections, so per-machine sections
 	// (cwd, env info, memory paths, git status) move out of the system
@@ -456,6 +503,8 @@ func Parse(args []string) (*Config, error) {
 	redGreen := fs.Bool("red-green", true, "after worker, run the task's new/changed test files on the base commit in a temporary worktree; tests that pass there fail the iteration")
 	testGlobs := fs.String("test-globs", "", "comma-separated test-file globs for non-Go projects, e.g. 'test_*.py,*.spec.ts'; default: inferred from the plan's ## Test Command; *_test.go always counts")
 	maxCallCost := fs.Float64("max-call-cost", 0, "fail the task if a single agent call's cost in USD exceeds this — checked after the call returns, so it cannot preempt the spend (0 = no limit)")
+	maxCostPerTask := fs.Float64("max-cost-per-task", 0, "fail the task once the total recorded cost of the task in usage.jsonl, previous runs included, exceeds this many USD; checked after each agent call (0 = no limit)")
+	maxCostPerRun := fs.Float64("max-cost-per-run", 0, "stop the run after the current agent call once this run's recorded cost exceeds this many USD; the current task stays pending and diadoche exits non-zero (0 = no limit)")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -505,6 +554,12 @@ func Parse(args []string) (*Config, error) {
 	if *maxCallCost < 0 {
 		return nil, fmt.Errorf("--max-call-cost must be >= 0, got %g", *maxCallCost)
 	}
+	if *maxCostPerTask < 0 {
+		return nil, fmt.Errorf("--max-cost-per-task must be >= 0, got %g", *maxCostPerTask)
+	}
+	if *maxCostPerRun < 0 {
+		return nil, fmt.Errorf("--max-cost-per-run must be >= 0, got %g", *maxCostPerRun)
+	}
 
 	globs := splitCSV(*testGlobs)
 	if err := redgreen.ValidateGlobs(globs); err != nil {
@@ -544,6 +599,8 @@ func Parse(args []string) (*Config, error) {
 		PreprocessorModel:  preprocessorOverride,
 		MaxCallMinutes:     *maxCallMinutes,
 		MaxCallCostUSD:     *maxCallCost,
+		MaxCostPerTaskUSD:  *maxCostPerTask,
+		MaxCostPerRunUSD:   *maxCostPerRun,
 		AllowDirty:         *allowDirty,
 		Worktree:           *worktree,
 		StableSystemPrompt: *stableSystemPrompt,
@@ -589,6 +646,7 @@ func printHelp(fs *flag.FlagSet, w io.Writer) {
 	fmt.Fprint(w, helpModes)
 	fmt.Fprint(w, helpModels)
 	fmt.Fprint(w, helpCallBudget)
+	fmt.Fprint(w, helpUsageLimits)
 	fmt.Fprint(w, helpFlagsHeader)
 	fs.SetOutput(w)
 	fs.PrintDefaults()
