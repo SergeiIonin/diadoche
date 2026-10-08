@@ -1,3 +1,2 @@
-- 021_parallel_limits_budgets_adr.md
 - 022_smoke_config_and_runner.md
 - 023_smoke_in_iteration.md
