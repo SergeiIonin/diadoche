@@ -11,3 +11,4 @@ README_RU.md
 # diadoche task specs, plans and reviews (Russian); STATUS.md/QUEUE.md stay tracked
 /.claude/diadoche/spec/[0-9][0-9][0-9]_*
 /.claude/diadoche/spec/raw/*.md
+/.claude/diadoche/usage.jsonl
