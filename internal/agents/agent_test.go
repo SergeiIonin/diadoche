@@ -124,6 +124,22 @@ func TestBuiltinDefaultModels(t *testing.T) {
 	}
 }
 
+// TestEmbeddedTesterPromptIsDiffScoped pins the other half of the plan
+// contract into the built-in tester prompt: tester reviews from the diff
+// it is handed, in either of the two shapes the orchestrator can send, and
+// never re-explores the repository on its own.
+func TestEmbeddedTesterPromptIsDiffScoped(t *testing.T) {
+	tester, err := LoadOrDefault(t.TempDir(), "tester")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"diff", "untracked", "--stat", "ambiguous", "do not re-explore", "## Test Command"} {
+		if !strings.Contains(tester.SystemPrompt, want) {
+			t.Errorf("embedded tester prompt is missing %q", want)
+		}
+	}
+}
+
 // TestEmbeddedPlannerAndWorkerPromptsCarryPlanContract pins the
 // IMPL_PLAN.md contract into the built-in prompts: planner must describe
 // both required sections and the per-file create/modify marker, and worker

@@ -63,9 +63,12 @@ Flags:
   regardless of which of the above picked the model. An unrecognized model
   name is a startup error, before any `claude` process runs. The resolved
   models are logged once at the start of the run.
-- `--max-diff-bytes` — above this many bytes of raw `git diff`, tester gets
-  `git diff --stat` plus a diff restricted to the plan's file list instead
-  (default 50000). See "Diff-scoped tester" below.
+- `--max-diff-bytes` (alias `--tester-diff-limit`; pass only one of the
+  two, passing both is a startup error) — above this many bytes of diff
+  (`git diff` plus the contents of new untracked files), tester gets
+  `git diff --stat`, the untracked file list and an instruction to open
+  what it needs itself (default 204800, i.e. 200 KB). See "Diff-scoped
+  tester" below.
 - `--max-call-minutes` — kill a single agent call if it runs longer than
   this many minutes (default 0 = no limit). See "Per-call budget" below.
 - `--max-call-cost` — fail the task if a single agent call's cost (USD)
@@ -198,10 +201,20 @@ untracked files since that base — excluding `.claude/diadoche/` and
 `.claude/agents/`, diadoche's own bookkeeping/config, so those never look
 like part of the worker's change.
 
+New files never show up in `git diff` at all, so the contents of untracked
+text files are included alongside it (binary ones are listed by name and
+size only, and the index is never touched to produce any of this).
+
 - An empty diff (and no untracked files) means tester is **not called at
   all** — the iteration is immediately treated as unsuccessful.
-- A diff over `--max-diff-bytes` is replaced with `git diff --stat` plus a
-  diff restricted to the files listed in the plan's `## Files` section.
+- The diff and that untracked content count toward `--max-diff-bytes`
+  (alias `--tester-diff-limit`) together, so a single huge new file can't
+  slip past the limit. Over it, tester instead gets `git diff --stat`, the
+  list of untracked files with their sizes, the diff restricted to the
+  files listed in the plan's `## Files` section (only when that one fits
+  the limit — otherwise it is omitted too and the prompt says so), the
+  task's base commit, and an instruction to open just the files it needs
+  itself, e.g. `git diff <base> -- <path>`.
 
 ## FAILED tasks
 

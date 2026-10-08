@@ -260,3 +260,52 @@ func TestParkAndRestoreBeforeFirstCommit(t *testing.T) {
 		t.Error("ParkPaths must never overwrite an existing branch")
 	}
 }
+
+func TestReadUntrackedReturnsTextContentAndFlagsBinary(t *testing.T) {
+	requireGit(t)
+	dir := t.TempDir()
+	ctx := context.Background()
+	if err := EnsureRepo(ctx, dir); err != nil {
+		t.Fatal(err)
+	}
+
+	const textContent = "package main\n\nfunc main() {}\n"
+	if err := os.WriteFile(filepath.Join(dir, "new.go"), []byte(textContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	binContent := []byte{0x7f, 'E', 'L', 'F', 0x00, 0x01, 0x02}
+	if err := os.WriteFile(filepath.Join(dir, "blob.bin"), binContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// "gone.txt" stands for a file git listed as untracked that vanished
+	// before it could be read — a skip, not an error.
+	files, err := ReadUntracked(dir, []string{"new.go", "blob.bin", "gone.txt"})
+	if err != nil {
+		t.Fatalf("ReadUntracked: %v", err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("got %d files, want 2 (the missing one skipped): %+v", len(files), files)
+	}
+	if files[0].Path != "new.go" || files[1].Path != "blob.bin" {
+		t.Errorf("input order not preserved: got %q, %q", files[0].Path, files[1].Path)
+	}
+	if files[0].Content != textContent {
+		t.Errorf("new.go content = %q, want %q", files[0].Content, textContent)
+	}
+	if files[0].Binary {
+		t.Error("new.go reported as binary")
+	}
+	if files[0].Size != int64(len(textContent)) {
+		t.Errorf("new.go size = %d, want %d", files[0].Size, len(textContent))
+	}
+	if !files[1].Binary {
+		t.Error("blob.bin not reported as binary")
+	}
+	if files[1].Content != "" {
+		t.Errorf("blob.bin content = %q, want empty for a binary file", files[1].Content)
+	}
+	if files[1].Size != int64(len(binContent)) {
+		t.Errorf("blob.bin size = %d, want %d", files[1].Size, len(binContent))
+	}
+}

@@ -140,6 +140,57 @@ func UntrackedFiles(ctx context.Context, dir string) ([]string, error) {
 	return files, nil
 }
 
+// UntrackedFile is one new, untracked file as tester needs to see it: its
+// path, its size, and its text content (empty for a binary file).
+type UntrackedFile struct {
+	Path    string
+	Size    int64
+	Content string
+	Binary  bool
+}
+
+// binarySniffLen is how far into a file a NUL byte still makes git treat it
+// as binary; ReadUntracked uses the same heuristic so what it calls binary
+// matches what `git diff` would.
+const binarySniffLen = 8000
+
+// ReadUntracked reads the contents of the given untracked paths (as
+// reported by UntrackedFiles, i.e. slash-separated and relative to dir),
+// preserving their order.
+//
+// It exists because a plain `git diff <base>` never shows a new file at
+// all, yet a worker that only added files has still made a change tester
+// must review. Reading the files directly keeps the index untouched — no
+// `git add -N` — so nothing about the working tree is disturbed by
+// building the review input. A file that disappeared between `ls-files`
+// and the read is skipped rather than failing the iteration; a binary one
+// is reported by path and size with no content.
+func ReadUntracked(dir string, paths []string) ([]UntrackedFile, error) {
+	out := make([]UntrackedFile, 0, len(paths))
+	for _, p := range paths {
+		full := filepath.Join(dir, filepath.FromSlash(p))
+		b, err := os.ReadFile(full)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read untracked file %s: %w", p, err)
+		}
+		f := UntrackedFile{Path: p, Size: int64(len(b))}
+		sniff := b
+		if len(sniff) > binarySniffLen {
+			sniff = sniff[:binarySniffLen]
+		}
+		if bytes.IndexByte(sniff, 0) >= 0 {
+			f.Binary = true
+		} else {
+			f.Content = string(b)
+		}
+		out = append(out, f)
+	}
+	return out, nil
+}
+
 // EnsureRepo makes sure dir is inside a git working tree, running `git init`
 // in dir if it isn't one yet.
 func EnsureRepo(ctx context.Context, dir string) error {

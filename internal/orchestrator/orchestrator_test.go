@@ -1094,8 +1094,19 @@ func TestProcessTaskCallsTesterWithDiffWhenWorkerAddsFile(t *testing.T) {
 	if !strings.Contains(prompt, "Untracked files") || !strings.Contains(prompt, "new_feature.go") {
 		t.Errorf("expected tester prompt to list the new untracked file; got:\n%s", prompt)
 	}
+	// A new file never shows up in `git diff`, so its *contents* are the
+	// only thing tester could review it from.
+	if !strings.Contains(prompt, "package main") {
+		t.Errorf("expected tester prompt to carry the new untracked file's contents; got:\n%s", prompt)
+	}
 	if !strings.Contains(prompt, "go test ./...") {
 		t.Errorf("expected tester prompt to carry the plan's test command; got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "open files outside the diff only") {
+		t.Errorf("expected tester prompt to carry the normal-case review guidance; got:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "exceeded --max-diff-bytes") {
+		t.Errorf("a diff well under the limit must not be reported as truncated; got:\n%s", prompt)
 	}
 }
 
@@ -1135,6 +1146,14 @@ func TestProcessTaskTruncatesOversizedDiffForTester(t *testing.T) {
 		},
 		markDoneOnTester: true,
 	}
+	// The base the task will diff against is HEAD right now; by the time
+	// Run returns, the DONE commit has moved HEAD and spec/001_BASE is
+	// gone, so capture it up front.
+	base, err := gitutil.BaseCommit(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	o := &Orchestrator{
 		Cfg:    config.Config{Dir: dir, Iter: 1, MaxDiffBytes: 20}, // tiny threshold: forces truncation
 		Layout: layout,
@@ -1158,6 +1177,14 @@ func TestProcessTaskTruncatesOversizedDiffForTester(t *testing.T) {
 	if strings.Contains(prompt, sentinel) {
 		t.Errorf("expected the full diff body (with the sentinel) to be dropped once truncated; got:\n%s", prompt)
 	}
+	// Without the diff, tester has to fetch what it needs itself — so it
+	// must be told to, and given the base commit to diff against.
+	if !strings.Contains(prompt, "open those files yourself") {
+		t.Errorf("expected tester prompt to instruct opening the needed files itself; got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, base) {
+		t.Errorf("expected tester prompt to name the diff base %s; got:\n%s", base, prompt)
+	}
 }
 
 // TestProcessTaskOversizedDiffIsRestrictedToAnnotatedPlanFiles is the
@@ -1166,6 +1193,80 @@ func TestProcessTaskTruncatesOversizedDiffForTester(t *testing.T) {
 // modify: ...", the restricted diff handed to tester must still contain
 // big.txt's changes.
 func TestProcessTaskOversizedDiffIsRestrictedToAnnotatedPlanFiles(t *testing.T) {
+	requireGit(t)
+	dir := t.TempDir()
+	setTestGitEnv(t)
+	ctx := context.Background()
+
+	if err := gitutil.EnsureRepo(ctx, dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "big.txt"), []byte("line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "other.txt"), []byte(strings.Repeat("line\n", 50)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := gitutil.CommitAll(ctx, dir, "seed big.txt and other.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	layout := specs.NewLayout(dir)
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	writeAgentFixtures(t, layout.AgentsDir)
+	specFile := "001_example.md"
+	if err := os.WriteFile(filepath.Join(layout.SpecDir, specFile), []byte("# Example\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	const sentinel = "UNIQUE_SENTINEL_XYZ"
+	const annotatedPlan = "## Files\n- `big.txt` — modify: rewrite contents\n\n## Test Command\ngo test ./...\n"
+	runner := &scriptedRunner{
+		layout: layout,
+		onPlanner: func(specDir string) error {
+			return os.WriteFile(filepath.Join(specDir, "001_IMPL_PLAN.md"), []byte(annotatedPlan), 0o644)
+		},
+		onWorker: func(dir string) error {
+			// A one-line change in the plan's own file (a few hundred
+			// bytes of diff at most), plus a 100-line change in a file
+			// the plan never mentions (well over a kilobyte): the full
+			// diff blows the threshold, big.txt's alone fits it.
+			if err := os.WriteFile(filepath.Join(dir, "big.txt"), []byte(sentinel+"\n"), 0o644); err != nil {
+				return err
+			}
+			return os.WriteFile(filepath.Join(dir, "other.txt"), []byte(strings.Repeat("changed line\n", 50)), 0o644)
+		},
+		markDoneOnTester: true,
+	}
+	o := &Orchestrator{
+		Cfg:    config.Config{Dir: dir, Iter: 1, MaxDiffBytes: 600},
+		Layout: layout,
+		Runner: runner,
+		Log:    log.New(io.Discard, "", 0),
+	}
+	if err := o.Run(ctx); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	if runner.testerCalls != 1 {
+		t.Fatalf("testerCalls = %d, want 1", runner.testerCalls)
+	}
+	prompt := runner.testerPrompts[0]
+	if !strings.Contains(prompt, "exceeded --max-diff-bytes") {
+		t.Errorf("expected tester prompt to note the diff was truncated; got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, sentinel) {
+		t.Errorf("expected the diff restricted to the plan's annotated Files entry to include big.txt's changes; got:\n%s", prompt)
+	}
+}
+
+// TestProcessTaskOmitsRestrictedDiffWhenItIsAlsoOverTheLimit covers the
+// case the plan-restricted fallback cannot help with: the oversized change
+// is in the plan's own files, so including their diff would send just as
+// many bytes the limit was meant to avoid.
+func TestProcessTaskOmitsRestrictedDiffWhenItIsAlsoOverTheLimit(t *testing.T) {
 	requireGit(t)
 	dir := t.TempDir()
 	setTestGitEnv(t)
@@ -1204,7 +1305,62 @@ func TestProcessTaskOversizedDiffIsRestrictedToAnnotatedPlanFiles(t *testing.T) 
 		markDoneOnTester: true,
 	}
 	o := &Orchestrator{
-		Cfg:    config.Config{Dir: dir, Iter: 1, MaxDiffBytes: 20}, // tiny threshold: forces truncation
+		Cfg:    config.Config{Dir: dir, Iter: 1, MaxDiffBytes: 20},
+		Layout: layout,
+		Runner: runner,
+		Log:    log.New(io.Discard, "", 0),
+	}
+	if err := o.Run(ctx); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	if runner.testerCalls != 1 {
+		t.Fatalf("testerCalls = %d, want 1", runner.testerCalls)
+	}
+	prompt := runner.testerPrompts[0]
+	if strings.Contains(prompt, sentinel) {
+		t.Errorf("the plan-restricted diff is itself over the limit and must be omitted; got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "over the size limit too") {
+		t.Errorf("expected tester prompt to say the plan-file diff was omitted as well; got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "big.txt") {
+		t.Errorf("expected big.txt to still appear in the diff --stat; got:\n%s", prompt)
+	}
+}
+
+// TestProcessTaskCountsUntrackedContentTowardTheLimit guards the case a
+// size check on the tracked diff alone would miss entirely: a worker that
+// only adds new files has an empty `git diff`, so the contents of those
+// files are the only thing there is to bound.
+func TestProcessTaskCountsUntrackedContentTowardTheLimit(t *testing.T) {
+	requireGit(t)
+	dir := t.TempDir()
+	setTestGitEnv(t)
+	ctx := context.Background()
+
+	layout := specs.NewLayout(dir)
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	writeAgentFixtures(t, layout.AgentsDir)
+	specFile := "001_example.md"
+	if err := os.WriteFile(filepath.Join(layout.SpecDir, specFile), []byte("# Example\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	const sentinel = "UNIQUE_SENTINEL_XYZ"
+	runner := &scriptedRunner{
+		layout:    layout,
+		onPlanner: writeValidPlan,
+		onWorker: func(dir string) error {
+			body := sentinel + "\n" + strings.Repeat("filler line\n", 80) // ~1 KB, all untracked
+			return os.WriteFile(filepath.Join(dir, "huge_new.go"), []byte(body), 0o644)
+		},
+		markDoneOnTester: true,
+	}
+	o := &Orchestrator{
+		Cfg:    config.Config{Dir: dir, Iter: 1, MaxDiffBytes: 100},
 		Layout: layout,
 		Runner: runner,
 		Log:    log.New(io.Discard, "", 0),
@@ -1218,10 +1374,89 @@ func TestProcessTaskOversizedDiffIsRestrictedToAnnotatedPlanFiles(t *testing.T) 
 	}
 	prompt := runner.testerPrompts[0]
 	if !strings.Contains(prompt, "exceeded --max-diff-bytes") {
-		t.Errorf("expected tester prompt to note the diff was truncated; got:\n%s", prompt)
+		t.Errorf("a big untracked file must count toward the limit; got:\n%s", prompt)
 	}
-	if !strings.Contains(prompt, sentinel) {
-		t.Errorf("expected the diff restricted to the plan's annotated Files entry to include big.txt's changes; got:\n%s", prompt)
+	if !strings.Contains(prompt, "huge_new.go") {
+		t.Errorf("expected the untracked file to still be listed by name; got:\n%s", prompt)
+	}
+	if strings.Contains(prompt, sentinel) {
+		t.Errorf("expected the untracked file's contents to be dropped once over the limit; got:\n%s", prompt)
+	}
+}
+
+// TestProcessTaskSkipsBinaryUntrackedContent: a new binary file is still a
+// change tester must know about, but its bytes are useless in a prompt.
+func TestProcessTaskSkipsBinaryUntrackedContent(t *testing.T) {
+	requireGit(t)
+	dir := t.TempDir()
+	setTestGitEnv(t)
+	ctx := context.Background()
+
+	layout := specs.NewLayout(dir)
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	writeAgentFixtures(t, layout.AgentsDir)
+	specFile := "001_example.md"
+	if err := os.WriteFile(filepath.Join(layout.SpecDir, specFile), []byte("# Example\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &scriptedRunner{
+		layout:    layout,
+		onPlanner: writeValidPlan,
+		onWorker: func(dir string) error {
+			return os.WriteFile(filepath.Join(dir, "asset.bin"), []byte{'a', 0x00, 'b'}, 0o644)
+		},
+		markDoneOnTester: true,
+	}
+	o := &Orchestrator{
+		Cfg:    config.Config{Dir: dir, Iter: 1, MaxDiffBytes: config.DefaultMaxDiffBytes},
+		Layout: layout,
+		Runner: runner,
+		Log:    log.New(io.Discard, "", 0),
+	}
+	if err := o.Run(ctx); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	if runner.testerCalls != 1 {
+		t.Fatalf("testerCalls = %d, want 1 — a new binary file is still a change", runner.testerCalls)
+	}
+	prompt := runner.testerPrompts[0]
+	if !strings.Contains(prompt, "asset.bin") {
+		t.Errorf("expected the new binary file to be listed; got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "binary") {
+		t.Errorf("expected the prompt to mark the file as binary instead of inlining its bytes; got:\n%s", prompt)
+	}
+}
+
+func TestRenderUntrackedShapes(t *testing.T) {
+	files := []gitutil.UntrackedFile{
+		{Path: "a.go", Size: 13, Content: "package main\n"},
+		{Path: "b.bin", Size: 3, Binary: true},
+	}
+
+	withContent := renderUntracked(files, true)
+	for _, want := range []string{"Untracked files", "a.go", "13 bytes", "package main", "b.bin", "binary"} {
+		if !strings.Contains(withContent, want) {
+			t.Errorf("content form is missing %q; got:\n%s", want, withContent)
+		}
+	}
+
+	namesOnly := renderUntracked(files, false)
+	for _, want := range []string{"Untracked files", "a.go (13 bytes)", "b.bin (3 bytes)"} {
+		if !strings.Contains(namesOnly, want) {
+			t.Errorf("names-only form is missing %q; got:\n%s", want, namesOnly)
+		}
+	}
+	if strings.Contains(namesOnly, "package main") {
+		t.Errorf("names-only form must not carry file contents; got:\n%s", namesOnly)
+	}
+
+	if renderUntracked(nil, true) != "" {
+		t.Error("no untracked files must render as the empty string, not a dangling header")
 	}
 }
 

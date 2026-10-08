@@ -17,12 +17,13 @@ const (
 	DefaultIter = 3
 	MaxIter     = 8
 
-	// DefaultMaxDiffBytes bounds the raw `git diff` handed to tester before
-	// diadoche falls back to `git diff --stat` plus a diff restricted to the
-	// files the implementation plan says were meant to change. Kept modest
-	// on purpose — this whole flag exists to cut token spend, so the
-	// default should actually cut it on anything but a small change.
-	DefaultMaxDiffBytes = 50_000
+	// DefaultMaxDiffBytes bounds the diff handed to tester — the raw
+	// `git diff` plus the contents of any new untracked text files. Above
+	// it, tester instead gets `git diff --stat`, the list of untracked
+	// files, the diff restricted to the plan's "## Files" (when that one
+	// fits the limit) and an instruction to open the files it needs
+	// itself. 200 KB, as required by 004_tester_gets_diff.md.
+	DefaultMaxDiffBytes = 204_800
 )
 
 // ErrHelp is returned by Parse when the user asked for help (-h, -help or
@@ -39,6 +40,7 @@ const helpName = `NAME
 const helpSynopsis = `SYNOPSIS
     diadoche [--dir <path>] [--ITER <n>] [--langs <list>] [--frameworks <list>]
              [--dry-run] [--claude-bin <path>] [--max-diff-bytes <n>]
+             [--tester-diff-limit <n>]
              [--planner-model <name>] [--worker-model <name>]
              [--tester-model <name>] [--max-call-minutes <n>]
              [--max-call-cost <usd>] [--allow-dirty]
@@ -98,9 +100,14 @@ const helpDescription = `DESCRIPTION
     current commit (or, pre-first-commit, git's empty-tree hash) as that
     task's diff base. Before each tester call it computes the diff (plus
     any untracked files) since that base. An empty diff means tester is
-    not called at all — the iteration is immediately unsuccessful. A diff
-    over --max-diff-bytes is replaced with 'git diff --stat' plus a diff
-    restricted to the files listed in "## Files" of the plan.
+    not called at all — the iteration is immediately unsuccessful. What
+    tester gets is the diff plus the contents of any new untracked text
+    files (binary ones are listed by name and size only). If that is over
+    --max-diff-bytes (alias --tester-diff-limit, default 200 KB) it is
+    replaced with 'git diff --stat', the list of untracked files, the diff
+    restricted to the files listed in "## Files" of the plan when that one
+    fits the limit, the base commit, and an instruction for tester to open
+    the files it needs itself.
 
     FAILED TASKS: every task starts from a clean working tree. When a task
     becomes FAILED (iterations exhausted, an agent error, --max-call-cost),
@@ -261,8 +268,9 @@ type Config struct {
 	Task       string
 	Initialize string
 
-	// MaxDiffBytes bounds the raw diff handed to tester (subtask 4 of
-	// 09_optimize_agents.md); see DefaultMaxDiffBytes.
+	// MaxDiffBytes bounds the diff handed to tester, set by either
+	// --max-diff-bytes or its synonym --tester-diff-limit (passing both is
+	// a startup error); see DefaultMaxDiffBytes.
 	MaxDiffBytes int
 
 	// PlannerModel, WorkerModel, TesterModel, PreprocessorModel are model
@@ -322,7 +330,8 @@ func Parse(args []string) (*Config, error) {
 	preprocess := fs.Bool("preprocess", false, "split a raw task file into atomic task specs and exit, instead of running the main loop")
 	task := fs.String("task", "", "path to the raw task file for --preprocess, e.g. .claude/diadoche/spec/raw/foo.md")
 	initialize := fs.String("initialize", "", "scaffold .claude/ in the given project path and exit, doing nothing else")
-	maxDiffBytes := fs.Int("max-diff-bytes", DefaultMaxDiffBytes, "above this many bytes of raw `git diff`, tester gets `git diff --stat` plus a diff restricted to the plan's file list instead")
+	maxDiffBytes := fs.Int("max-diff-bytes", DefaultMaxDiffBytes, "above this many bytes of diff (`git diff` plus the contents of new untracked files), tester gets `git diff --stat`, the untracked file list and an instruction to open what it needs itself")
+	testerDiffLimit := fs.Int("tester-diff-limit", DefaultMaxDiffBytes, "synonym of --max-diff-bytes (pass only one of the two)")
 	plannerModel := fs.String("planner-model", "", "override the planner agent's model (else $DIADOCHE_PLANNER_MODEL, else .claude/agents/planner.md, else built-in default)")
 	workerModel := fs.String("worker-model", "", "override the worker agent's model (else $DIADOCHE_WORKER_MODEL, else .claude/agents/worker.md, else built-in default)")
 	testerModel := fs.String("tester-model", "", "override the tester agent's model (else $DIADOCHE_TESTER_MODEL, else .claude/agents/tester.md, else built-in default)")
@@ -359,8 +368,19 @@ func Parse(args []string) (*Config, error) {
 		return nil, fmt.Errorf("--preprocess requires --task <path to raw task file>")
 	}
 
-	if *maxDiffBytes < 0 {
-		return nil, fmt.Errorf("--max-diff-bytes must be >= 0, got %d", *maxDiffBytes)
+	// --max-diff-bytes and --tester-diff-limit are two names for the same
+	// setting (the former predates the latter, so neither can be dropped).
+	// Passing both is rejected even when the values agree: silently
+	// honouring one of two deliberately-set flags is worse than saying so.
+	diffLimitFlag, diffLimit := "--max-diff-bytes", *maxDiffBytes
+	switch {
+	case passed["max-diff-bytes"] && passed["tester-diff-limit"]:
+		return nil, fmt.Errorf("--max-diff-bytes and --tester-diff-limit are synonyms; pass only one of them")
+	case passed["tester-diff-limit"]:
+		diffLimitFlag, diffLimit = "--tester-diff-limit", *testerDiffLimit
+	}
+	if diffLimit < 0 {
+		return nil, fmt.Errorf("%s must be >= 0, got %d", diffLimitFlag, diffLimit)
 	}
 	if *maxCallMinutes < 0 {
 		return nil, fmt.Errorf("--max-call-minutes must be >= 0, got %d", *maxCallMinutes)
@@ -395,7 +415,7 @@ func Parse(args []string) (*Config, error) {
 		ClaudeBin:         *claudeBin,
 		Preprocess:        *preprocess,
 		Task:              *task,
-		MaxDiffBytes:      *maxDiffBytes,
+		MaxDiffBytes:      diffLimit,
 		PlannerModel:      plannerOverride,
 		WorkerModel:       workerOverride,
 		TesterModel:       testerOverride,

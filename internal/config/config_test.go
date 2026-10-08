@@ -82,7 +82,7 @@ func TestParseHelpFlagPrintsManPageAndReturnsErrHelp(t *testing.T) {
 			if cfg != nil {
 				t.Fatalf("cfg = %+v, want nil", cfg)
 			}
-			for _, want := range []string{"SYNOPSIS", "DESCRIPTION", "MODES", "--initialize", "--preprocess", "EXAMPLES"} {
+			for _, want := range []string{"SYNOPSIS", "DESCRIPTION", "MODES", "--initialize", "--preprocess", "--tester-diff-limit", "EXAMPLES"} {
 				if !strings.Contains(out, want) {
 					t.Errorf("help output missing %q; got:\n%s", want, out)
 				}
@@ -229,6 +229,11 @@ func TestParseMaxDiffBytesDefaultAndOverride(t *testing.T) {
 	if cfg.MaxDiffBytes != DefaultMaxDiffBytes {
 		t.Fatalf("MaxDiffBytes = %d, want default %d", cfg.MaxDiffBytes, DefaultMaxDiffBytes)
 	}
+	// 004_tester_gets_diff.md pins the default at 200 KB, so pin the
+	// number itself and not just "whatever the constant says".
+	if DefaultMaxDiffBytes != 204800 {
+		t.Fatalf("DefaultMaxDiffBytes = %d, want 204800 (200 KB)", DefaultMaxDiffBytes)
+	}
 
 	cfg, err = Parse([]string{"--max-diff-bytes", "1000"})
 	if err != nil {
@@ -242,6 +247,51 @@ func TestParseMaxDiffBytesDefaultAndOverride(t *testing.T) {
 func TestParseMaxDiffBytesRejectsNegative(t *testing.T) {
 	if _, err := Parse([]string{"--max-diff-bytes", "-1"}); err == nil {
 		t.Fatal("expected an error for a negative --max-diff-bytes")
+	}
+}
+
+func TestParseTesterDiffLimitIsSynonymOfMaxDiffBytes(t *testing.T) {
+	cfg, err := Parse([]string{"--tester-diff-limit", "1000"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxDiffBytes != 1000 {
+		t.Fatalf("MaxDiffBytes = %d, want 1000 (set via --tester-diff-limit)", cfg.MaxDiffBytes)
+	}
+
+	cfg, err = Parse([]string{"--tester-diff-limit=0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxDiffBytes != 0 {
+		t.Fatalf("MaxDiffBytes = %d, want 0", cfg.MaxDiffBytes)
+	}
+}
+
+func TestParseBothDiffLimitFlagsIsError(t *testing.T) {
+	// Equal values on purpose: two names for one setting is still
+	// ambiguous intent, so it must be rejected rather than resolved.
+	_, err := Parse([]string{"--max-diff-bytes", "1", "--tester-diff-limit", "1"})
+	if err == nil {
+		t.Fatal("expected an error when both --max-diff-bytes and --tester-diff-limit are passed")
+	}
+	if errors.Is(err, ErrHelp) {
+		t.Fatalf("err = %v, want a validation error, not ErrHelp", err)
+	}
+	for _, want := range []string{"--max-diff-bytes", "--tester-diff-limit"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %s", err, want)
+		}
+	}
+}
+
+func TestParseTesterDiffLimitRejectsNegative(t *testing.T) {
+	_, err := Parse([]string{"--tester-diff-limit", "-1"})
+	if err == nil {
+		t.Fatal("expected an error for a negative --tester-diff-limit")
+	}
+	if !strings.Contains(err.Error(), "--tester-diff-limit") {
+		t.Errorf("error %q should name the flag the user actually passed", err)
 	}
 }
 

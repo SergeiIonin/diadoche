@@ -349,38 +349,19 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 
 		diffForTester := "[dry-run] diff computation skipped"
 		diffNote := ""
+		guidance := normalDiffGuidance
 		if !o.Cfg.DryRun {
-			diff, err := gitutil.DiffSinceExcluding(ctx, o.Cfg.Dir, ws.base, ws.exclude...)
+			td, err := o.buildTesterDiff(ctx, ws, plan)
 			if err != nil {
-				return false, fmt.Errorf("git diff: %w", err)
+				return false, err
 			}
-			untrackedAll, err := gitutil.UntrackedFiles(ctx, o.Cfg.Dir)
-			if err != nil {
-				return false, fmt.Errorf("git ls-files: %w", err)
-			}
-			untracked := excludeUnder(untrackedAll, ws.exclude)
-
-			if strings.TrimSpace(diff) == "" && len(untracked) == 0 {
+			if td.Empty {
 				o.Log.Printf("%s iteration %d: empty diff after worker, skipping tester (iteration unsuccessful)", specFile, iter)
 				continue
 			}
-
-			if len(diff) > o.Cfg.MaxDiffBytes {
-				stat, err := gitutil.DiffStatSinceExcluding(ctx, o.Cfg.Dir, ws.base, ws.exclude...)
-				if err != nil {
-					return false, fmt.Errorf("git diff --stat: %w", err)
-				}
-				restricted, err := gitutil.DiffSinceForFiles(ctx, o.Cfg.Dir, ws.base, implplan.Files(plan))
-				if err != nil {
-					return false, fmt.Errorf("git diff for plan files: %w", err)
-				}
-				diffForTester = stat + "\n\n" + restricted
-				diffNote = fmt.Sprintf(" (exceeded --max-diff-bytes=%d; showing `git diff --stat` plus the diff restricted to the plan's %s list)", o.Cfg.MaxDiffBytes, implplan.FilesHeading)
-			} else {
-				diffForTester = diff
-			}
-			if len(untracked) > 0 {
-				diffForTester += "\n\nUntracked files:\n" + strings.Join(untracked, "\n")
+			diffForTester, diffNote = td.Body, td.Note
+			if td.Oversized {
+				guidance = fmt.Sprintf(oversizedDiffGuidance, ws.base)
 			}
 		}
 
@@ -388,10 +369,11 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 			"Task spec (%s):\n%s\n\nImplementation plan (%s):\n%s\n\n"+
 				"Test/lint command from the plan:\n%s\n\n"+
 				"Diff of the worker's changes since this task started%s:\n%s\n\n"+
+				"%s\n\n"+
 				"Review the diff and the test results against the spec and plan. "+
 				"Write your findings to %s. If, and only if, the task is fully and correctly done, "+
 				"update the row for %q in %s to status DONE.",
-			specFile, specContent, implPlanFile, plan, testCommand, diffNote, diffForTester, reviewPath, specFile, o.Layout.StatusPath)
+			specFile, specContent, implPlanFile, plan, testCommand, diffNote, diffForTester, guidance, reviewPath, specFile, o.Layout.StatusPath)
 		testerPrompt += skillsNote
 
 		testerResult, err := o.runAgent(ctx, call, tester, testerPrompt)
