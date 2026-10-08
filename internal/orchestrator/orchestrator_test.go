@@ -173,12 +173,13 @@ func TestRunDoesNotLoopForeverOnRepeatedAgentFailures(t *testing.T) {
 		}
 	}
 
-	cfg := config.Config{Dir: dir, Iter: 1, DryRun: true} // DryRun: skip git, it's irrelevant here
+	cfg := config.Config{Dir: dir, Iter: 1} // simulate (below): skip git, it's irrelevant here
 	o := &Orchestrator{
-		Cfg:    cfg,
-		Layout: layout,
-		Runner: alwaysFailRunner{failOn: "planner"},
-		Log:    log.New(io.Discard, "", 0),
+		Cfg:      cfg,
+		Layout:   layout,
+		Runner:   alwaysFailRunner{failOn: "planner"},
+		Log:      log.New(io.Discard, "", 0),
+		simulate: true,
 	}
 
 	done := make(chan error, 1)
@@ -269,10 +270,11 @@ func TestProcessTaskResumesAtCorrectIterationAndReusesPlan(t *testing.T) {
 
 	runner := newRecordingRunner(layout)
 	o := &Orchestrator{
-		Cfg:    config.Config{Dir: dir, Iter: 3, DryRun: true},
-		Layout: layout,
-		Runner: runner,
-		Log:    log.New(io.Discard, "", 0),
+		Cfg:      config.Config{Dir: dir, Iter: 3},
+		Layout:   layout,
+		Runner:   runner,
+		Log:      log.New(io.Discard, "", 0),
+		simulate: true,
 	}
 
 	if err := o.Run(context.Background()); err != nil {
@@ -327,10 +329,11 @@ func TestProcessTaskDoesNotReuseAnInvalidPreCrashPlan(t *testing.T) {
 
 	runner := newRecordingRunner(layout)
 	o := &Orchestrator{
-		Cfg:    config.Config{Dir: dir, Iter: 3, DryRun: true},
-		Layout: layout,
-		Runner: runner,
-		Log:    log.New(io.Discard, "", 0),
+		Cfg:      config.Config{Dir: dir, Iter: 3},
+		Layout:   layout,
+		Runner:   runner,
+		Log:      log.New(io.Discard, "", 0),
+		simulate: true,
 	}
 	if err := o.Run(context.Background()); err != nil {
 		t.Fatalf("Run failed: %v", err)
@@ -386,13 +389,14 @@ func TestRunLogsResolvedModels(t *testing.T) {
 	}
 
 	var logBuf strings.Builder
-	cfg := config.Config{Dir: dir, Iter: 1, DryRun: true,
+	cfg := config.Config{Dir: dir, Iter: 1,
 		WorkerModel: agents.ModelOverride{Value: "claude-sonnet-5", Source: agents.ModelSourceFlag}}
 	o := &Orchestrator{
-		Cfg:    cfg,
-		Layout: layout,
-		Runner: newRecordingRunner(layout),
-		Log:    log.New(&logBuf, "", 0),
+		Cfg:      cfg,
+		Layout:   layout,
+		Runner:   newRecordingRunner(layout),
+		Log:      log.New(&logBuf, "", 0),
+		simulate: true,
 	}
 	if err := o.Run(context.Background()); err != nil {
 		t.Fatalf("Run failed: %v", err)
@@ -448,10 +452,11 @@ func TestRunUsesBuiltInDefaultModelsWhenNoOverride(t *testing.T) {
 
 	var logBuf strings.Builder
 	o := &Orchestrator{
-		Cfg:    config.Config{Dir: dir, Iter: 1, DryRun: true},
-		Layout: layout,
-		Runner: newRecordingRunner(layout),
-		Log:    log.New(&logBuf, "", 0),
+		Cfg:      config.Config{Dir: dir, Iter: 1},
+		Layout:   layout,
+		Runner:   newRecordingRunner(layout),
+		Log:      log.New(&logBuf, "", 0),
+		simulate: true,
 	}
 	if err := o.Run(context.Background()); err != nil {
 		t.Fatalf("Run failed: %v", err)
@@ -826,10 +831,11 @@ func TestProcessTaskRetriesPlannerWithinITERBudgetWhenPlanInvalid(t *testing.T) 
 
 	runner := &planContractRunner{layout: layout}
 	o := &Orchestrator{
-		Cfg:    config.Config{Dir: dir, Iter: 3, DryRun: true},
-		Layout: layout,
-		Runner: runner,
-		Log:    log.New(io.Discard, "", 0),
+		Cfg:      config.Config{Dir: dir, Iter: 3},
+		Layout:   layout,
+		Runner:   runner,
+		Log:      log.New(io.Discard, "", 0),
+		simulate: true,
 	}
 	if err := o.Run(context.Background()); err != nil {
 		t.Fatalf("Run failed: %v", err)
@@ -880,10 +886,11 @@ func TestProcessTaskRetriesPlannerWhenFilesSectionIsEmpty(t *testing.T) {
 		invalidContent: "## Files\n(none yet)\n\n## Test Command\ngo test ./...\n",
 	}
 	o := &Orchestrator{
-		Cfg:    config.Config{Dir: dir, Iter: 3, DryRun: true},
-		Layout: layout,
-		Runner: runner,
-		Log:    log.New(io.Discard, "", 0),
+		Cfg:      config.Config{Dir: dir, Iter: 3},
+		Layout:   layout,
+		Runner:   runner,
+		Log:      log.New(io.Discard, "", 0),
+		simulate: true,
 	}
 	if err := o.Run(context.Background()); err != nil {
 		t.Fatalf("Run failed: %v", err)
@@ -927,10 +934,11 @@ func TestProcessTaskFailsTaskIfPlanNeverBecomesValid(t *testing.T) {
 
 	runner := &planContractRunner{layout: layout, alwaysInvalid: true}
 	o := &Orchestrator{
-		Cfg:    config.Config{Dir: dir, Iter: 2, DryRun: true},
-		Layout: layout,
-		Runner: runner,
-		Log:    log.New(io.Discard, "", 0),
+		Cfg:      config.Config{Dir: dir, Iter: 2},
+		Layout:   layout,
+		Runner:   runner,
+		Log:      log.New(io.Discard, "", 0),
+		simulate: true,
 	}
 	if err := o.Run(context.Background()); err != nil {
 		t.Fatalf("Run failed: %v", err)

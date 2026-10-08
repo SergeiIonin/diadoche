@@ -32,6 +32,9 @@
 // review, every agent call's raw stdout/stderr and the task's final.diff.
 // Writing them is best effort: a failure is a warning, never the end of
 // the run.
+//
+// --dry-run never changes state: it walks the queue read-only and prints
+// the prompts each agent would get (see dryrun.go).
 package orchestrator
 
 import (
@@ -117,6 +120,18 @@ type Orchestrator struct {
 	// run.log and the tasks' artifacts; nil in --dry-run or when it
 	// couldn't be created (every runlog method is a no-op on nil).
 	run *runlog.Run
+
+	// simulate is for tests only: run the whole loop like a real run but
+	// without git, usage.jsonl, run-state.json or run artifacts — what
+	// --dry-run used to do. Real --dry-run is the read-only walk in
+	// dryrun.go.
+	simulate bool
+}
+
+// offline reports whether the loop runs without git, usage.jsonl,
+// run-state.json and run artifacts: in --dry-run, or simulated by a test.
+func (o *Orchestrator) offline() bool {
+	return o.Cfg.DryRun || o.simulate
 }
 
 func New(cfg config.Config) *Orchestrator {
@@ -140,11 +155,14 @@ func New(cfg config.Config) *Orchestrator {
 }
 
 func (o *Orchestrator) Run(ctx context.Context) (err error) {
+	if o.Cfg.DryRun {
+		return o.dryRun(ctx)
+	}
 	if err := o.Layout.Ensure(); err != nil {
 		return fmt.Errorf("ensure layout: %w", err)
 	}
 
-	if !o.Cfg.DryRun {
+	if !o.offline() {
 		if err := gitutil.EnsureRepo(ctx, o.Cfg.Dir); err != nil {
 			return fmt.Errorf("ensure git repo: %w", err)
 		}
@@ -168,55 +186,17 @@ func (o *Orchestrator) Run(ctx context.Context) (err error) {
 		o.event("", 0, "", "run_end", runlog.F("result", result))
 	}()
 
-	matchedSkills, err := skills.Resolve(o.Layout.SkillsDir, o.Cfg.Langs, o.Cfg.Frameworks)
+	planner, worker, tester, err := o.loadAgents()
 	if err != nil {
-		return fmt.Errorf("resolve skills: %w", err)
-	}
-	if len(matchedSkills) > 0 {
-		o.Log.Printf("skills in scope: %s", strings.Join(matchedSkills, ", "))
-	}
-
-	planner, err := agents.LoadOrDefault(o.Layout.AgentsDir, "planner")
-	if err != nil {
-		return fmt.Errorf("load planner agent: %w", err)
-	}
-	if err := agents.ResolveModel(planner, o.Cfg.PlannerModel); err != nil {
 		return err
 	}
-	worker, err := agents.LoadOrDefault(o.Layout.AgentsDir, "worker")
-	if err != nil {
-		return fmt.Errorf("load worker agent: %w", err)
-	}
-	if err := agents.ResolveModel(worker, o.Cfg.WorkerModel); err != nil {
-		return err
-	}
-	tester, err := agents.LoadOrDefault(o.Layout.AgentsDir, "tester")
-	if err != nil {
-		return fmt.Errorf("load tester agent: %w", err)
-	}
-	if err := agents.ResolveModel(tester, o.Cfg.TesterModel); err != nil {
-		return err
-	}
-	o.Log.Printf("models: planner=%s worker=%s tester=%s", planner.ModelDescription(), worker.ModelDescription(), tester.ModelDescription())
-
-	// One prefix for the whole run, resolved once and shared byte for byte
-	// by all three agents: that identity is what lets the API's prompt
-	// cache serve the common context to the next agent instead of charging
-	// for it again (see docs/prompt-caching.md).
-	basePrefix, prefixSource, err := agents.LoadPrefixOrDefault(o.Layout.Root)
-	if err != nil {
-		return fmt.Errorf("load prompt prefix: %w", err)
-	}
-	prefix := agents.BuildPrefix(basePrefix, matchedSkills)
-	planner.Prefix, worker.Prefix, tester.Prefix = prefix, prefix, prefix
-	o.Log.Printf("prompt prefix: %d bytes (source: %s)", len(prefix), prefixSource)
 
 	// Usage accounting writes real claude-CLI JSON output to disk; skip it
 	// entirely in --dry-run, where there's no real usage to record and no
 	// guarantee the project even has a .claude/diadoche directory worth
 	// writing into yet.
 	var uw *usage.Writer
-	if !o.Cfg.DryRun {
+	if !o.offline() {
 		usagePath := filepath.Join(o.Layout.Root, "usage.jsonl")
 		costs, err := usage.LoadCosts(usagePath)
 		if err != nil {
@@ -306,6 +286,54 @@ func (o *Orchestrator) Run(ctx context.Context) (err error) {
 	}
 }
 
+// loadAgents resolves the skills in scope, loads planner, worker and tester
+// with their models, and gives all three the run's shared prompt prefix.
+func (o *Orchestrator) loadAgents() (planner, worker, tester *agents.Agent, err error) {
+	matchedSkills, err := skills.Resolve(o.Layout.SkillsDir, o.Cfg.Langs, o.Cfg.Frameworks)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("resolve skills: %w", err)
+	}
+	if len(matchedSkills) > 0 {
+		o.Log.Printf("skills in scope: %s", strings.Join(matchedSkills, ", "))
+	}
+
+	planner, err = agents.LoadOrDefault(o.Layout.AgentsDir, "planner")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load planner agent: %w", err)
+	}
+	if err := agents.ResolveModel(planner, o.Cfg.PlannerModel); err != nil {
+		return nil, nil, nil, err
+	}
+	worker, err = agents.LoadOrDefault(o.Layout.AgentsDir, "worker")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load worker agent: %w", err)
+	}
+	if err := agents.ResolveModel(worker, o.Cfg.WorkerModel); err != nil {
+		return nil, nil, nil, err
+	}
+	tester, err = agents.LoadOrDefault(o.Layout.AgentsDir, "tester")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load tester agent: %w", err)
+	}
+	if err := agents.ResolveModel(tester, o.Cfg.TesterModel); err != nil {
+		return nil, nil, nil, err
+	}
+	o.Log.Printf("models: planner=%s worker=%s tester=%s", planner.ModelDescription(), worker.ModelDescription(), tester.ModelDescription())
+
+	// One prefix for the whole run, resolved once and shared byte for byte
+	// by all three agents: that identity is what lets the API's prompt
+	// cache serve the common context to the next agent instead of charging
+	// for it again (see docs/prompt-caching.md).
+	basePrefix, prefixSource, err := agents.LoadPrefixOrDefault(o.Layout.Root)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load prompt prefix: %w", err)
+	}
+	prefix := agents.BuildPrefix(basePrefix, matchedSkills)
+	planner.Prefix, worker.Prefix, tester.Prefix = prefix, prefix, prefix
+	o.Log.Printf("prompt prefix: %d bytes (source: %s)", len(prefix), prefixSource)
+	return planner, worker, tester, nil
+}
+
 func (o *Orchestrator) printUsageSummary(uw *usage.Writer) {
 	if uw == nil || uw.Summary.Calls() == 0 {
 		return
@@ -332,7 +360,7 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 	resume := o.takeResume(specFile)
 
 	var ws *workspace
-	if !o.Cfg.DryRun {
+	if !o.offline() {
 		if resume != nil {
 			o.seedBaseFromResume(num, resume)
 		}
@@ -544,13 +572,7 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 		o.setAgentState(iter, first, runstate.AgentPending)
 
 		if !reusingPlan {
-			plannerPrompt := fmt.Sprintf("Task spec (%s):\n%s\n", specFile, specContent)
-			if priorReview != "" {
-				plannerPrompt += fmt.Sprintf("\nFeedback from the previous review, address every point:\n%s\n", priorReview)
-			}
-			plannerPrompt += fmt.Sprintf("\nWrite (or update) the implementation plan to %s.", implPlanPath)
-
-			result, err := o.runStep(ctx, call, planner, plannerPrompt)
+			result, err := o.runStep(ctx, call, planner, plannerPrompt(specFile, specContent, priorReview, implPlanPath))
 			o.copyArtifact(specFile, num, fmt.Sprintf("iter-%d-IMPL_PLAN.md", iter), implPlanPath)
 			if err := o.checkBudgets(specFile, uw); err != nil {
 				return false, err
@@ -599,13 +621,7 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 		plan := string(implPlanBytes)
 
 		if !skipWorker {
-			workerPrompt := fmt.Sprintf("Task spec (%s):\n%s\n\nImplementation plan (%s):\n%s\n", specFile, specContent, implPlanFile, plan)
-			if priorReview != "" {
-				workerPrompt += fmt.Sprintf("\nFeedback from the previous review, address every point:\n%s\n", priorReview)
-			}
-			workerPrompt += "\nImplement the plan in this repository."
-
-			workerResult, err := o.runStep(ctx, call, worker, workerPrompt)
+			workerResult, err := o.runStep(ctx, call, worker, workerPrompt(specFile, specContent, implPlanFile, plan, priorReview))
 			if err := o.checkBudgets(specFile, uw); err != nil {
 				return false, err
 			}
@@ -625,7 +641,7 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 		diffForTester := "[dry-run] diff computation skipped"
 		diffNote := ""
 		guidance := normalDiffGuidance
-		if !o.Cfg.DryRun {
+		if !o.offline() {
 			td, err := o.buildTesterDiff(ctx, ws, plan)
 			if err != nil {
 				return false, err
@@ -643,7 +659,7 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 
 		// The red-green tester note becomes its own paragraph after the
 		// diff guidance; without one the prompt is unchanged.
-		if o.Cfg.RedGreen && !o.Cfg.DryRun {
+		if o.Cfg.RedGreen && !o.offline() {
 			rg, err := o.redGreenCheck(ctx, specFile, specContent, ws, plan)
 			if err != nil {
 				return false, fmt.Errorf("red-green check: %w", err)
@@ -662,17 +678,12 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 			}
 		}
 
-		testerPrompt := fmt.Sprintf(
-			"Task spec (%s):\n%s\n\nImplementation plan (%s):\n%s\n\n"+
-				"Test/lint command from the plan:\n%s\n\n"+
-				"Diff of the worker's changes since this task started%s:\n%s\n\n"+
-				"%s\n\n"+
-				"Review the diff and the test results against the spec and plan. "+
-				"Write your findings to %s. If, and only if, the task is fully and correctly done, "+
-				"update the row for %q in %s to status DONE.",
-			specFile, specContent, implPlanFile, plan, testCommand, diffNote, diffForTester, guidance, reviewPath, specFile, o.Layout.StatusPath)
-
-		testerResult, err := o.runStep(ctx, call, tester, testerPrompt)
+		prompt := testerPrompt(testerPromptInput{
+			specFile: specFile, specContent: specContent, implPlanFile: implPlanFile, plan: plan,
+			testCommand: testCommand, diffNote: diffNote, diff: diffForTester, guidance: guidance,
+			reviewPath: reviewPath, statusPath: o.Layout.StatusPath,
+		})
+		testerResult, err := o.runStep(ctx, call, tester, prompt)
 		if err != nil {
 			return false, fmt.Errorf("tester: %w", err)
 		}
@@ -922,7 +933,7 @@ func lastCompletedIteration(specDir, num string, maxIter int) int {
 // commit. A no-op in --dry-run mode, and a no-op if there's nothing to
 // commit (e.g. the task only involved discussion, no file changes).
 func (o *Orchestrator) commitDone(ctx context.Context, specFile string) error {
-	if o.Cfg.DryRun {
+	if o.offline() {
 		o.Log.Printf("[dry-run] would commit: task %s done", specFile)
 		return nil
 	}

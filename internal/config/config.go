@@ -438,7 +438,9 @@ const helpExamples = `EXAMPLES
     Restrict which skills are mentioned to the agents:
         diadoche --dir /path/to/project --langs go,typescript --frameworks gin,next
 
-    Preview what would happen without invoking claude at all:
+    Print the prompt planner, worker and tester would get in iteration 1
+    for every pending task, read-only: no claude call, no file written,
+    git untouched:
         diadoche --dir /path/to/project --dry-run
 
     Split a raw, multi-part task file into atomic specs:
@@ -569,7 +571,7 @@ func Parse(args []string) (*Config, error) {
 	iter := fs.Int("ITER", DefaultIter, fmt.Sprintf("max iterations per task (1-%d)", MaxIter))
 	langs := fs.String("langs", "", "comma-separated languages, matched against .claude/skills subfolders")
 	frameworks := fs.String("frameworks", "", "comma-separated frameworks, matched against .claude/skills subfolders")
-	dryRun := fs.Bool("dry-run", false, "log what would be sent to each agent instead of invoking the claude CLI")
+	dryRun := fs.Bool("dry-run", false, "walk the queue read-only and print the prompt each agent (planner, worker, tester) would receive for iteration 1, without invoking claude, writing any file or touching git")
 	claudeBin := fs.String("claude-bin", "claude", "path to the claude CLI binary")
 	preprocess := fs.Bool("preprocess", false, "split a raw task file into atomic task specs and exit, instead of running the main loop")
 	task := fs.String("task", "", "path to the raw task file for --preprocess, e.g. .claude/diadoche/spec/raw/foo.md")

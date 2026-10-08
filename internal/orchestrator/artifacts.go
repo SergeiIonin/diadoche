@@ -14,10 +14,11 @@ import (
 const runsDirName = "runs"
 
 // openRun creates this run's directory and run.log, and keeps the runs
-// directory out of git. Nothing is written in --dry-run. A failure is
+// directory out of git. Nothing is written in --dry-run (which never
+// gets here, see dryrun.go) or in a test's simulated loop. A failure is
 // only a warning: the run goes on without run.log and artifacts.
 func (o *Orchestrator) openRun(ctx context.Context) {
-	if o.Cfg.DryRun {
+	if o.offline() {
 		return
 	}
 	runsDir := filepath.Join(o.Layout.Root, runsDirName)

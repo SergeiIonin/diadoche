@@ -51,8 +51,9 @@ func (o *Orchestrator) gracefulCtx(ctx context.Context) (context.Context, contex
 }
 
 // initRunState sets up run-state.json once per run, after the first queue
-// sync (queue is QUEUE.md then). It is off in --dry-run, so a dry run never
-// makes a real one resume from fake progress. With --fresh the saved state
+// sync (queue is QUEUE.md then). It is off in --dry-run (which never gets
+// here, see dryrun.go) and in a test's simulated loop, so neither makes a
+// real run resume from fake progress. With --fresh the saved state
 // is ignored; otherwise a saved, unfinished task that still agrees with
 // STATUS.md and QUEUE.md becomes o.resume and is moved to the head of the
 // queue. A state that doesn't agree is ignored with a warning: the spec/
@@ -62,7 +63,7 @@ func (o *Orchestrator) gracefulCtx(ctx context.Context) (context.Context, contex
 // of git (.git/info/exclude): the bookkeeping commits of .claude/diadoche
 // never pick it up and the tree stays clean.
 func (o *Orchestrator) initRunState(ctx context.Context, queue []string) {
-	if o.Cfg.DryRun {
+	if o.offline() {
 		return
 	}
 	o.runID = runstate.NewRunID(o.now())

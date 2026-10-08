@@ -50,8 +50,13 @@ Flags:
 - `--langs`, `--frameworks` — comma-separated; used to hint agents which
   `.claude/skills` subfolders are relevant. Without these flags, agents are
   told about every skill that's present.
-- `--dry-run` — don't invoke `claude`, just print what would be sent to
-  each agent.
+- `--dry-run` — walk the queue read-only: for every pending task, in queue
+  order, print the prompts planner, worker and tester would get in
+  iteration 1 (the plan and the diff, which don't exist in a dry run, are
+  shown as labelled `[dry-run placeholder]`s). `claude` is not invoked,
+  nothing is written (`STATUS.md`, `QUEUE.md`, spec files, `usage.jsonl`,
+  run state, run artifacts) and git is not touched; the run ends with
+  `dry-run: no state was changed`.
 - `--claude-bin` — path to the `claude` binary (default `claude` on `$PATH`).
 - `--preprocess` + `--task <path>` — preprocessor mode, see below.
 - `--initialize <project-path>` — scaffold `.claude/` in a project and

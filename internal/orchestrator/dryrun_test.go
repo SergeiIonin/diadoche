@@ -1,0 +1,260 @@
+package orchestrator
+
+import (
+	"bytes"
+	"context"
+	"io/fs"
+	"log"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"diadoche/internal/agents"
+	"diadoche/internal/config"
+	"diadoche/internal/gitutil"
+	"diadoche/internal/specs"
+)
+
+// dryRunRepo is a temp git repo with two task specs, 001_a.md and 002_b.md,
+// synced into STATUS.md/QUEUE.md (both QUEUED) and committed, plus one
+// untracked file so `git status --porcelain` has something to compare.
+func dryRunRepo(t *testing.T) (string, specs.Layout) {
+	t.Helper()
+	requireGit(t)
+	setTestGitEnv(t)
+	dir := t.TempDir()
+	ctx := context.Background()
+	if err := gitutil.EnsureRepo(ctx, dir); err != nil {
+		t.Fatal(err)
+	}
+	layout := specs.NewLayout(dir)
+	writeAgentFixtures(t, layout.AgentsDir)
+	writeFile(t, filepath.Join(layout.SpecDir, "001_a.md"), "# A\ndo a\n")
+	writeFile(t, filepath.Join(layout.SpecDir, "002_b.md"), "# B\ndo b\n")
+	if _, _, err := specs.Sync(layout); err != nil {
+		t.Fatal(err)
+	}
+	if err := gitutil.CommitAll(ctx, dir, "seed"); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "untracked.txt"), "not committed\n")
+	return dir, layout
+}
+
+func newDryRunOrchestrator(dir string, layout specs.Layout, runner agents.Runner, logger *log.Logger) *Orchestrator {
+	return &Orchestrator{
+		Cfg:    config.Config{Dir: dir, Iter: 3, DryRun: true, MaxDiffBytes: config.DefaultMaxDiffBytes},
+		Layout: layout,
+		Runner: runner,
+		Log:    logger,
+	}
+}
+
+// treeSnapshot maps every file under dir (outside .git, plus
+// .git/info/exclude) to its content.
+func treeSnapshot(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	snap := map[string]string{}
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(dir, path)
+		if d.IsDir() {
+			if rel == ".git" {
+				return fs.SkipDir
+			}
+			snap[rel+"/"] = ""
+			return nil
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		snap[rel] = string(b)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, ".git", "info", "exclude")); err == nil {
+		snap[".git/info/exclude"] = string(b)
+	}
+	return snap
+}
+
+func gitSnapshot(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	return map[string]string{
+		"status":   gitOut(t, dir, "status", "--porcelain", "--untracked-files=all"),
+		"branch":   gitOut(t, dir, "branch", "-a"),
+		"worktree": gitOut(t, dir, "worktree", "list"),
+		"head":     gitOut(t, dir, "rev-parse", "HEAD"),
+		"stash":    gitOut(t, dir, "stash", "list"),
+	}
+}
+
+func diffSnapshots(t *testing.T, what string, before, after map[string]string) {
+	t.Helper()
+	for k, v := range before {
+		if a, ok := after[k]; !ok {
+			t.Errorf("%s: %s disappeared", what, k)
+		} else if a != v {
+			t.Errorf("%s: %s changed:\n%s\nwant:\n%s", what, k, a, v)
+		}
+	}
+	for k := range after {
+		if _, ok := before[k]; !ok {
+			t.Errorf("%s: %s appeared", what, k)
+		}
+	}
+}
+
+func TestDryRunLeavesStateAndGitUntouched(t *testing.T) {
+	dir, layout := dryRunRepo(t)
+	filesBefore, gitBefore := treeSnapshot(t, dir), gitSnapshot(t, dir)
+	if gitBefore["status"] == "" {
+		t.Fatal("fixture: git status is empty, the comparison would be meaningless")
+	}
+
+	var buf bytes.Buffer
+	logger := log.New(&buf, "", 0)
+	o := newDryRunOrchestrator(dir, layout, agents.DryRunRunner{Log: logger}, logger)
+	if err := o.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	diffSnapshots(t, "files", filesBefore, treeSnapshot(t, dir))
+	diffSnapshots(t, "git", gitBefore, gitSnapshot(t, dir))
+	for _, spec := range []string{"001_a.md", "002_b.md"} {
+		if st, err := specs.GetStatus(layout, spec); err != nil || st != specs.StatusQueued {
+			t.Errorf("%s status = %q, %v; want QUEUED", spec, st, err)
+		}
+	}
+	if !strings.Contains(buf.String(), "dry-run: no state was changed") {
+		t.Errorf("log lacks the final dry-run line:\n%s", buf.String())
+	}
+}
+
+// promptRecorder records every agent call in order.
+type promptRecorder struct {
+	agents  []string
+	prompts []string
+}
+
+func (r *promptRecorder) Run(_ context.Context, _ string, a *agents.Agent, prompt string) (agents.RunResult, error) {
+	r.agents = append(r.agents, a.Name)
+	r.prompts = append(r.prompts, prompt)
+	return agents.RunResult{}, nil
+}
+
+func TestDryRunPrintsEveryAgentPromptPerTask(t *testing.T) {
+	dir, layout := dryRunRepo(t)
+	rec := &promptRecorder{}
+	if err := newDryRunOrchestrator(dir, layout, rec, log.New(&bytes.Buffer{}, "", 0)).Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if got, want := strings.Join(rec.agents, " "), "planner worker tester planner worker tester"; got != want {
+		t.Fatalf("agent calls = %q, want %q", got, want)
+	}
+	for i, task := range []struct{ spec, num string }{{"001_a.md", "001"}, {"002_b.md", "002"}} {
+		planner, worker, tester := rec.prompts[3*i], rec.prompts[3*i+1], rec.prompts[3*i+2]
+		for _, p := range []string{planner, worker, tester} {
+			if !strings.Contains(p, "Task spec ("+task.spec+")") {
+				t.Errorf("prompt for %s lacks its task spec:\n%s", task.spec, p)
+			}
+		}
+		if !strings.Contains(planner, "Write (or update) the implementation plan to") || !strings.Contains(planner, task.num+"_IMPL_PLAN.md") {
+			t.Errorf("planner prompt for %s:\n%s", task.spec, planner)
+		}
+		if !strings.Contains(worker, dryRunPlan(task.num+"_IMPL_PLAN.md")) || !strings.Contains(worker, "Implement the plan in this repository.") {
+			t.Errorf("worker prompt for %s:\n%s", task.spec, worker)
+		}
+		for _, want := range []string{dryRunPlan(task.num + "_IMPL_PLAN.md"), dryRunTestCommand, dryRunDiff, task.num + "_REVIEW_1.md"} {
+			if !strings.Contains(tester, want) {
+				t.Errorf("tester prompt for %s lacks %q:\n%s", task.spec, want, tester)
+			}
+		}
+	}
+
+	// The production runner prints them.
+	var buf bytes.Buffer
+	logger := log.New(&buf, "", 0)
+	if err := newDryRunOrchestrator(dir, layout, agents.DryRunRunner{Log: logger}, logger).Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{"agent=planner", "agent=worker", "agent=tester", "Task spec (001_a.md)", "Task spec (002_b.md)", dryRunPlaceholder} {
+		if !strings.Contains(out, want) {
+			t.Errorf("dry-run output lacks %q", want)
+		}
+	}
+}
+
+func TestDryRunIncludesUnsyncedTaskWithoutWritingStatus(t *testing.T) {
+	dir := t.TempDir()
+	layout := specs.NewLayout(dir)
+	writeAgentFixtures(t, layout.AgentsDir)
+	writeFile(t, filepath.Join(layout.SpecDir, "001_new.md"), "# New\n")
+
+	rec := &promptRecorder{}
+	if err := newDryRunOrchestrator(dir, layout, rec, log.New(&bytes.Buffer{}, "", 0)).Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := strings.Join(rec.agents, " "); got != "planner worker tester" {
+		t.Errorf("agent calls = %q, want one round for 001_new.md", got)
+	}
+	for _, p := range []string{layout.StatusPath, layout.QueuePath} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("%s exists after a dry run (stat err = %v)", p, err)
+		}
+	}
+}
+
+func TestDryRunSkipsDoneAndFailedTasks(t *testing.T) {
+	dir := t.TempDir()
+	layout := specs.NewLayout(dir)
+	writeAgentFixtures(t, layout.AgentsDir)
+	for _, f := range []string{"001_done.md", "002_failed.md", "003_queued.md"} {
+		writeFile(t, filepath.Join(layout.SpecDir, f), "# "+f+"\n")
+	}
+	if err := specs.WriteStatus(layout.StatusPath, []specs.Row{
+		{Num: "001", Spec: "001_done.md", Status: specs.StatusDone},
+		{Num: "002", Spec: "002_failed.md", Status: specs.StatusFailed},
+		{Num: "003", Spec: "003_queued.md", Status: specs.StatusQueued},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := &promptRecorder{}
+	if err := newDryRunOrchestrator(dir, layout, rec, log.New(&bytes.Buffer{}, "", 0)).Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(rec.prompts) != 3 {
+		t.Fatalf("got %d agent calls, want 3", len(rec.prompts))
+	}
+	for _, p := range rec.prompts {
+		if !strings.Contains(p, "Task spec (003_queued.md)") {
+			t.Errorf("prompt is not for 003_queued.md:\n%s", p)
+		}
+	}
+}
+
+func TestPromptsIncludeReviewFeedbackOnlyWhenGiven(t *testing.T) {
+	const feedback = "Feedback from the previous review"
+	spec := []byte("# Spec\n")
+	if p := plannerPrompt("001_a.md", spec, "", "/x/001_IMPL_PLAN.md"); strings.Contains(p, feedback) {
+		t.Errorf("planner prompt without a review has feedback:\n%s", p)
+	}
+	if p := plannerPrompt("001_a.md", spec, "fix X", "/x/001_IMPL_PLAN.md"); !strings.Contains(p, feedback+", address every point:\nfix X\n") {
+		t.Errorf("planner prompt lacks the review:\n%s", p)
+	}
+	if p := workerPrompt("001_a.md", spec, "001_IMPL_PLAN.md", "plan", ""); strings.Contains(p, feedback) {
+		t.Errorf("worker prompt without a review has feedback:\n%s", p)
+	}
+	if p := workerPrompt("001_a.md", spec, "001_IMPL_PLAN.md", "plan", "fix X"); !strings.Contains(p, feedback+", address every point:\nfix X\n") {
+		t.Errorf("worker prompt lacks the review:\n%s", p)
+	}
+}

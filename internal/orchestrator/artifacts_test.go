@@ -339,6 +339,7 @@ func TestArtifactWriteErrorDoesNotStopRun(t *testing.T) {
 
 func TestDryRunWritesNoRunDir(t *testing.T) {
 	o, _, _, _ := newPauseFixture(t, config.Config{Iter: 1, DryRun: true}, "001_example.md")
+	o.Runner = agents.DryRunRunner{Log: o.Log}
 	if err := o.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}

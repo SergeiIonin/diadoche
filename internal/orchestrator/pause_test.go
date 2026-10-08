@@ -135,6 +135,15 @@ func newPauseFixture(t *testing.T, cfg config.Config, specFiles ...string) (*Orc
 	return o, runner, sleeper, &buf
 }
 
+// newSimulatedPauseFixture is newPauseFixture whose Run goes through the
+// whole loop without git, usage.jsonl, run state or run artifacts.
+func newSimulatedPauseFixture(t *testing.T, cfg config.Config, specFiles ...string) (*Orchestrator, *pauseRunner, *fakeSleep, *bytes.Buffer) {
+	t.Helper()
+	o, runner, sleeper, buf := newPauseFixture(t, cfg, specFiles...)
+	o.simulate = true
+	return o, runner, sleeper, buf
+}
+
 // assertNoRestarterTrigger checks that no log line would make
 // diadoche-restarter kill diadoche.
 func assertNoRestarterTrigger(t *testing.T, logText string) {
@@ -147,7 +156,7 @@ func assertNoRestarterTrigger(t *testing.T, logText string) {
 }
 
 func TestLimitRefusalsPauseWithoutSpendingAnIteration(t *testing.T) {
-	o, runner, sleeper, buf := newPauseFixture(t, config.Config{Iter: 3, DryRun: true}, "001_example.md")
+	o, runner, sleeper, buf := newSimulatedPauseFixture(t, config.Config{Iter: 3}, "001_example.md")
 	runner.refuseAgent = "planner"
 	runner.refusals = []string{sessionLimitText, sessionLimitText}
 
@@ -178,7 +187,7 @@ func TestLimitRefusalsPauseWithoutSpendingAnIteration(t *testing.T) {
 }
 
 func TestRateLimitIsPausedToo(t *testing.T) {
-	o, runner, sleeper, buf := newPauseFixture(t, config.Config{Iter: 1, DryRun: true}, "001_example.md")
+	o, runner, sleeper, buf := newSimulatedPauseFixture(t, config.Config{Iter: 1}, "001_example.md")
 	runner.refuseAgent = "worker"
 	runner.refusals = []string{rateLimitText}
 
@@ -247,7 +256,7 @@ func TestPauseBackoffDoublesUpToAnHourAndResetsAfterSuccess(t *testing.T) {
 
 func TestPauseWaitsUntilTheResetTimeFromTheReply(t *testing.T) {
 	now := time.Date(2026, 10, 8, 15, 0, 0, 0, time.UTC)
-	o, runner, sleeper, buf := newPauseFixture(t, config.Config{Iter: 1, DryRun: true}, "001_example.md")
+	o, runner, sleeper, buf := newSimulatedPauseFixture(t, config.Config{Iter: 1}, "001_example.md")
 	o.Now = func() time.Time { return now }
 	runner.refuseAgent = "planner"
 	runner.refusals = []string{sessionLimitText + " · resets 7pm (UTC)"}
@@ -277,7 +286,7 @@ func TestPauseWaitsUntilTheResetTimeFromTheReply(t *testing.T) {
 
 func TestPauseWaitsUntilTheLegacyEpochResetTime(t *testing.T) {
 	const ts = 1790000000
-	o, runner, sleeper, _ := newPauseFixture(t, config.Config{Iter: 1, DryRun: true}, "001_example.md")
+	o, runner, sleeper, _ := newSimulatedPauseFixture(t, config.Config{Iter: 1}, "001_example.md")
 	o.Now = func() time.Time { return time.Unix(ts, 0).Add(-90 * time.Minute) }
 	runner.refuseAgent = "tester"
 	runner.refusals = []string{fmt.Sprintf("Claude AI usage limit reached|%d", ts)}
@@ -294,7 +303,7 @@ func TestPauseWaitsUntilTheLegacyEpochResetTime(t *testing.T) {
 }
 
 func TestCancelDuringPauseLeavesTaskPaused(t *testing.T) {
-	o, runner, sleeper, buf := newPauseFixture(t, config.Config{Iter: 2, DryRun: true}, "001_example.md")
+	o, runner, sleeper, buf := newSimulatedPauseFixture(t, config.Config{Iter: 2}, "001_example.md")
 	runner.refuseAgent = "planner"
 	runner.refusals = []string{sessionLimitText}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -344,7 +353,7 @@ func TestDefaultPauseSleepStopsOnCancel(t *testing.T) {
 }
 
 func TestOrdinaryAgentErrorStillSpendsTheIteration(t *testing.T) {
-	o, runner, sleeper, _ := newPauseFixture(t, config.Config{Iter: 2, DryRun: true}, "001_example.md")
+	o, runner, sleeper, _ := newSimulatedPauseFixture(t, config.Config{Iter: 2}, "001_example.md")
 	runner.failWorker = errors.New("agent worker: exit status 1: panic: boom")
 
 	if err := o.Run(context.Background()); err != nil {

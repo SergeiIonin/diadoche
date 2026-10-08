@@ -270,9 +270,37 @@ func Sync(l Layout) (rows []Row, queue []string, err error) {
 	if err = l.Ensure(); err != nil {
 		return
 	}
-	rows, err = ReadStatus(l.StatusPath)
+	rows, err = mergedRows(l)
 	if err != nil {
 		return
+	}
+	if err = WriteStatus(l.StatusPath, rows); err != nil {
+		return
+	}
+	queue = pendingQueue(rows)
+	err = WriteQueue(l.QueuePath, queue)
+	return
+}
+
+// PendingQueue returns the queue Sync would build — every pending task in
+// ascending task number, including task files not in STATUS.md yet —
+// without writing anything: no STATUS.md, no QUEUE.md, not even the spec
+// directory. Used by --dry-run.
+func PendingQueue(l Layout) ([]string, error) {
+	rows, err := mergedRows(l)
+	if err != nil {
+		return nil, err
+	}
+	return pendingQueue(rows), nil
+}
+
+// mergedRows reads STATUS.md and appends every discovered task file it
+// doesn't list yet as a QUEUED row. It writes nothing; a missing STATUS.md
+// or spec directory is no rows/files.
+func mergedRows(l Layout) ([]Row, error) {
+	rows, err := ReadStatus(l.StatusPath)
+	if err != nil {
+		return nil, err
 	}
 	known := map[string]bool{}
 	for _, r := range rows {
@@ -281,7 +309,7 @@ func Sync(l Layout) (rows []Row, queue []string, err error) {
 
 	files, err := DiscoverTaskFiles(l.SpecDir)
 	if err != nil {
-		return
+		return nil, err
 	}
 	for _, f := range files {
 		if known[f] {
@@ -290,13 +318,7 @@ func Sync(l Layout) (rows []Row, queue []string, err error) {
 		rows = append(rows, Row{Num: TaskNumber(f), Spec: f, Status: StatusQueued})
 		known[f] = true
 	}
-
-	if err = WriteStatus(l.StatusPath, rows); err != nil {
-		return
-	}
-	queue = pendingQueue(rows)
-	err = WriteQueue(l.QueuePath, queue)
-	return
+	return rows, nil
 }
 
 // pendingQueue returns the specs of every QUEUED/IN_PROGRESS/PAUSED row in rows

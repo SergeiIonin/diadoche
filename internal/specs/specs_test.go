@@ -412,3 +412,84 @@ func TestWriteFileAtomicReplacesViaRename(t *testing.T) {
 		t.Errorf("temp files left behind: %v", leftovers)
 	}
 }
+
+func TestPendingQueueWritesNothing(t *testing.T) {
+	dir := t.TempDir()
+	l := NewLayout(dir)
+	if err := os.MkdirAll(l.SpecDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteStatus(l.StatusPath, []Row{
+		{Num: "003", Spec: "003_c.md", Status: StatusInProgress},
+		{Num: "001", Spec: "001_a.md", Status: StatusQueued},
+		{Num: "002", Spec: "002_b.md", Status: StatusDone},
+		{Num: "004", Spec: "004_d.md", Status: StatusFailed},
+		{Num: "005", Spec: "005_e.md", Status: StatusPaused},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 006 is a task file STATUS.md doesn't list yet.
+	for _, f := range []string{"001_a.md", "002_b.md", "003_c.md", "004_d.md", "005_e.md", "006_f.md"} {
+		if err := os.WriteFile(filepath.Join(l.SpecDir, f), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	statusBefore, err := os.ReadFile(l.StatusPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entriesBefore, err := os.ReadDir(l.SpecDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	queue, err := PendingQueue(l)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	statusAfter, err := os.ReadFile(l.StatusPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(statusAfter) != string(statusBefore) {
+		t.Fatalf("STATUS.md changed:\n%s\nwant:\n%s", statusAfter, statusBefore)
+	}
+	if _, err := os.Stat(l.QueuePath); !os.IsNotExist(err) {
+		t.Fatalf("QUEUE.md was created (stat err = %v)", err)
+	}
+	entriesAfter, err := os.ReadDir(l.SpecDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entriesAfter) != len(entriesBefore) {
+		t.Fatalf("spec dir has %d entries after PendingQueue, want %d", len(entriesAfter), len(entriesBefore))
+	}
+
+	_, synced, err := Sync(l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"001_a.md", "003_c.md", "005_e.md", "006_f.md"}
+	if strings.Join(queue, ",") != strings.Join(want, ",") {
+		t.Fatalf("PendingQueue = %v, want %v", queue, want)
+	}
+	if strings.Join(queue, ",") != strings.Join(synced, ",") {
+		t.Fatalf("PendingQueue = %v, Sync queue = %v", queue, synced)
+	}
+}
+
+func TestPendingQueueOnMissingSpecDir(t *testing.T) {
+	dir := t.TempDir()
+	l := NewLayout(dir)
+	queue, err := PendingQueue(l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(queue) != 0 {
+		t.Fatalf("queue = %v, want empty", queue)
+	}
+	if _, err := os.Stat(l.Root); !os.IsNotExist(err) {
+		t.Fatalf("%s was created (stat err = %v)", l.Root, err)
+	}
+}
