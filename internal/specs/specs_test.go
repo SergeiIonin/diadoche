@@ -304,3 +304,45 @@ func TestSyncDoesNotRequeueBlocked(t *testing.T) {
 		t.Errorf("BLOCKED row not persisted: %+v", persisted[0])
 	}
 }
+
+func TestReadQueueDropsTrailingNoTestsMarker(t *testing.T) {
+	dir := t.TempDir()
+	l := NewLayout(dir)
+	if err := l.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(l.QueuePath, []byte("- 002_x.md [no-tests]\n- 003_y.md\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadQueue(l.QueuePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != "002_x.md" || got[1] != "003_y.md" {
+		t.Fatalf("ReadQueue = %q, want [002_x.md 003_y.md]", got)
+	}
+	next, err := PopQueue(l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != "002_x.md" {
+		t.Fatalf("PopQueue = %q, want 002_x.md", next)
+	}
+}
+
+func TestHasNoTestsMarker(t *testing.T) {
+	cases := []struct {
+		spec string
+		want bool
+	}{
+		{"# 001. Task\n\n" + NoTestsMarker + "\n\nbody\n", true},
+		{"# 001. Task\n  <!--   diadoche:  no-tests   -->  \n", true},
+		{"# 001. Task\n\nno tests needed\n", false},
+		{"text <!-- diadoche: no-tests --> inline\n", false},
+	}
+	for _, c := range cases {
+		if got := HasNoTestsMarker([]byte(c.spec)); got != c.want {
+			t.Errorf("HasNoTestsMarker(%q) = %v, want %v", c.spec, got, c.want)
+		}
+	}
+}

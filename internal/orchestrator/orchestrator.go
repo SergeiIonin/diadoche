@@ -1,7 +1,9 @@
 // Package orchestrator runs diadoche's main loop: sync the spec queue,
 // then for each queued task run planner -> worker -> tester for up to
 // cfg.Iter iterations, until the tester marks the task DONE in STATUS.md or
-// the iteration budget is exhausted (FAILED).
+// the iteration budget is exhausted (FAILED). Between worker and tester,
+// the red-green check (see redgreen.go) makes sure worker's tests fail on
+// the task's base commit, i.e. actually test the new code.
 //
 // With cfg.Worktree each task runs in its own git worktree and branch
 // (see worktree.go), merged into the current branch once DONE; without it
@@ -261,8 +263,10 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 }
 
 // runIterations runs up to cfg.Iter planner/worker/tester rounds for one
-// task. done reports whether tester marked the task DONE; a non-nil err is
-// why the task was cut short (an agent error, --max-call-cost, ...). Both
+// task, with the red-green check (cfg.RedGreen) between worker and tester:
+// a failed check writes the iteration's review itself and skips tester.
+// done reports whether tester marked the task DONE; a non-nil err is why
+// the task was cut short (an agent error, --max-call-cost, ...). Both
 // false and nil means the iteration budget ran out.
 func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, ws *workspace, planner, worker, tester *agents.Agent, uw *usage.Writer) (done bool, err error) {
 	specPath := filepath.Join(o.Layout.SpecDir, specFile)
@@ -393,6 +397,25 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 			diffForTester, diffNote = td.Body, td.Note
 			if td.Oversized {
 				guidance = fmt.Sprintf(oversizedDiffGuidance, ws.base)
+			}
+		}
+
+		// The red-green tester note becomes its own paragraph after the
+		// diff guidance; without one the prompt is unchanged.
+		if o.Cfg.RedGreen && !o.Cfg.DryRun {
+			rg, err := o.redGreenCheck(ctx, specFile, specContent, ws, plan)
+			if err != nil {
+				return false, fmt.Errorf("red-green check: %w", err)
+			}
+			if rg.fail {
+				if err := os.WriteFile(reviewPath, []byte(rg.review), 0o644); err != nil {
+					return false, fmt.Errorf("write red-green review: %w", err)
+				}
+				o.Log.Printf("%s iteration %d: red-green check failed, skipping tester (iteration unsuccessful)", specFile, iter)
+				continue
+			}
+			if rg.testerNote != "" {
+				guidance += "\n\n" + rg.testerNote
 			}
 		}
 

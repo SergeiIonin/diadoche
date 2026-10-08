@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"diadoche/internal/agents"
+	"diadoche/internal/redgreen"
 )
 
 const (
@@ -45,6 +46,7 @@ const helpSynopsis = `SYNOPSIS
              [--tester-model <name>] [--max-call-minutes <n>]
              [--max-call-cost <usd>] [--allow-dirty]
              [--stable-system-prompt=<bool>] [--worktree=<bool>]
+             [--red-green=<bool>] [--test-globs <list>]
     diadoche --preprocess --task <path> [--dir <path>] [--claude-bin <path>]
              [--preprocessor-model <name>]
     diadoche --initialize <project-path>
@@ -162,6 +164,31 @@ const helpDescription = `DESCRIPTION
     doesn't know that flag. See docs/prompt-caching.md for what cannot be
     unified and why.
 
+    RED-GREEN CHECK (--red-green, on by default): after worker and before
+    tester, in the same iteration, diadoche checks that the task's tests
+    actually test something. The test files are the files added or changed
+    since the diff base that match *_test.go or one of --test-globs (when
+    --test-globs is not given, globs are inferred from the plan's
+    "## Test Command", e.g. pytest -> test_*.py, *_test.py). diadoche
+    creates a temporary detached worktree at the base commit in the OS temp
+    directory, copies only those test files into it, and runs the plan's
+    Test Command there; the worktree is always removed afterwards, also
+    when the command fails or times out. The task's own working tree is
+    never touched.
+      Tests pass on the base commit: they check nothing — the iteration is
+      unsuccessful, tester is not called, and the review handed to the
+      next planner says so and lists the test files (and test names).
+      Tests fail or don't compile on the base commit: the normal red
+      result, the iteration continues to tester.
+      No test files in the diff: the iteration is unsuccessful ("worker
+      wrote no tests"), unless the spec contains the line
+      <!-- diadoche: no-tests -->, which skips the check.
+      Test files that existed before the task were changed but are not in
+      the plan's "## Files": tester's prompt gets an extra item asking it
+      to check that those existing tests were not weakened.
+    The check is skipped in --dry-run and for a repository without
+    commits. --red-green=false disables it entirely.
+
     DIRTY TREE: with --worktree, the run refuses to start if the main
     working tree has uncommitted changes outside .claude/diadoche/ and
     .claude/agents/ (each task's changes are merged into the current
@@ -249,11 +276,15 @@ FILES
         Status cell ("BLOCKED: <reason>").
 
     <project>/.claude/diadoche/spec/QUEUE.md
-        This run's work queue, rebuilt from STATUS.md on every sync.
+        This run's work queue, rebuilt from STATUS.md on every sync. A
+        trailing " [no-tests]" on a line is tolerated and ignored; mark the
+        spec itself instead.
 
     <project>/.claude/diadoche/spec/NNN_<slug>.md
         A task spec. diadoche also writes NNN_IMPL_PLAN.md and
-        NNN_REVIEW_<M>.md alongside it as the task progresses.
+        NNN_REVIEW_<M>.md alongside it as the task progresses. A line
+        <!-- diadoche: no-tests --> in the spec marks a task that needs no
+        tests (see RED-GREEN CHECK).
 
     <project>/.claude/agents/<name>.md
         Optional per-project override of a built-in agent's prompt/model
@@ -376,6 +407,17 @@ type Config struct {
 	// false gives the old in-place behaviour: tasks work in the main
 	// working tree and a FAILED task's changes are parked.
 	Worktree bool
+
+	// RedGreen runs the red-green check after worker: the task's new and
+	// changed test files are run on the base commit, and tests that pass
+	// there fail the iteration. The zero value is off; Parse defaults it
+	// on (--red-green).
+	RedGreen bool
+
+	// TestGlobs are extra test-file globs (--test-globs) for non-Go
+	// projects; *_test.go always counts. Empty means: inferred from the
+	// plan's "## Test Command".
+	TestGlobs []string
 }
 
 // TaskPath resolves --task relative to --dir, unless it's already absolute.
@@ -411,6 +453,8 @@ func Parse(args []string) (*Config, error) {
 	allowDirty := fs.Bool("allow-dirty", false, "skip the dirty-working-tree check (at run start with --worktree, before each task with --worktree=false); with --worktree=false those files are never parked when the task FAILS")
 	worktree := fs.Bool("worktree", true, "run each task in its own git worktree .claude/diadoche/worktrees/<NNN>-<slug> on branch diadoche/<NNN>-<slug>, merging it into the current branch once DONE; --worktree=false works in the main working tree and parks FAILED changes instead")
 	stableSystemPrompt := fs.Bool("stable-system-prompt", true, "pass claude --exclude-dynamic-system-prompt-sections, keeping the shared prompt prefix identical between calls; set to false for a claude CLI without that flag")
+	redGreen := fs.Bool("red-green", true, "after worker, run the task's new/changed test files on the base commit in a temporary worktree; tests that pass there fail the iteration")
+	testGlobs := fs.String("test-globs", "", "comma-separated test-file globs for non-Go projects, e.g. 'test_*.py,*.spec.ts'; default: inferred from the plan's ## Test Command; *_test.go always counts")
 	maxCallCost := fs.Float64("max-call-cost", 0, "fail the task if a single agent call's cost in USD exceeds this — checked after the call returns, so it cannot preempt the spend (0 = no limit)")
 
 	if err := fs.Parse(args); err != nil {
@@ -462,6 +506,11 @@ func Parse(args []string) (*Config, error) {
 		return nil, fmt.Errorf("--max-call-cost must be >= 0, got %g", *maxCallCost)
 	}
 
+	globs := splitCSV(*testGlobs)
+	if err := redgreen.ValidateGlobs(globs); err != nil {
+		return nil, fmt.Errorf("--test-globs: %w", err)
+	}
+
 	plannerOverride, err := resolveModelOverride(passed, "planner-model", *plannerModel, "DIADOCHE_PLANNER_MODEL")
 	if err != nil {
 		return nil, err
@@ -498,6 +547,8 @@ func Parse(args []string) (*Config, error) {
 		AllowDirty:         *allowDirty,
 		Worktree:           *worktree,
 		StableSystemPrompt: *stableSystemPrompt,
+		RedGreen:           *redGreen,
+		TestGlobs:          globs,
 	}, nil
 }
 

@@ -358,14 +358,9 @@ func RestorePaths(ctx context.Context, dir, base string, paths []string) error {
 		return nil
 	}
 	env := []string{literalPathspecs}
-	lsArgs := append([]string{"ls-tree", "-r", "-z", "--name-only", base, "--"}, paths...)
-	lsOut, err := runEnv(ctx, dir, env, lsArgs...)
+	inBase, err := PathsInTree(ctx, dir, base, paths)
 	if err != nil {
-		return fmt.Errorf("git ls-tree: %w: %s", err, lsOut)
-	}
-	inBase := map[string]bool{}
-	for _, p := range splitNUL(lsOut) {
-		inBase[p] = true
+		return err
 	}
 	var existing, added []string
 	for _, p := range paths {
@@ -396,6 +391,45 @@ func RestorePaths(ctx context.Context, dir, base string, paths []string) error {
 		}
 	}
 	return nil
+}
+
+// PathsInTree reports which of paths exist in treeish (a commit or git's
+// empty tree), as `git ls-tree -r --name-only` with literal pathspecs.
+// Empty paths need no git call and yield an empty map.
+func PathsInTree(ctx context.Context, dir, treeish string, paths []string) (map[string]bool, error) {
+	in := map[string]bool{}
+	if len(paths) == 0 {
+		return in, nil
+	}
+	args := append([]string{"ls-tree", "-r", "-z", "--name-only", treeish, "--"}, paths...)
+	out, err := runEnv(ctx, dir, []string{literalPathspecs}, args...)
+	if err != nil {
+		return nil, fmt.Errorf("git ls-tree: %w: %s", err, out)
+	}
+	for _, p := range splitNUL(out) {
+		in[p] = true
+	}
+	return in, nil
+}
+
+// ShowFile returns the content of path (slash-separated, relative to the
+// repository root) as of commit, via `git show <commit>:<path>`.
+func ShowFile(ctx context.Context, dir, commit, path string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "show", commit+":"+path)
+	cmd.Dir = dir
+	var out, errOut bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errOut
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("git show %s:%s: %w: %s", commit, path, err, errOut.String())
+	}
+	return out.String(), nil
+}
+
+// IsEmptyTree reports whether base is git's empty-tree hash, i.e. the base
+// BaseCommit returns for a repository without commits.
+func IsEmptyTree(base string) bool {
+	return base == emptyTreeHash
 }
 
 // removeEmptyParents deletes d and its ancestors, up to but excluding
@@ -461,6 +495,22 @@ func WorktreeAdd(ctx context.Context, repoDir, path, branch, base string) error 
 	}
 	if out, err := run(ctx, repoDir, args...); err != nil {
 		return fmt.Errorf("git worktree add: %w: %s", err, out)
+	}
+	return nil
+}
+
+// WorktreeAddDetached creates a worktree at path with a detached HEAD at
+// commit — a throwaway checkout that creates no branch. Stale worktree
+// registrations are pruned first, like WorktreeAdd.
+func WorktreeAddDetached(ctx context.Context, repoDir, path, commit string) error {
+	if out, err := run(ctx, repoDir, "worktree", "prune"); err != nil {
+		return fmt.Errorf("git worktree prune: %w: %s", err, out)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	if out, err := run(ctx, repoDir, "worktree", "add", "--detach", path, commit); err != nil {
+		return fmt.Errorf("git worktree add --detach: %w: %s", err, out)
 	}
 	return nil
 }

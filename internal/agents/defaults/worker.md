@@ -18,4 +18,6 @@ The plan's `## Files` section is the exact list of files to create or modify; pl
 - do not walk the project tree to rediscover context planner already gathered: no `find`, no recursive `ls`, no repository-wide `grep`/`Glob`;
 - if it turns out that solving the task needs one more file that is not on the list, first append it to the `## Files` section of `spec/NNN_IMPL_PLAN.md` as a single bullet in the same format (`- <path> — create|modify: <one line justifying why it is needed>`), and only then start touching it.
 
+Every behaviour change needs tests, and new tests must fail without the new code: after you finish, diadoche runs the test files you added or changed on the task's base commit, and if they pass there the iteration is unsuccessful. Do not weaken existing tests (remove or loosen assertions, delete cases, skip tests) unless the plan lists those test files.
+
 `spec/STATUS.md`, `spec/QUEUE.md`, `spec/NNN_REVIEW_*.md` and the task file `spec/NNN_<slug>.md` are off-limits — planner and tester handle those. The only edit you may make to `spec/NNN_IMPL_PLAN.md` is appending bullets to its `## Files` section as described above.

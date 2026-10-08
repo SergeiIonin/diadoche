@@ -365,3 +365,50 @@ func TestParseWorktreeDefaultsOnAndCanBeDisabled(t *testing.T) {
 		t.Error("Worktree = true, want false when explicitly disabled")
 	}
 }
+
+func TestParseRedGreenDefaultsOnAndCanBeDisabled(t *testing.T) {
+	cfg, err := Parse(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.RedGreen {
+		t.Error("RedGreen = false, want true by default")
+	}
+	if cfg.TestGlobs != nil {
+		t.Errorf("TestGlobs = %q, want nil by default", cfg.TestGlobs)
+	}
+
+	cfg, err = Parse([]string{"--red-green=false"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RedGreen {
+		t.Error("RedGreen = true, want false when explicitly disabled")
+	}
+}
+
+func TestParseTestGlobs(t *testing.T) {
+	cfg, err := Parse([]string{"--test-globs", "test_*.py, *.spec.ts"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TestGlobs) != 2 || cfg.TestGlobs[0] != "test_*.py" || cfg.TestGlobs[1] != "*.spec.ts" {
+		t.Errorf("TestGlobs = %q, want [test_*.py *.spec.ts]", cfg.TestGlobs)
+	}
+
+	_, err = Parse([]string{"--test-globs", "["})
+	if err == nil || !strings.Contains(err.Error(), "--test-globs") {
+		t.Errorf("bad glob: err = %v, want a --test-globs error", err)
+	}
+}
+
+func TestParseHelpMentionsRedGreen(t *testing.T) {
+	out := captureStdout(t, func() {
+		_, _ = Parse([]string{"--help"})
+	})
+	for _, want := range []string{"--red-green", "--test-globs", "RED-GREEN CHECK", "<!-- diadoche: no-tests -->"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("help output missing %q", want)
+		}
+	}
+}

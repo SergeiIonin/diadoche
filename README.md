@@ -89,6 +89,13 @@ Flags:
   shared prompt prefix is identical between calls (default `true`). Set
   `--stable-system-prompt=false` for a `claude` CLI without that flag. See
   "Prompt caching" below.
+- `--red-green` — after worker, run the task's new/changed test files on
+  the task's base commit in a temporary worktree; tests that pass there
+  (i.e. check nothing) fail the iteration (default `true`).
+  `--red-green=false` disables the step. See "Red-green check" below.
+- `--test-globs` — comma-separated test-file globs for non-Go projects,
+  e.g. `'test_*.py,*.spec.ts'` (default: inferred from the plan's
+  `## Test Command`; `*_test.go` always counts).
 - `-h` / `-help` / `--help` — print the full man-page-style help and exit.
 
 ## Preprocessor (`--preprocess`)
@@ -229,6 +236,38 @@ size only, and the index is never touched to produce any of this).
   the limit — otherwise it is omitted too and the prompt says so), the
   task's base commit, and an instruction to open just the files it needs
   itself, e.g. `git diff <base> -- <path>`.
+
+## Red-green check
+
+With `--red-green` (the default), diadoche checks after worker and before
+tester, in the same iteration, that worker's tests actually test the new
+code:
+
+- The test files are the files added or changed since the task's base
+  commit that match `*_test.go` or one of `--test-globs`. Without
+  `--test-globs`, globs are inferred from the plan's `## Test Command`
+  (`pytest` → `test_*.py`, `*_test.py`; `jest`/`npm test` →
+  `*.test.ts`, `*.spec.ts`, ...; `cargo test` → `tests/*.rs`; ...).
+- diadoche creates a temporary detached git worktree at the base commit in
+  the OS temp directory, copies only those test files into it and runs the
+  plan's Test Command there. The worktree is always removed afterwards,
+  also when the command fails; the task's own working tree is never
+  touched.
+- Tests pass on the base commit → they check nothing: the iteration is
+  unsuccessful, tester is not called, and the iteration's review (which
+  the next planner gets) says so and lists the test files and test names.
+- Tests fail or don't compile on the base commit → the expected red
+  result; the iteration continues to tester.
+- No test files in the diff → the iteration is unsuccessful ("worker wrote
+  no tests"), unless the task spec contains the line
+  `<!-- diadoche: no-tests -->`, which skips the check. (`QUEUE.md` is
+  rebuilt from `STATUS.md`, so the marker belongs in the spec; a trailing
+  ` [no-tests]` on a queue line is tolerated and ignored.)
+- Test files that existed before the task were changed but are not listed
+  in the plan's `## Files` → tester's prompt gets an extra item asking it to
+  check that those existing tests were not weakened.
+
+The step is skipped in `--dry-run` and for a repository without commits.
 
 ## Worktrees
 

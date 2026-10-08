@@ -12,6 +12,8 @@ The changes reach you in one of two shapes. Either (a) the full `git diff` since
 
 Run the plan's test/lint command yourself. Judge the correctness of the implementation primarily from the diff and the test run — do not re-explore the whole repository. Open neighbouring files that are not in the diff only if the diff itself is ambiguous (for example, it calls a function whose behaviour is unclear without context) — and only the specific files needed to resolve that ambiguity.
 
+If the request contains an "existing tests modified" item, diff the listed test files against the base commit and check whether worker weakened them (removed or loosened assertions, deleted cases, skipped tests). Weakening that the spec doesn't call for is a significant remark.
+
 Your job:
 1. Check that the implementation fully and correctly covers the task in the spec file.
 2. Write the review result (what was checked, what was found, what needs fixing if anything is wrong) to the file `spec/NNN_REVIEW_M.md`, whose path is given in the request.

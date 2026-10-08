@@ -551,3 +551,76 @@ func TestEnsureInfoExcludeIsIdempotent(t *testing.T) {
 		t.Errorf("excluded dir should be ignored, status:\n%s", st)
 	}
 }
+
+func TestWorktreeAddDetachedAtBaseAndRemove(t *testing.T) {
+	dir := newCommittedRepo(t)
+	ctx := context.Background()
+	first := git(t, dir, "rev-parse", "HEAD")
+	writeTestFile(t, filepath.Join(dir, "b.txt"), "b\n")
+	if err := CommitAll(ctx, dir, "second"); err != nil {
+		t.Fatal(err)
+	}
+
+	wt := filepath.Join(t.TempDir(), "check", "wt")
+	if err := WorktreeAddDetached(ctx, dir, wt, first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(wt, "a.txt")); err != nil {
+		t.Errorf("a.txt missing in detached worktree: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(wt, "b.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("b.txt from the second commit present in worktree at the first commit (err=%v)", err)
+	}
+	if got := git(t, wt, "rev-parse", "HEAD"); got != first {
+		t.Errorf("worktree HEAD = %s, want %s", got, first)
+	}
+	if got := CurrentBranch(ctx, wt); got != "HEAD" {
+		t.Errorf("worktree branch = %q, want detached HEAD", got)
+	}
+	if !IsWorktree(ctx, dir, wt) {
+		t.Fatal("detached worktree not registered")
+	}
+
+	if err := WorktreeRemove(ctx, dir, wt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(wt); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("worktree dir still exists (err=%v)", err)
+	}
+	if IsWorktree(ctx, dir, wt) {
+		t.Error("worktree still listed after WorktreeRemove")
+	}
+}
+
+func TestPathsInTreeAndShowFile(t *testing.T) {
+	dir := newCommittedRepo(t)
+	ctx := context.Background()
+	base := git(t, dir, "rev-parse", "HEAD")
+	writeTestFile(t, filepath.Join(dir, "a.txt"), "changed\n")
+	writeTestFile(t, filepath.Join(dir, "sub", "new.txt"), "new\n")
+
+	in, err := PathsInTree(ctx, dir, base, []string{"a.txt", "sub/new.txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !in["a.txt"] || in["sub/new.txt"] {
+		t.Errorf("PathsInTree = %v, want only a.txt", in)
+	}
+	if empty, err := PathsInTree(ctx, dir, base, nil); err != nil || len(empty) != 0 {
+		t.Errorf("PathsInTree(nil) = %v, %v; want empty map", empty, err)
+	}
+
+	got, err := ShowFile(ctx, dir, base, "a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "a\n" {
+		t.Errorf("ShowFile = %q, want base content %q", got, "a\n")
+	}
+	if _, err := ShowFile(ctx, dir, base, "sub/new.txt"); err == nil {
+		t.Error("ShowFile of a path absent at base: want error")
+	}
+	if !IsEmptyTree(emptyTreeHash) || IsEmptyTree(base) {
+		t.Error("IsEmptyTree misreports")
+	}
+}

@@ -164,3 +164,92 @@ func TestCommand(plan string) string {
 	body, _ := find(plan, TestCommandHeading)
 	return body
 }
+
+// TestCommandScript turns the "## Test Command" body into a shell script
+// that can be run with `sh -c`. When the body has fenced code blocks
+// (``` lines, with or without a language tag), the script is the content
+// of all of them, in order. Otherwise every non-empty line is taken as a
+// command, with a leading "- " or "* " bullet and surrounding single
+// backticks stripped; prose is not filtered out — planner is asked to put
+// only commands there. Returns "" when nothing remains.
+func TestCommandScript(plan string) string {
+	body := TestCommand(plan)
+	lines := strings.Split(body, "\n")
+
+	var fenced []string
+	hasFence, inFence := false, false
+	for _, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			hasFence = true
+			inFence = !inFence
+			continue
+		}
+		if inFence && strings.TrimSpace(line) != "" {
+			fenced = append(fenced, line)
+		}
+	}
+	if hasFence {
+		return strings.Join(fenced, "\n")
+	}
+
+	var out []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if l, ok := strings.CutPrefix(line, "- "); ok {
+			line = l
+		} else if l, ok := strings.CutPrefix(line, "* "); ok {
+			line = l
+		}
+		line = strings.TrimSpace(line)
+		if len(line) >= 2 && strings.HasPrefix(line, "`") && strings.HasSuffix(line, "`") {
+			line = strings.TrimSpace(line[1 : len(line)-1])
+		}
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+// testGlobRules maps substrings of a test command (matched
+// case-insensitively) to the test-file globs of the ecosystem they belong
+// to. Order is the order InferTestGlobs reports globs in.
+var testGlobRules = []struct {
+	needles []string
+	globs   []string
+}{
+	{[]string{"pytest", "python -m unittest", "tox"}, []string{"test_*.py", "*_test.py"}},
+	{
+		[]string{"jest", "vitest", "mocha", "npm test", "npm run test", "yarn test", "pnpm test", "bun test"},
+		[]string{"*.test.js", "*.test.jsx", "*.test.ts", "*.test.tsx", "*.spec.js", "*.spec.jsx", "*.spec.ts", "*.spec.tsx"},
+	},
+	{[]string{"cargo test"}, []string{"tests/*.rs", "**/tests/*.rs"}},
+	{[]string{"mvn", "gradle", "gradlew"}, []string{"*Test.java", "*Tests.java", "*Test.kt", "*Tests.kt"}},
+	{[]string{"rspec"}, []string{"*_spec.rb"}},
+	{[]string{"go test"}, []string{"*_test.go"}},
+}
+
+// InferTestGlobs guesses test-file globs from a test command by the test
+// runners it mentions (pytest, jest, cargo test, ...). It returns the union
+// for every runner recognised, deduplicated and in a stable order, or nil
+// when none is.
+func InferTestGlobs(testCommand string) []string {
+	cmd := strings.ToLower(testCommand)
+	seen := map[string]bool{}
+	var out []string
+	for _, r := range testGlobRules {
+		for _, n := range r.needles {
+			if !strings.Contains(cmd, n) {
+				continue
+			}
+			for _, g := range r.globs {
+				if !seen[g] {
+					seen[g] = true
+					out = append(out, g)
+				}
+			}
+			break
+		}
+	}
+	return out
+}

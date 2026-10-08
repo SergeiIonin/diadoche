@@ -195,6 +195,12 @@ func WriteStatus(path string, rows []Row) error {
 	return writeFileAtomic(path, []byte(b.String()))
 }
 
+// ReadQueue returns the items of QUEUE.md, one spec filename per line.
+//
+// A trailing " [no-tests]" on a line, if someone put it there by hand, is
+// tolerated and dropped: QUEUE.md is rebuilt from STATUS.md by Sync, so a
+// marker there would not survive anyway. The no-tests marker lives in the
+// spec file itself — see NoTestsMarker.
 func ReadQueue(path string) ([]string, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -208,6 +214,7 @@ func ReadQueue(path string) ([]string, error) {
 		line = strings.TrimSpace(line)
 		line = strings.TrimPrefix(line, "- ")
 		line = strings.TrimSpace(line)
+		line = strings.TrimSpace(strings.TrimSuffix(line, queueNoTestsSuffix))
 		if line == "" {
 			continue
 		}
@@ -370,4 +377,26 @@ func GetStatus(l Layout, specFile string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("spec %q not found in %s", specFile, l.StatusPath)
+}
+
+// NoTestsMarker is the line that marks a task spec as needing no tests:
+// with it, the red-green check neither runs the task's tests on the base
+// commit nor fails the iteration for a diff without test files. It lives
+// in the spec file because QUEUE.md is rebuilt by Sync and would lose it.
+const NoTestsMarker = "<!-- diadoche: no-tests -->"
+
+// queueNoTestsSuffix is the hand-written queue-line marker ReadQueue drops.
+const queueNoTestsSuffix = "[no-tests]"
+
+var noTestsRe = regexp.MustCompile(`^<!--\s*diadoche:\s*no-tests\s*-->$`)
+
+// HasNoTestsMarker reports whether specContent has a line that is, once
+// trimmed, the NoTestsMarker (extra whitespace inside the comment allowed).
+func HasNoTestsMarker(specContent []byte) bool {
+	for line := range strings.SplitSeq(string(specContent), "\n") {
+		if noTestsRe.MatchString(strings.TrimSpace(line)) {
+			return true
+		}
+	}
+	return false
 }

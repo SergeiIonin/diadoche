@@ -965,6 +965,7 @@ type scriptedRunner struct {
 	onWorker         func(dir string) error
 	testerCalls      int
 	testerPrompts    []string
+	plannerPrompts   []string
 	markDoneOnTester bool
 
 	// plannerCost/workerCost/testerCost, when non-zero, are returned as a
@@ -978,6 +979,7 @@ func (r *scriptedRunner) Run(_ context.Context, dir string, a *agents.Agent, pro
 	result := agents.RunResult{TotalCostUSD: cost, Parsed: cost != 0}
 	switch a.Name {
 	case "planner":
+		r.plannerPrompts = append(r.plannerPrompts, prompt)
 		if r.onPlanner != nil {
 			if err := r.onPlanner(r.layout.SpecDir); err != nil {
 				return result, err

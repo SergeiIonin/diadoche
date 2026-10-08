@@ -167,3 +167,64 @@ func TestHasRequiredSectionsAcceptsLegacyBarePlan(t *testing.T) {
 	}
 	assertFiles(t, validPlan, []string{"internal/foo/foo.go", "internal/foo/foo_test.go", "internal/bar/bar.go"})
 }
+
+func TestTestCommandScript(t *testing.T) {
+	fence := "```"
+	cases := []struct {
+		name, body, want string
+	}{
+		{"fenced", fence + "\ngo test ./...\n" + fence, "go test ./..."},
+		{"fenced with tag", fence + "bash\nmake lint\ngo test ./...\n" + fence, "make lint\ngo test ./..."},
+		{"fenced with prose around", "Run this:\n" + fence + "sh\npytest -q\n" + fence + "\nthen done", "pytest -q"},
+		{"bullet and backticks", "- `go test ./...`\n* `go vet ./...`", "go test ./...\ngo vet ./..."},
+		{"plain lines", "go build ./...\n\ngo test ./...", "go build ./...\ngo test ./..."},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			plan := "# Plan\n\n## Files\n- a.go\n\n## Test Command\n" + c.body + "\n\n## Steps\nx\n"
+			if got := TestCommandScript(plan); got != c.want {
+				t.Errorf("TestCommandScript = %q, want %q", got, c.want)
+			}
+		})
+	}
+	if got := TestCommandScript("# Plan\n\n## Test Command\n\n## Steps\n"); got != "" {
+		t.Errorf("empty section: got %q, want empty", got)
+	}
+	if got := TestCommandScript("# Plan\n"); got != "" {
+		t.Errorf("missing section: got %q, want empty", got)
+	}
+}
+
+func TestInferTestGlobs(t *testing.T) {
+	has := func(globs []string, g string) bool {
+		for _, x := range globs {
+			if x == g {
+				return true
+			}
+		}
+		return false
+	}
+	if g := InferTestGlobs("pytest -q"); !has(g, "test_*.py") || !has(g, "*_test.py") {
+		t.Errorf("pytest: %v", g)
+	}
+	if g := InferTestGlobs("npm test"); !has(g, "*.test.ts") || !has(g, "*.spec.js") {
+		t.Errorf("npm test: %v", g)
+	}
+	if g := InferTestGlobs("go test ./..."); len(g) != 1 || g[0] != "*_test.go" {
+		t.Errorf("go test: %v", g)
+	}
+	if g := InferTestGlobs("cargo test"); !has(g, "**/tests/*.rs") {
+		t.Errorf("cargo test: %v", g)
+	}
+	if g := InferTestGlobs("make"); g != nil {
+		t.Errorf("make: %v, want nil", g)
+	}
+	g := InferTestGlobs("pytest && pytest -x && go test ./...")
+	seen := map[string]bool{}
+	for _, x := range g {
+		if seen[x] {
+			t.Errorf("duplicate glob %q in %v", x, g)
+		}
+		seen[x] = true
+	}
+}
