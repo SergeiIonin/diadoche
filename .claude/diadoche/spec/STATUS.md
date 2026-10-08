@@ -13,8 +13,8 @@
 | 011 | 011_dry_run_no_side_effects.md | DONE |
 | 012 | 012_worker_decisions_report.md | DONE |
 | 013 | 013_on_task_done_hook.md | DONE |
-| 014 | 014_built_in_adr_step.md | FAILED |
-| 015 | 015_planner_tester_use_adrs.md | FAILED |
 | 016 | 016_on_fail_policy_escalate_block.md | DONE |
 | 017 | 017_on_fail_policy_split.md | DONE |
 | 018 | 018_questions_md_and_needs_human.md | DONE |
+| 014 | 014_built_in_adr_step.md | DONE |
+| 015 | 015_planner_tester_use_adrs.md | QUEUED |
