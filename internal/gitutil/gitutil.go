@@ -723,3 +723,26 @@ func CurrentBranch(ctx context.Context, dir string) string {
 	}
 	return strings.TrimSpace(out)
 }
+
+// DiffUntracked renders each of paths (untracked files in dir) as a
+// new-file patch, `git diff --no-index --binary -- /dev/null <path>`, so a
+// task's full diff can include the files it added.
+func DiffUntracked(ctx context.Context, dir string, paths []string) (string, error) {
+	var b strings.Builder
+	for _, p := range paths {
+		cmd := exec.CommandContext(ctx, "git", "diff", "--no-index", "--binary", "--", os.DevNull, p)
+		cmd.Dir = dir
+		var out, errOut bytes.Buffer
+		cmd.Stdout = &out
+		cmd.Stderr = &errOut
+		err := cmd.Run()
+		// --no-index exits 1 when the files differ, which they always do;
+		// it also exits 1 when it can't read the file, but prints no patch.
+		var exitErr *exec.ExitError
+		if err != nil && !(errors.As(err, &exitErr) && exitErr.ExitCode() == 1 && out.Len() > 0) {
+			return b.String(), fmt.Errorf("git diff --no-index %s: %w: %s", p, err, errOut.String())
+		}
+		b.Write(out.Bytes())
+	}
+	return b.String(), nil
+}

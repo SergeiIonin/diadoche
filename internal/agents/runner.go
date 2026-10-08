@@ -35,6 +35,12 @@ type RunResult struct {
 	// still leaves something to debug with.
 	Output string
 
+	// Stdout and Stderr are the claude process's raw, unparsed output
+	// (stdout carries the JSON result object), kept for the run's
+	// per-task artifacts. Empty in --dry-run.
+	Stdout string
+	Stderr string
+
 	Usage        Usage
 	TotalCostUSD float64
 	DurationMS   int64
@@ -167,6 +173,8 @@ func (r CLIRunner) Run(ctx context.Context, workDir string, a *Agent, prompt str
 	combined := stdout.String() + stderr.String()
 	result := RunResult{
 		Output:     combined,
+		Stdout:     stdout.String(),
+		Stderr:     stderr.String(),
 		DurationMS: duration.Milliseconds(),
 		ExitCode:   exitCode(cmd),
 	}

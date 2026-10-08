@@ -402,3 +402,31 @@ func TestCLIRunnerOmitsAppendSystemPromptWhenPrefixEmpty(t *testing.T) {
 		t.Errorf("--append-system-prompt must be omitted without a prefix; args: %v", args)
 	}
 }
+
+func TestCLIRunnerKeepsRawStdoutAndStderr(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		exit string
+	}{{"success", ""}, {"failure", "exit 3\n"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := fakeClaude(t, `cat "`+writeJSONResponse(t, fullClaudeJSON)+`"
+echo "some warning" >&2
+`+tc.exit)
+			r := CLIRunner{Bin: stub}
+			a := &Agent{Name: "worker", Model: "claude-opus-5"}
+			result, err := r.Run(context.Background(), t.TempDir(), a, "do the thing")
+			if (err != nil) != (tc.exit != "") {
+				t.Fatalf("Run error = %v", err)
+			}
+			if result.Stdout != fullClaudeJSON+"\n" {
+				t.Errorf("Stdout = %q, want the raw JSON", result.Stdout)
+			}
+			if result.Stderr != "some warning\n" {
+				t.Errorf("Stderr = %q", result.Stderr)
+			}
+			if result.Output != "hello from agent" || !result.Parsed {
+				t.Errorf("Output = %q, Parsed = %v; want the parsed result", result.Output, result.Parsed)
+			}
+		})
+	}
+}

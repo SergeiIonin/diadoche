@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"diadoche/internal/agents"
+	"diadoche/internal/runlog"
 	"diadoche/internal/specs"
 	"diadoche/internal/usage"
 	"diadoche/internal/usagelimit"
@@ -113,8 +114,11 @@ func (o *Orchestrator) runAgentPausing(ctx context.Context, c agentCall, a *agen
 			if paused {
 				if err := specs.SetStatus(o.Layout, c.specFile, specs.StatusInProgress); err != nil {
 					o.Log.Printf("%s could not set status back to %s: %v", prefix, specs.StatusInProgress, err)
+				} else {
+					o.event(c.specFile, c.iter, a.Name, "status", runlog.F("status", specs.StatusInProgress))
 				}
 				o.Log.Printf("%s resumed after pause", prefix)
+				o.event(c.specFile, c.iter, a.Name, "resume")
 			}
 			o.pauseBackoff = 0
 			return result, nil
@@ -148,8 +152,15 @@ func (o *Orchestrator) runAgentPausing(ctx context.Context, c agentCall, a *agen
 
 		if err := specs.SetStatusReason(o.Layout, c.specFile, specs.StatusPaused, reason); err != nil {
 			o.Log.Printf("%s could not record %s status: %v", prefix, specs.StatusPaused, err)
+		} else {
+			o.event(c.specFile, c.iter, a.Name, "status", runlog.F("status", specs.StatusPaused))
 		}
 		o.Log.Printf("%s paused: claude %s (%s), retrying the same call in %s", prefix, hit.Kind, until, wait)
+		untilField := "-"
+		if hit.HasReset {
+			untilField = hit.ResetAt.Format(time.RFC3339)
+		}
+		o.event(c.specFile, c.iter, a.Name, "pause", runlog.F("kind", hit.Kind), runlog.F("wait", wait), runlog.F("until", untilField))
 		sctx, cancel := o.gracefulCtx(ctx)
 		err = o.sleep(sctx, wait)
 		cancel()

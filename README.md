@@ -499,6 +499,43 @@ agent and by task, and the cache-read share of all input tokens — that is
 + cache_read_input_tokens` (output tokens excluded), the one number that
 says whether prompt caching is working.
 
+## Run logs and artifacts
+
+Every run (except `--dry-run`) gets its own directory
+`.claude/diadoche/runs/<run-id>/`, where `<run-id>` is the start time as
+`YYYYMMDD-HHMMSS` (with a `-2`, `-3`... suffix on a collision):
+
+```
+.claude/diadoche/runs/<run-id>/
+├── run.log
+└── <NNN>-<slug>/
+    ├── iter-<N>-IMPL_PLAN.md      copy of the plan of iteration N
+    ├── iter-<N>-REVIEW.md         copy of the review of iteration N
+    ├── iter-<N>-<agent>.stdout    raw stdout of the call (claude's JSON reply)
+    ├── iter-<N>-<agent>.stderr    raw stderr of the call
+    └── final.diff                 the task's changes against its base commit
+```
+
+`run.log` has one line per event, written without buffering, so
+`tail -f .claude/diadoche/runs/*/run.log` follows the run live. Each line is
+also echoed to stdout as `event: ...`:
+
+```
+2026-10-08T12:00:00.123+02:00 task=001_example.md iter=1 agent=planner event=agent_end duration=1m2.5s exit=0 cost=$0.4210 tokens=81234 result=ok
+```
+
+Events: `run_start`, `task_start`, `status` (every STATUS.md change),
+`agent_start`, `agent_end` (duration, exit code, cost, tokens), `verdict`
+(tester's DONE/NOT_DONE), `plan_rejected`, `empty_diff`, `redgreen_failed`,
+`pause`, `resume`, `commit`, `merge`, `merge_blocked`, `park`, `task_end`
+(final status), `run_end`, and `warning` when an artifact couldn't be
+written. A failed write never stops the run. A repeated call of the same
+agent in one iteration (a retry after a limit pause) gets a `-2`, `-3`...
+suffix. `final.diff` is written once the task ends, whatever the outcome.
+
+The `runs/` directory is added to `.git/info/exclude` of the project, so
+diadoche's own commits never pick it up.
+
 ## Prompt caching
 
 All agents of a run get the same shared prompt prefix — byte for byte — as

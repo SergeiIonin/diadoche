@@ -13,5 +13,7 @@ README_RU.md
 /.claude/diadoche/spec/raw/*.md
 /.claude/diadoche/usage.jsonl
 /.claude/diadoche/run-state.json
+# per-run logs and task artifacts (run.log, plan/review copies, agent output, final.diff)
+/.claude/diadoche/runs/
 # per-task git worktrees of a diadoche run (--worktree)
 /.claude/diadoche/worktrees/

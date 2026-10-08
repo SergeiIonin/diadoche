@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"diadoche/internal/gitutil"
+	"diadoche/internal/runlog"
 	"diadoche/internal/specs"
 )
 
@@ -153,6 +154,12 @@ func (o *Orchestrator) failTask(ctx context.Context, specFile, num string, ws *w
 	}
 	if err := specs.SetStatusReason(o.Layout, specFile, specs.StatusFailed, reason); err != nil {
 		o.Log.Printf("task %s: also failed to record FAILED status: %v", specFile, err)
+	} else {
+		fields := []runlog.Field{runlog.F("status", specs.StatusFailed)}
+		if reason != "" {
+			fields = append(fields, runlog.F("reason", reason))
+		}
+		o.event(specFile, 0, "", "status", fields...)
 	}
 	if ws == nil { // --dry-run
 		return nil
@@ -222,8 +229,10 @@ func (o *Orchestrator) park(ctx context.Context, specFile, num string, ws *works
 			return fmt.Errorf("revert parked files (they're safe on branch %s): %w", branch, err)
 		}
 		o.Log.Printf("task %s: parked %d changed file(s) on branch %s", specFile, len(paths), branch)
+		o.event(specFile, 0, "", "park", runlog.F("branch", branch), runlog.F("files", len(paths)))
 	} else {
 		o.Log.Printf("task %s: no code changes to park, no branch created", specFile)
+		o.event(specFile, 0, "", "park", runlog.F("branch", "none"))
 	}
 
 	failedPath := filepath.Join(o.Layout.SpecDir, num+"_FAILED.md")

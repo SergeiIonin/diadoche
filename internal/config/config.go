@@ -111,6 +111,18 @@ const helpDescription = `DESCRIPTION
     that couldn't be parsed is still recorded (zeroed) and logs a warning
     — usage accounting never fails the run.
 
+    Every run also gets .claude/diadoche/runs/<run-id>/ (run-id is the
+    start time, YYYYMMDD-HHMMSS[-N]). Its run.log has one line per event
+    (time, task, iter, agent, event, details: run/task start and end,
+    agent calls with duration, exit code and cost, tester verdicts,
+    pauses, status changes, merge/parking), written unbuffered so it can
+    be followed with tail -f, and echoed to stdout as "event: ...". Each
+    task's <NNN>-<slug>/ subdirectory holds iter-<N>-IMPL_PLAN.md,
+    iter-<N>-REVIEW.md, the raw iter-<N>-<agent>.stdout/.stderr of every
+    agent call and the task's final.diff. A failed write is only a
+    warning. Nothing is written in --dry-run; the directory is kept out
+    of git via .git/info/exclude.
+
     DIFF SCOPE: before a task's first iteration, diadoche records the
     current commit (or, pre-first-commit, git's empty-tree hash) as that
     task's diff base. Before each tester call it computes the diff (plus
@@ -397,6 +409,18 @@ FILES
     <project>/.claude/diadoche/usage.jsonl
         One JSON line per agent call: time, task, agent, iteration, model,
         token counts, cost (USD), duration.
+
+    <project>/.claude/diadoche/runs/<run-id>/run.log
+        One line per run event: time, task, iteration, agent, event and
+        key=value details. Flushed after every line (tail -f) and echoed to
+        stdout as "event: ...". Not written in --dry-run.
+
+    <project>/.claude/diadoche/runs/<run-id>/<NNN>-<slug>/
+        A task's artifacts: iter-<N>-IMPL_PLAN.md and iter-<N>-REVIEW.md
+        (copies of each iteration's plan and review), iter-<N>-<agent>.stdout
+        and .stderr (raw output of each agent call; a retry after a limit
+        pause adds -2, -3...), and final.diff (the task's changes against
+        its base commit, written whatever its outcome).
 
     <project>/.claude/diadoche/run-state.json
         Where the run is (see SIGNALS AND RESTART STATE): run_id, task

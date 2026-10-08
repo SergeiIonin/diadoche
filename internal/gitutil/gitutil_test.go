@@ -624,3 +624,31 @@ func TestPathsInTreeAndShowFile(t *testing.T) {
 		t.Error("IsEmptyTree misreports")
 	}
 }
+
+func TestDiffUntrackedRendersNewFilePatches(t *testing.T) {
+	requireGit(t)
+	dir := t.TempDir()
+	ctx := context.Background()
+	if err := EnsureRepo(ctx, dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sub", "new.txt"), []byte("brand new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := DiffUntracked(ctx, dir, []string{"sub/new.txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "new file mode") || !strings.Contains(out, "+brand new") || !strings.Contains(out, "sub/new.txt") {
+		t.Errorf("DiffUntracked = %q, want a new-file patch of sub/new.txt", out)
+	}
+	if out, err := DiffUntracked(ctx, dir, nil); err != nil || out != "" {
+		t.Errorf("DiffUntracked(nil) = %q, %v; want empty", out, err)
+	}
+	if _, err := DiffUntracked(ctx, dir, []string{"missing.txt"}); err == nil {
+		t.Error("DiffUntracked of a missing file: want an error")
+	}
+}

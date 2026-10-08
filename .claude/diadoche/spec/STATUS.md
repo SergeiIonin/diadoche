@@ -9,5 +9,5 @@
 | 007 | 007_red_green_test_check.md | DONE |
 | 008 | 008_limit_pause_and_budgets.md | DONE |
 | 009 | 009_idempotent_restart_state.md | DONE |
-| 010 | 010_run_logs_and_artifacts.md | QUEUED |
+| 010 | 010_run_logs_and_artifacts.md | DONE |
 | 011 | 011_dry_run_no_side_effects.md | QUEUED |

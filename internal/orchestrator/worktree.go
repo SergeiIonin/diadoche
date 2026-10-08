@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"diadoche/internal/gitutil"
+	"diadoche/internal/runlog"
 	"diadoche/internal/specs"
 )
 
@@ -146,7 +147,10 @@ func (o *Orchestrator) finishDoneWorktree(ctx context.Context, specFile string, 
 			reason := fmt.Sprintf("merge of %s into %s failed (%s); worktree kept at %s", ws.branch, target, mErr.Error(), o.relPath(ws.dir))
 			if err := specs.SetStatusReason(o.Layout, specFile, specs.StatusBlocked, reason); err != nil {
 				o.Log.Printf("task %s: also failed to record BLOCKED status: %v", specFile, err)
+			} else {
+				o.event(specFile, 0, "", "status", runlog.F("status", specs.StatusBlocked), runlog.F("reason", "merge_failed"))
 			}
+			o.event(specFile, 0, "", "merge_blocked", runlog.F("branch", ws.branch), runlog.F("into", target))
 			o.Log.Printf("task %s: BLOCKED: %s; the worktree and branch %s are kept for a human to resolve", specFile, reason, ws.branch)
 			ws.removeBaseFile()
 			o.commitBookkeeping(ctx, specFile, "diadoche: BLOCKED "+specFile)
@@ -160,8 +164,13 @@ func (o *Orchestrator) finishDoneWorktree(ctx context.Context, specFile string, 
 			how = "fast-forward"
 		}
 		o.Log.Printf("task %s: merged %s into %s (%s)", specFile, ws.branch, target, how)
+		if !ff {
+			how = "merge"
+		}
+		o.event(specFile, 0, "", "merge", runlog.F("branch", ws.branch), runlog.F("into", target), runlog.F("how", how))
 	} else {
 		o.Log.Printf("task %s: no code changes to merge", specFile)
+		o.event(specFile, 0, "", "merge", runlog.F("branch", ws.branch), runlog.F("how", "none"))
 	}
 
 	if err := gitutil.WorktreeRemove(ctx, o.Cfg.Dir, ws.dir); err != nil {
@@ -199,6 +208,7 @@ func (o *Orchestrator) failWorktree(ctx context.Context, specFile, num string, w
 		return err
 	}
 	o.Log.Printf("task %s: worktree removed, its branch renamed to %s", specFile, branch)
+	o.event(specFile, 0, "", "park", runlog.F("branch", branch))
 
 	failedPath := filepath.Join(o.Layout.SpecDir, num+"_FAILED.md")
 	if err := os.WriteFile(failedPath, []byte(o.failedReport(specFile, num, branch, stat, restorable, cause, true)), 0o644); err != nil {

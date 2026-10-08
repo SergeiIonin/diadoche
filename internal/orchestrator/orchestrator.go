@@ -24,6 +24,14 @@
 // STATUS.md/QUEUE.md. A signal (Orchestrator.StopRequested) lets the agent
 // call in flight finish, then Run saves the state and returns
 // ErrInterrupted; the task stays pending and is never failed for it.
+//
+// Every run also gets .claude/diadoche/runs/<run-id>/ (see artifacts.go and
+// package runlog): run.log, one line per event (run/task start and end,
+// agent calls, tester verdicts, pauses, status changes, merges, parking),
+// and per task a <NNN>-<slug>/ directory with each iteration's plan and
+// review, every agent call's raw stdout/stderr and the task's final.diff.
+// Writing them is best effort: a failure is a warning, never the end of
+// the run.
 package orchestrator
 
 import (
@@ -41,6 +49,7 @@ import (
 	"diadoche/internal/config"
 	"diadoche/internal/gitutil"
 	"diadoche/internal/implplan"
+	"diadoche/internal/runlog"
 	"diadoche/internal/runstate"
 	"diadoche/internal/skills"
 	"diadoche/internal/speclock"
@@ -103,6 +112,11 @@ type Orchestrator struct {
 	// until processTask takes it; cur is the current task's record.
 	resume *runstate.Task
 	cur    *runstate.Task
+
+	// run is this run's directory under .claude/diadoche/runs, holding
+	// run.log and the tasks' artifacts; nil in --dry-run or when it
+	// couldn't be created (every runlog method is a no-op on nil).
+	run *runlog.Run
 }
 
 func New(cfg config.Config) *Orchestrator {
@@ -125,7 +139,7 @@ func New(cfg config.Config) *Orchestrator {
 	}
 }
 
-func (o *Orchestrator) Run(ctx context.Context) error {
+func (o *Orchestrator) Run(ctx context.Context) (err error) {
 	if err := o.Layout.Ensure(); err != nil {
 		return fmt.Errorf("ensure layout: %w", err)
 	}
@@ -140,6 +154,19 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			}
 		}
 	}
+
+	o.openRun(ctx)
+	defer o.run.Close()
+	defer func() {
+		result := "ok"
+		switch {
+		case errors.Is(err, ErrInterrupted) || errors.Is(err, context.Canceled):
+			result = "interrupted"
+		case err != nil:
+			result = "error"
+		}
+		o.event("", 0, "", "run_end", runlog.F("result", result))
+	}()
 
 	matchedSkills, err := skills.Resolve(o.Layout.SkillsDir, o.Cfg.Langs, o.Cfg.Frameworks)
 	if err != nil {
@@ -216,6 +243,11 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 				return fmt.Errorf("read queue: %w", err)
 			}
 			o.initRunState(ctx, queue)
+			runDir := ""
+			if o.run != nil {
+				runDir = o.run.ID
+			}
+			o.event("", 0, "", "run_start", runlog.F("run", runDir), runlog.F("state_run", o.runID))
 		}
 
 		processedAny := false
@@ -317,12 +349,26 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 			o.checkResumedWorkspace(specFile, ws, resume)
 		}
 	}
+	if ws != nil {
+		o.event(specFile, 0, "", "task_start", runlog.F("base", ws.base))
+	} else {
+		o.event(specFile, 0, "", "task_start")
+	}
 
 	if err := specs.SetStatus(o.Layout, specFile, specs.StatusInProgress); err != nil {
 		return err
 	}
+	o.event(specFile, 0, "", "status", runlog.F("status", specs.StatusInProgress))
 
 	done, cause := o.runIterations(ctx, specFile, num, ws, resume, planner, worker, tester, uw)
+	o.writeFinalDiff(ctx, specFile, num, ws)
+	taskEnd := func(status, reason string) {
+		fields := []runlog.Field{runlog.F("status", status)}
+		if reason != "" {
+			fields = append(fields, runlog.F("reason", reason))
+		}
+		o.event(specFile, 0, "", "task_end", fields...)
+	}
 
 	// The resumable outcomes below keep the task's run-state.json record
 	// (the next run continues from it); every other one closes it.
@@ -330,12 +376,14 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 	if errors.As(cause, &interrupted) {
 		o.saveState()
 		o.Log.Printf("task %s: interrupted while paused; it stays PAUSED and is resumed by the next run", specFile)
+		taskEnd(specs.StatusPaused, "interrupted")
 		return &fatalError{cause}
 	}
 	if !done && (errors.Is(cause, ErrInterrupted) || ctx.Err() != nil) {
 		// A signal is never a reason to fail a task: nothing is parked.
 		o.saveState()
 		o.Log.Printf("task %s: interrupted by signal; it stays IN_PROGRESS and the next run resumes it %s", specFile, o.resumePoint())
+		taskEnd(specs.StatusInProgress, "interrupted")
 		if cause == nil || errors.Is(cause, ErrInterrupted) {
 			return &fatalError{cmp.Or(cause, ErrInterrupted)}
 		}
@@ -344,6 +392,7 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 	if errors.Is(cause, ErrRunBudgetExceeded) {
 		o.saveState()
 		o.Log.Printf("task %s: run budget exhausted; leaving it pending with its changes in place", specFile)
+		taskEnd(specs.StatusInProgress, "run_budget")
 		return &fatalError{cause}
 	}
 	if cause != nil && usagelimit.Mentions(cause.Error()) {
@@ -353,23 +402,35 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 		// changes still in the working tree (or its worktree).
 		o.saveState()
 		o.Log.Printf("task %s: interrupted by a claude usage limit; leaving it IN_PROGRESS with its changes in place", specFile)
+		taskEnd(specs.StatusInProgress, "usage_limit")
 		return &fatalError{cause}
 	}
 	defer o.closeTaskState()
 	if done {
 		o.Log.Printf("task %s: DONE", specFile)
+		var err error
 		if ws != nil && ws.worktree {
-			return o.finishDoneWorktree(ctx, specFile, ws)
+			err = o.finishDoneWorktree(ctx, specFile, ws)
+		} else {
+			if ws != nil {
+				ws.removeBaseFile()
+			}
+			err = o.commitDone(ctx, specFile)
 		}
-		if ws != nil {
-			ws.removeBaseFile()
+		// finishDoneWorktree turns a task whose merge failed BLOCKED.
+		status, serr := specs.GetStatus(o.Layout, specFile)
+		if serr != nil || status == "" {
+			status = specs.StatusDone
 		}
-		return o.commitDone(ctx, specFile)
+		taskEnd(status, "")
+		return err
 	}
 	if cause == nil {
 		o.Log.Printf("task %s: FAILED after %d iteration(s)", specFile, o.Cfg.Iter)
 	}
-	if err := o.failTask(ctx, specFile, num, ws, cause); err != nil {
+	err := o.failTask(ctx, specFile, num, ws, cause)
+	taskEnd(specs.StatusFailed, "")
+	if err != nil {
 		return &fatalError{fmt.Errorf("task %s: park FAILED changes: %w", specFile, err)}
 	}
 	return cause
@@ -422,7 +483,7 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 			return false, ErrInterrupted
 		}
 		o.Log.Printf("--- %s iteration %d/%d ---", specFile, iter, o.Cfg.Iter)
-		call := agentCall{specFile: specFile, iter: iter, workDir: o.Cfg.Dir, uw: uw, tally: &iterationTally{}}
+		call := agentCall{specFile: specFile, num: num, iter: iter, workDir: o.Cfg.Dir, uw: uw, tally: &iterationTally{}}
 		if ws != nil {
 			call.workDir = ws.dir
 		}
@@ -490,6 +551,7 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 			plannerPrompt += fmt.Sprintf("\nWrite (or update) the implementation plan to %s.", implPlanPath)
 
 			result, err := o.runStep(ctx, call, planner, plannerPrompt)
+			o.copyArtifact(specFile, num, fmt.Sprintf("iter-%d-IMPL_PLAN.md", iter), implPlanPath)
 			if err := o.checkBudgets(specFile, uw); err != nil {
 				return false, err
 			}
@@ -519,11 +581,15 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 					return false, fmt.Errorf("write plan-contract review: %w", err)
 				}
 				o.Log.Printf("%s iteration %d: %s is missing or empty in the required Files/Test Command sections (Files must list at least one file); retrying planner next iteration", specFile, iter, implPlanFile)
+				o.copyArtifact(specFile, num, fmt.Sprintf("iter-%d-REVIEW.md", iter), reviewPath)
+				o.event(specFile, iter, "", "plan_rejected", runlog.F("review", reviewFile))
 				continue
 			}
 			if o.stopRequested() {
 				return false, ErrInterrupted
 			}
+		} else {
+			o.copyArtifact(specFile, num, fmt.Sprintf("iter-%d-IMPL_PLAN.md", iter), implPlanPath)
 		}
 
 		implPlanBytes, err := os.ReadFile(implPlanPath)
@@ -566,6 +632,7 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 			}
 			if td.Empty {
 				o.Log.Printf("%s iteration %d: empty diff after worker, skipping tester (iteration unsuccessful)", specFile, iter)
+				o.event(specFile, iter, "", "empty_diff")
 				continue
 			}
 			diffForTester, diffNote = td.Body, td.Note
@@ -586,6 +653,8 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 					return false, fmt.Errorf("write red-green review: %w", err)
 				}
 				o.Log.Printf("%s iteration %d: red-green check failed, skipping tester (iteration unsuccessful)", specFile, iter)
+				o.copyArtifact(specFile, num, fmt.Sprintf("iter-%d-REVIEW.md", iter), reviewPath)
+				o.event(specFile, iter, "", "redgreen_failed", runlog.F("review", reviewFile))
 				continue
 			}
 			if rg.testerNote != "" {
@@ -612,7 +681,14 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 		if err != nil {
 			return false, err
 		}
+		o.copyArtifact(specFile, num, fmt.Sprintf("iter-%d-REVIEW.md", iter), reviewPath)
+		verdict := "NOT_DONE"
 		if status == specs.StatusDone {
+			verdict = specs.StatusDone
+		}
+		o.event(specFile, iter, "tester", "verdict", runlog.F("verdict", verdict), runlog.F("review", reviewFile))
+		if status == specs.StatusDone {
+			o.event(specFile, iter, "tester", "status", runlog.F("status", specs.StatusDone), runlog.F("by", "tester"))
 			// A task that just reached DONE is never failed for cost after
 			// the fact — that would throw away completed work for no
 			// benefit, since there's no further spend left to prevent this
@@ -658,6 +734,7 @@ func (o *Orchestrator) runStep(ctx context.Context, c agentCall, a *agents.Agent
 // it's part of.
 type agentCall struct {
 	specFile string
+	num      string
 	iter     int
 	workDir  string
 	uw       *usage.Writer
@@ -678,11 +755,24 @@ type iterationTally struct {
 func (o *Orchestrator) runAgent(ctx context.Context, c agentCall, a *agents.Agent, prompt string) (agents.RunResult, error) {
 	prefix := fmt.Sprintf("%s iter %d/%d: [%s]", c.specFile, c.iter, o.Cfg.Iter, a.Name)
 	o.Log.Printf("%s started (model=%s)", prefix, a.Model)
+	o.event(c.specFile, c.iter, a.Name, "agent_start", runlog.F("model", a.Model))
 
 	stopHeartbeat := o.startHeartbeat(prefix)
 	result, err := o.Runner.Run(ctx, c.workDir, a, prompt)
 	stopHeartbeat()
 	o.recordUsage(c.uw, c.specFile, a.Name, c.iter, a.Model, result)
+	o.saveCallOutput(c, a, result)
+	cost, outcomeField := "unknown", "ok"
+	if result.Parsed {
+		cost = fmt.Sprintf("$%.4f", result.TotalCostUSD)
+	}
+	if err != nil {
+		outcomeField = "failed"
+	}
+	o.event(c.specFile, c.iter, a.Name, "agent_end",
+		runlog.F("duration", (time.Duration(result.DurationMS)*time.Millisecond).Round(time.Millisecond)),
+		runlog.F("exit", result.ExitCode), runlog.F("cost", cost),
+		runlog.F("tokens", result.Usage.Total()), runlog.F("result", outcomeField))
 
 	if result.Parsed {
 		c.tally.tokens += result.Usage.Total()
@@ -841,5 +931,6 @@ func (o *Orchestrator) commitDone(ctx context.Context, specFile string) error {
 		return fmt.Errorf("commit %s: %w", specFile, err)
 	}
 	o.Log.Printf("task %s: committed", specFile)
+	o.event(specFile, 0, "", "commit")
 	return nil
 }
