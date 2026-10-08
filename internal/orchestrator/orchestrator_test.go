@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"diadoche/internal/config"
 	"diadoche/internal/gitutil"
 	"diadoche/internal/specs"
+	"diadoche/internal/usage"
 )
 
 // testAgentModel is the model every test fixture agent definition uses. It
@@ -465,22 +467,26 @@ func TestRunUsesBuiltInDefaultModelsWhenNoOverride(t *testing.T) {
 	}
 }
 
-// ---- usage accounting (09_optimize_agents.md, subtask 2) ----
+// ---- usage accounting (002_usage_accounting.md) ----
 
-// usageRunner returns a fixed, fully-parsed RunResult for every call (as if
-// every claude invocation succeeded and its JSON output parsed cleanly),
-// while still driving the task to DONE like fakeRunner.
+// usageRunner returns a fully-parsed RunResult for every call (as if every
+// claude invocation succeeded and its JSON output parsed cleanly), while
+// still driving the task to DONE like fakeRunner. Token counts differ per
+// agent so a test can tell the recorded lines apart.
 type usageRunner struct {
 	layout specs.Layout
 }
 
+// usageFixtures is what usageRunner reports for each agent: the expected
+// content of that agent's usage.jsonl line.
+var usageFixtures = map[string]agents.RunResult{
+	"planner": {Usage: agents.Usage{InputTokens: 10, OutputTokens: 5, CacheCreationInputTokens: 100, CacheReadInputTokens: 1000}, TotalCostUSD: 0.001, DurationMS: 1, ExitCode: 0, Parsed: true},
+	"worker":  {Usage: agents.Usage{InputTokens: 20, OutputTokens: 10, CacheCreationInputTokens: 200, CacheReadInputTokens: 2000}, TotalCostUSD: 0.002, DurationMS: 2, ExitCode: 0, Parsed: true},
+	"tester":  {Usage: agents.Usage{InputTokens: 30, OutputTokens: 15, CacheCreationInputTokens: 300, CacheReadInputTokens: 3000}, TotalCostUSD: 0.003, DurationMS: 3, ExitCode: 0, Parsed: true},
+}
+
 func (r usageRunner) Run(_ context.Context, workDir string, a *agents.Agent, _ string) (agents.RunResult, error) {
-	result := agents.RunResult{
-		Usage:        agents.Usage{InputTokens: 10, OutputTokens: 5},
-		TotalCostUSD: 0.001,
-		DurationMS:   1,
-		Parsed:       true,
-	}
+	result := usageFixtures[a.Name]
 	switch a.Name {
 	case "planner":
 		if err := os.WriteFile(filepath.Join(r.layout.SpecDir, "001_IMPL_PLAN.md"), []byte(validPlanFixture), 0o644); err != nil {
@@ -541,24 +547,63 @@ func TestRunWritesUsageJSONLAndPrintsSummary(t *testing.T) {
 	if len(lines) != 3 { // planner, worker, tester
 		t.Fatalf("usage.jsonl has %d lines, want 3; content:\n%s", len(lines), data)
 	}
+	seen := map[string]bool{}
+	var sumIn, sumOut, sumCacheWrite, sumCacheRead int
+	var sumCost float64
 	for _, line := range lines {
-		var rec struct {
-			Agent      string  `json:"agent"`
-			Task       string  `json:"task"`
-			CostUSD    float64 `json:"cost_usd"`
-			Parsed     bool    `json:"parsed"`
-			DurationMS int64   `json:"duration_ms"`
-		}
+		var rec usage.Record
 		if err := json.Unmarshal([]byte(line), &rec); err != nil {
 			t.Fatalf("line not valid JSON: %v: %s", err, line)
 		}
-		if !rec.Parsed || rec.CostUSD != 0.001 || rec.Task != "001_example.md" {
-			t.Errorf("unexpected usage record: %+v", rec)
+		want, ok := usageFixtures[rec.Agent]
+		if !ok {
+			t.Fatalf("unexpected agent %q in usage.jsonl", rec.Agent)
 		}
+		if seen[rec.Agent] {
+			t.Errorf("agent %s recorded more than once", rec.Agent)
+		}
+		seen[rec.Agent] = true
+
+		if rec.Task != "001_example.md" || rec.Iteration != 1 || rec.Model != testAgentModel {
+			t.Errorf("unexpected task/iteration/model in record: %+v", rec)
+		}
+		if rec.Time.IsZero() {
+			t.Errorf("record for %s has a zero time", rec.Agent)
+		}
+		if !rec.Parsed || rec.ExitCode != 0 {
+			t.Errorf("record for %s: parsed=%v exit_code=%d, want parsed=true exit_code=0", rec.Agent, rec.Parsed, rec.ExitCode)
+		}
+		if rec.InputTokens != want.Usage.InputTokens || rec.OutputTokens != want.Usage.OutputTokens ||
+			rec.CacheCreationInputTokens != want.Usage.CacheCreationInputTokens ||
+			rec.CacheReadInputTokens != want.Usage.CacheReadInputTokens ||
+			rec.CostUSD != want.TotalCostUSD || rec.DurationMS != want.DurationMS {
+			t.Errorf("record for %s = %+v, does not match the runner's result %+v", rec.Agent, rec, want)
+		}
+
+		sumIn += rec.InputTokens
+		sumOut += rec.OutputTokens
+		sumCacheWrite += rec.CacheCreationInputTokens
+		sumCacheRead += rec.CacheReadInputTokens
+		sumCost += rec.CostUSD
+	}
+	if len(seen) != 3 {
+		t.Fatalf("recorded agents = %v, want planner, worker and tester", seen)
 	}
 
-	if !strings.Contains(logBuf.String(), "usage summary") {
-		t.Errorf("expected end-of-run log to contain a usage summary; got:\n%s", logBuf.String())
+	// The printed summary must be exactly the sum of the usage.jsonl lines.
+	out := logBuf.String()
+	cacheShare := float64(sumCacheRead) / float64(sumIn+sumCacheWrite+sumCacheRead) * 100
+	for _, want := range []string{
+		"usage summary",
+		"3 call(s)",
+		fmt.Sprintf("%d input / %d output tokens", sumIn, sumOut),
+		fmt.Sprintf("(+%d cache-write / %d cache-read)", sumCacheWrite, sumCacheRead),
+		fmt.Sprintf("$%.4f", sumCost),
+		fmt.Sprintf("cache-read share of all input tokens: %.1f%% (%d of %d)", cacheShare, sumCacheRead, sumIn+sumCacheWrite+sumCacheRead),
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("end-of-run summary missing %q; got:\n%s", want, out)
+		}
 	}
 }
 
@@ -636,8 +681,84 @@ func TestRunSurvivesUnparseableUsageOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(strings.TrimSpace(string(data))) == 0 {
-		t.Error("expected usage.jsonl to still get a (zeroed) line per call")
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 3 { // planner, worker, tester — one zeroed line each
+		t.Fatalf("usage.jsonl has %d lines, want 3; content:\n%s", len(lines), data)
+	}
+	for _, line := range lines {
+		var rec usage.Record
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("line not valid JSON: %v: %s", err, line)
+		}
+		if rec.Parsed {
+			t.Errorf("record for %s has parsed=true, want false", rec.Agent)
+		}
+		if rec.InputTokens != 0 || rec.OutputTokens != 0 || rec.CostUSD != 0 {
+			t.Errorf("record for %s should be zeroed, got %+v", rec.Agent, rec)
+		}
+	}
+}
+
+// failingUsageRunner fails every call for the named agent, reporting the
+// claude CLI's non-zero exit status — a failed call must still be recorded,
+// with its exit code.
+type failingUsageRunner struct {
+	failOn string
+}
+
+func (r failingUsageRunner) Run(_ context.Context, _ string, a *agents.Agent, _ string) (agents.RunResult, error) {
+	if a.Name == r.failOn {
+		return agents.RunResult{ExitCode: 1, DurationMS: 1}, errors.New("simulated: claude exited with status 1")
+	}
+	return agents.RunResult{}, nil
+}
+
+func TestRunRecordsFailedCallsWithTheirExitCode(t *testing.T) {
+	requireGit(t)
+	dir := t.TempDir()
+	setTestGitEnv(t)
+
+	layout := specs.NewLayout(dir)
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	writeAgentFixtures(t, layout.AgentsDir)
+	for _, f := range []string{"001_a.md", "002_b.md", "003_c.md"} {
+		if err := os.WriteFile(filepath.Join(layout.SpecDir, f), []byte("# task\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var logBuf strings.Builder
+	o := &Orchestrator{
+		Cfg:    config.Config{Dir: dir, Iter: 1, MaxDiffBytes: config.DefaultMaxDiffBytes},
+		Layout: layout,
+		Runner: failingUsageRunner{failOn: "planner"},
+		Log:    log.New(&logBuf, "", 0),
+	}
+	if err := o.Run(context.Background()); err == nil {
+		t.Fatal("expected Run to abort after repeated planner failures")
+	}
+
+	data, err := os.ReadFile(filepath.Join(layout.Root, "usage.jsonl"))
+	if err != nil {
+		t.Fatalf("expected a usage line even for failed calls: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) == 0 {
+		t.Fatal("expected at least one usage record")
+	}
+	for _, line := range lines {
+		var rec usage.Record
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("line not valid JSON: %v: %s", err, line)
+		}
+		if rec.Agent != "planner" {
+			t.Errorf("recorded agent = %q, want planner (the only agent that ran)", rec.Agent)
+		}
+		if rec.ExitCode != 1 {
+			t.Errorf("record for %s has exit_code=%d, want 1", rec.Agent, rec.ExitCode)
+		}
 	}
 }
 

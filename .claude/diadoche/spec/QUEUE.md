@@ -1,4 +1,3 @@
-- 002_usage_accounting.md
 - 003_impl_plan_files_contract.md
 - 004_tester_gets_diff.md
 - 005_stable_prompt_prefix.md

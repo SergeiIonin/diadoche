@@ -27,13 +27,25 @@ type Usage struct {
 // underlying claude invocation's JSON usage/cost fields couldn't be read
 // (e.g. --dry-run, a malformed response, or a hard failure before any JSON
 // was produced) — callers must check it before trusting the token/cost
-// fields, but DurationMS is always the real measured wall-clock time.
+// fields, but DurationMS and ExitCode are always the real observed values.
 type RunResult struct {
-	Output       string
+	// Output is the agent's text answer: the JSON result object's "result"
+	// field when the claude output parsed and carried one. It falls back to
+	// the raw stdout+stderr otherwise, so an unparseable or crashed call
+	// still leaves something to debug with.
+	Output string
+
 	Usage        Usage
 	TotalCostUSD float64
 	DurationMS   int64
-	Parsed       bool
+
+	// ExitCode is the claude process's exit status: 0 on success, >0 for
+	// the CLI's own non-zero exit, and -1 when no status was ever produced
+	// (the binary couldn't be started, or the process was killed by a
+	// signal — e.g. the --max-call-minutes timeout).
+	ExitCode int
+
+	Parsed bool
 }
 
 // Total is every token the turn consumed: input, output and both kinds of
@@ -43,16 +55,21 @@ func (u Usage) Total() int {
 }
 
 // Summary renders the turn's duration, token breakdown and cost as one
-// human-readable log fragment. Tokens/cost are reported as unknown when
-// the claude JSON result couldn't be parsed (e.g. --dry-run).
+// human-readable log fragment, plus the exit code when it isn't 0.
+// Tokens/cost are reported as unknown when the claude JSON result couldn't
+// be parsed (e.g. --dry-run).
 func (r RunResult) Summary() string {
 	d := (time.Duration(r.DurationMS) * time.Millisecond).Round(time.Second)
+	var exit string
+	if r.ExitCode != 0 {
+		exit = fmt.Sprintf(", exit=%d", r.ExitCode)
+	}
 	if !r.Parsed {
-		return fmt.Sprintf("took %s, tokens: unknown", d)
+		return fmt.Sprintf("took %s, tokens: unknown%s", d, exit)
 	}
 	u := r.Usage
-	return fmt.Sprintf("took %s, tokens: %d (in=%d out=%d cache_write=%d cache_read=%d), cost $%.4f",
-		d, u.Total(), u.InputTokens, u.OutputTokens, u.CacheCreationInputTokens, u.CacheReadInputTokens, r.TotalCostUSD)
+	return fmt.Sprintf("took %s, tokens: %d (in=%d out=%d cache_write=%d cache_read=%d), cost $%.4f%s",
+		d, u.Total(), u.InputTokens, u.OutputTokens, u.CacheCreationInputTokens, u.CacheReadInputTokens, r.TotalCostUSD, exit)
 }
 
 // Runner launches one independent agent turn and returns its combined
@@ -67,8 +84,9 @@ type Runner interface {
 //	    --append-system-prompt <role prompt> --output-format json -p <task prompt>
 //
 // --output-format json is what makes usage/cost accounting (RunResult.Usage,
-// TotalCostUSD) possible; the raw stdout/stderr is still captured as-is for
-// error messages and RunResult.Output.
+// TotalCostUSD) possible, and carries the agent's text answer in the result
+// object's "result" field (RunResult.Output); the raw stdout/stderr is still
+// captured as-is for error messages and as a fallback output.
 type CLIRunner struct {
 	Bin string // defaults to "claude"
 
@@ -117,25 +135,48 @@ func (r CLIRunner) Run(ctx context.Context, workDir string, a *Agent, prompt str
 	result := RunResult{
 		Output:     combined,
 		DurationMS: duration.Milliseconds(),
+		ExitCode:   exitCode(cmd),
 	}
-	if usage, cost, ok := parseUsageJSON(stdout.Bytes()); ok {
-		result.Usage = usage
-		result.TotalCostUSD = cost
+	if parsed, ok := parseClaudeJSON(stdout.Bytes()); ok {
+		result.Usage = parsed.Usage
+		result.TotalCostUSD = parsed.TotalCostUSD
 		result.Parsed = true
+		if parsed.Result != "" {
+			result.Output = parsed.Result
+		}
 	}
 
 	if runErr != nil {
 		if r.MaxCallDuration > 0 && errors.Is(callCtx.Err(), context.DeadlineExceeded) {
 			return result, fmt.Errorf("agent %s: call killed after exceeding --max-call-minutes=%s", a.Name, r.MaxCallDuration)
 		}
+		// The error deliberately carries the *raw* stdout+stderr tail, not
+		// the parsed result text: usage-limit detection
+		// (usagelimit.Mentions here, usagelimit.IsLimitLine over diadoche's
+		// log in diadoche-restarter) needs the claude JSON line with
+		// "is_error":true and the limit message on one single line.
 		return result, fmt.Errorf("agent %s: %w: %s", a.Name, runErr, tail(combined, 2000))
 	}
 	return result, nil
 }
 
+// exitCode reports the finished process's exit status, or -1 when it never
+// produced one (failed to start, or killed by a signal — including the
+// --max-call-minutes timeout).
+func exitCode(cmd *exec.Cmd) int {
+	if cmd.ProcessState == nil {
+		return -1
+	}
+	return cmd.ProcessState.ExitCode()
+}
+
 // claudeJSONResult is the subset of the claude CLI's `--output-format json`
-// result object diadoche cares about for usage accounting.
+// result object diadoche cares about: the agent's text answer plus its
+// usage accounting.
 type claudeJSONResult struct {
+	Result       string   `json:"result"`
+	Subtype      string   `json:"subtype"`
+	IsError      bool     `json:"is_error"`
 	TotalCostUSD *float64 `json:"total_cost_usd"`
 	Usage        *struct {
 		InputTokens              int `json:"input_tokens"`
@@ -145,25 +186,39 @@ type claudeJSONResult struct {
 	} `json:"usage"`
 }
 
-// parseUsageJSON extracts usage/cost from a claude CLI JSON result. It
-// returns ok=false (never an error) whenever the output isn't parseable
-// JSON or is missing the fields diadoche needs — usage accounting is
-// best-effort and must never be the reason an agent turn is treated as
-// having failed.
-func parseUsageJSON(stdout []byte) (Usage, float64, bool) {
-	var result claudeJSONResult
-	if err := json.Unmarshal(bytes.TrimSpace(stdout), &result); err != nil {
-		return Usage{}, 0, false
+// claudeResult is a decoded claude CLI JSON result, in the shape diadoche
+// uses it: the agent's text answer and its token/cost accounting.
+type claudeResult struct {
+	Usage        Usage
+	TotalCostUSD float64
+	Result       string
+	IsError      bool
+}
+
+// parseClaudeJSON extracts the agent's text result plus usage/cost from a
+// claude CLI JSON result. It returns ok=false (never an error) whenever the
+// output isn't parseable JSON or is missing the usage/cost fields diadoche
+// needs — usage accounting is best-effort and must never be the reason an
+// agent turn is treated as having failed.
+func parseClaudeJSON(stdout []byte) (claudeResult, bool) {
+	var decoded claudeJSONResult
+	if err := json.Unmarshal(bytes.TrimSpace(stdout), &decoded); err != nil {
+		return claudeResult{}, false
 	}
-	if result.Usage == nil || result.TotalCostUSD == nil {
-		return Usage{}, 0, false
+	if decoded.Usage == nil || decoded.TotalCostUSD == nil {
+		return claudeResult{}, false
 	}
-	return Usage{
-		InputTokens:              result.Usage.InputTokens,
-		OutputTokens:             result.Usage.OutputTokens,
-		CacheCreationInputTokens: result.Usage.CacheCreationInputTokens,
-		CacheReadInputTokens:     result.Usage.CacheReadInputTokens,
-	}, *result.TotalCostUSD, true
+	return claudeResult{
+		Usage: Usage{
+			InputTokens:              decoded.Usage.InputTokens,
+			OutputTokens:             decoded.Usage.OutputTokens,
+			CacheCreationInputTokens: decoded.Usage.CacheCreationInputTokens,
+			CacheReadInputTokens:     decoded.Usage.CacheReadInputTokens,
+		},
+		TotalCostUSD: *decoded.TotalCostUSD,
+		Result:       decoded.Result,
+		IsError:      decoded.IsError,
+	}, true
 }
 
 // tail returns at most the last n bytes of s, so a failed agent's error

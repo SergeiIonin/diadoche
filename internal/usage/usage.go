@@ -30,6 +30,7 @@ type Record struct {
 	CacheReadInputTokens     int       `json:"cache_read_input_tokens"`
 	CostUSD                  float64   `json:"cost_usd"`
 	DurationMS               int64     `json:"duration_ms"`
+	ExitCode                 int       `json:"exit_code"`
 	Parsed                   bool      `json:"parsed"`
 }
 
@@ -85,6 +86,23 @@ type totals struct {
 	CacheReadInputTokens     int
 	CostUSD                  float64
 	DurationMS               int64
+}
+
+// allInputTokens is every token that entered the model: fresh input plus
+// both kinds of prompt-cache traffic (output tokens excluded).
+func (t totals) allInputTokens() int {
+	return t.InputTokens + t.CacheCreationInputTokens + t.CacheReadInputTokens
+}
+
+// cacheReadShare is the fraction of all input tokens that were served from
+// the prompt cache — the single number that says whether caching is
+// working. It is 0 when no input tokens were recorded at all.
+func (t totals) cacheReadShare() float64 {
+	all := t.allInputTokens()
+	if all == 0 {
+		return 0
+	}
+	return float64(t.CacheReadInputTokens) / float64(all)
 }
 
 // Summary aggregates Records overall and broken down by agent and by task.
@@ -147,16 +165,21 @@ func (s *Summary) Format() string {
 		s.Overall.CacheCreationInputTokens, s.Overall.CacheReadInputTokens,
 		s.Overall.CostUSD, time.Duration(s.Overall.DurationMS)*time.Millisecond)
 
+	fmt.Fprintf(&b, "cache-read share of all input tokens: %.1f%% (%d of %d)\n",
+		s.Overall.cacheReadShare()*100, s.Overall.CacheReadInputTokens, s.Overall.allInputTokens())
+
 	b.WriteString("by agent:\n")
 	for _, name := range sortedKeys(s.ByAgent) {
 		t := s.ByAgent[name]
-		fmt.Fprintf(&b, "  %-14s %3d call(s)  %8d in  %8d out  $%.4f\n", name, t.Calls, t.InputTokens, t.OutputTokens, t.CostUSD)
+		fmt.Fprintf(&b, "  %-14s %3d call(s)  %8d in  %8d out  $%.4f  cache-read %5.1f%%\n",
+			name, t.Calls, t.InputTokens, t.OutputTokens, t.CostUSD, t.cacheReadShare()*100)
 	}
 
 	b.WriteString("by task:\n")
 	for _, name := range sortedKeys(s.ByTask) {
 		t := s.ByTask[name]
-		fmt.Fprintf(&b, "  %-30s %3d call(s)  $%.4f\n", name, t.Calls, t.CostUSD)
+		fmt.Fprintf(&b, "  %-30s %3d call(s)  %8d in  %8d out  $%.4f\n",
+			name, t.Calls, t.InputTokens, t.OutputTokens, t.CostUSD)
 	}
 
 	return b.String()

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestWriterAppendsOneLinePerRecordAndBuildsSummary(t *testing.T) {
@@ -20,9 +21,9 @@ func TestWriterAppendsOneLinePerRecordAndBuildsSummary(t *testing.T) {
 	defer w.Close()
 
 	records := []Record{
-		{Task: "001_a.md", Agent: "planner", Iteration: 1, Model: "claude-opus-5", InputTokens: 100, OutputTokens: 50, CostUSD: 0.01, DurationMS: 1000, Parsed: true},
-		{Task: "001_a.md", Agent: "worker", Iteration: 1, Model: "claude-opus-5", InputTokens: 200, OutputTokens: 150, CostUSD: 0.05, DurationMS: 5000, Parsed: true},
-		{Task: "002_b.md", Agent: "planner", Iteration: 1, Model: "claude-opus-5", InputTokens: 80, OutputTokens: 40, CostUSD: 0.008, DurationMS: 800, Parsed: true},
+		{Time: time.Now(), Task: "001_a.md", Agent: "planner", Iteration: 1, Model: "claude-opus-5", InputTokens: 100, OutputTokens: 50, CacheCreationInputTokens: 10, CacheReadInputTokens: 900, CostUSD: 0.01, DurationMS: 1000, ExitCode: 0, Parsed: true},
+		{Time: time.Now(), Task: "001_a.md", Agent: "worker", Iteration: 1, Model: "claude-opus-5", InputTokens: 200, OutputTokens: 150, CacheCreationInputTokens: 20, CacheReadInputTokens: 1800, CostUSD: 0.05, DurationMS: 5000, ExitCode: 1, Parsed: true},
+		{Time: time.Now(), Task: "002_b.md", Agent: "planner", Iteration: 1, Model: "claude-opus-5", InputTokens: 80, OutputTokens: 40, CostUSD: 0.008, DurationMS: 800, ExitCode: 0, Parsed: true},
 	}
 	for _, r := range records {
 		if err := w.Append(r); err != nil {
@@ -56,6 +57,11 @@ func TestWriterAppendsOneLinePerRecordAndBuildsSummary(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer f.Close()
+	wantKeys := []string{
+		"time", "task", "agent", "iteration", "model",
+		"input_tokens", "output_tokens", "cache_creation_input_tokens",
+		"cache_read_input_tokens", "cost_usd", "duration_ms", "exit_code", "parsed",
+	}
 	var lines int
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
@@ -64,9 +70,91 @@ func TestWriterAppendsOneLinePerRecordAndBuildsSummary(t *testing.T) {
 		if err := json.Unmarshal(scanner.Bytes(), &rec); err != nil {
 			t.Fatalf("line %d not valid JSON: %v", lines, err)
 		}
+		var fields map[string]any
+		if err := json.Unmarshal(scanner.Bytes(), &fields); err != nil {
+			t.Fatalf("line %d not a JSON object: %v", lines, err)
+		}
+		for _, key := range wantKeys {
+			if _, ok := fields[key]; !ok {
+				t.Errorf("line %d is missing the %q field: %s", lines, key, scanner.Bytes())
+			}
+		}
+		if rec.Agent == "worker" && rec.ExitCode != 1 {
+			t.Errorf("worker record exit_code = %d, want 1", rec.ExitCode)
+		}
 	}
 	if lines != 3 {
 		t.Fatalf("usage.jsonl has %d lines, want 3", lines)
+	}
+}
+
+func TestSummaryFormatReportsCacheReadShare(t *testing.T) {
+	s := NewSummary()
+	s.add(Record{Task: "001_a.md", Agent: "planner", InputTokens: 100, CacheCreationInputTokens: 100, CacheReadInputTokens: 800})
+
+	out := s.Format()
+	// 800 cache-read of 1000 total input tokens (output tokens excluded).
+	if !strings.Contains(out, "80.0%") {
+		t.Errorf("Format() missing the cache-read share 80.0%%; got:\n%s", out)
+	}
+	if !strings.Contains(out, "cache-read share of all input tokens") {
+		t.Errorf("Format() missing the cache-read share line; got:\n%s", out)
+	}
+
+	empty := NewSummary()
+	empty.add(Record{Task: "001_a.md", Agent: "planner"})
+	if out := empty.Format(); !strings.Contains(out, "0.0%") {
+		t.Errorf("a zero-token summary must print 0.0%%, not NaN; got:\n%s", out)
+	}
+}
+
+func TestSummaryTotalsEqualSumOfRecords(t *testing.T) {
+	records := []Record{
+		{Task: "001_a.md", Agent: "planner", InputTokens: 10, OutputTokens: 1, CacheCreationInputTokens: 100, CacheReadInputTokens: 1000, CostUSD: 0.01, DurationMS: 100},
+		{Task: "001_a.md", Agent: "worker", InputTokens: 20, OutputTokens: 2, CacheCreationInputTokens: 200, CacheReadInputTokens: 2000, CostUSD: 0.02, DurationMS: 200},
+		{Task: "002_b.md", Agent: "worker", InputTokens: 30, OutputTokens: 3, CacheCreationInputTokens: 300, CacheReadInputTokens: 3000, CostUSD: 0.03, DurationMS: 300},
+	}
+	s := NewSummary()
+	for _, r := range records {
+		s.add(r)
+	}
+
+	sum := func(rs ...Record) totals {
+		var t totals
+		for _, r := range rs {
+			t.Calls++
+			t.InputTokens += r.InputTokens
+			t.OutputTokens += r.OutputTokens
+			t.CacheCreationInputTokens += r.CacheCreationInputTokens
+			t.CacheReadInputTokens += r.CacheReadInputTokens
+			t.CostUSD += r.CostUSD
+			t.DurationMS += r.DurationMS
+		}
+		return t
+	}
+
+	cases := []struct {
+		name string
+		got  totals
+		want totals
+	}{
+		{"overall", s.Overall, sum(records...)},
+		{"agent planner", *s.ByAgent["planner"], sum(records[0])},
+		{"agent worker", *s.ByAgent["worker"], sum(records[1], records[2])},
+		{"task 001_a.md", *s.ByTask["001_a.md"], sum(records[0], records[1])},
+		{"task 002_b.md", *s.ByTask["002_b.md"], sum(records[2])},
+	}
+	for _, c := range cases {
+		if c.got.Calls != c.want.Calls || c.got.InputTokens != c.want.InputTokens ||
+			c.got.OutputTokens != c.want.OutputTokens ||
+			c.got.CacheCreationInputTokens != c.want.CacheCreationInputTokens ||
+			c.got.CacheReadInputTokens != c.want.CacheReadInputTokens ||
+			c.got.DurationMS != c.want.DurationMS {
+			t.Errorf("%s: totals = %+v, want %+v", c.name, c.got, c.want)
+		}
+		if diff := c.got.CostUSD - c.want.CostUSD; diff > 1e-9 || diff < -1e-9 {
+			t.Errorf("%s: CostUSD = %v, want %v", c.name, c.got.CostUSD, c.want.CostUSD)
+		}
 	}
 }
 

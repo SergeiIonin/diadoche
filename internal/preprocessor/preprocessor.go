@@ -119,6 +119,7 @@ func recordUsage(logger *log.Logger, layout specs.Layout, dryRun bool, taskPath,
 		CacheReadInputTokens:     result.Usage.CacheReadInputTokens,
 		CostUSD:                  result.TotalCostUSD,
 		DurationMS:               result.DurationMS,
+		ExitCode:                 result.ExitCode,
 		Parsed:                   result.Parsed,
 	}
 	if err := w.Append(rec); err != nil {

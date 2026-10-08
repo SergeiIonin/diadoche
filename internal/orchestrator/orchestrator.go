@@ -503,7 +503,7 @@ func (o *Orchestrator) checkCallCost(agentName string, result agents.RunResult) 
 // recordUsage appends one usage.jsonl line for a single agent call. A nil
 // uw (--dry-run) is a silent no-op. Neither a write failure nor an
 // unparseable claude JSON result is ever fatal to the run — both are
-// logged as a warning, per 09_optimize_agents.md's "must not crash
+// logged as a warning, per 002_usage_accounting.md's "must not crash
 // the run" requirement.
 func (o *Orchestrator) recordUsage(uw *usage.Writer, specFile, agentName string, iter int, model string, result agents.RunResult) {
 	if uw == nil {
@@ -521,6 +521,7 @@ func (o *Orchestrator) recordUsage(uw *usage.Writer, specFile, agentName string,
 		CacheReadInputTokens:     result.Usage.CacheReadInputTokens,
 		CostUSD:                  result.TotalCostUSD,
 		DurationMS:               result.DurationMS,
+		ExitCode:                 result.ExitCode,
 		Parsed:                   result.Parsed,
 	}
 	if err := uw.Append(rec); err != nil {

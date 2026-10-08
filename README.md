@@ -242,12 +242,24 @@ own.
 
 ## Usage accounting
 
-Every agent call's model, token usage (input/output/cache) and cost — parsed
-from the `claude` CLI's `--output-format json` result — is appended as one
-JSON line to `.claude/diadoche/usage.jsonl`, along with the task, agent
-name, iteration and duration. A line that couldn't be parsed is still
-recorded (zeroed) and logs a warning; usage accounting never fails the run.
-Once a run finishes, a summary (overall, by agent, by task) is printed.
+Agents are invoked with `--output-format json`, so each call returns a JSON
+result object: the agent's text answer in its `result` field (that is what
+the rest of diadoche works with; the raw stdout is kept as a fallback when
+the JSON can't be read) plus the call's token usage and cost.
+
+Every agent call's model, token usage (input/output/cache) and cost is
+appended as one JSON line to `.claude/diadoche/usage.jsonl`, along with the
+task, agent name, iteration, duration and the `claude` process's exit code
+(`0` on success, the CLI's own status when it exits non-zero, `-1` when the
+process never produced one — it couldn't start, or was killed by
+`--max-call-minutes`). A line that couldn't be parsed is still recorded
+(zeroed) and logs a warning; usage accounting never fails the run.
+
+Once a run finishes, a summary is printed: the run total, a breakdown by
+agent and by task, and the cache-read share of all input tokens — that is
+`cache_read_input_tokens` over `input_tokens + cache_creation_input_tokens
++ cache_read_input_tokens` (output tokens excluded), the one number that
+says whether prompt caching is working.
 
 ## Restarting after usage limits (`diadoche-restarter`)
 

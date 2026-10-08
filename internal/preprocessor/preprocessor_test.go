@@ -2,6 +2,7 @@ package preprocessor
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"diadoche/internal/agents"
 	"diadoche/internal/config"
 	"diadoche/internal/specs"
+	"diadoche/internal/usage"
 )
 
 func writeAgentFixture(t *testing.T, agentsDir, name, model string) {
@@ -88,8 +90,16 @@ func TestRunWritesUsageRecordWhenNotDryRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected usage.jsonl to be written: %v", err)
 	}
-	if !strings.Contains(string(data), `"agent":"preprocessor"`) || !strings.Contains(string(data), `"cost_usd":0.01`) {
-		t.Errorf("unexpected usage.jsonl content: %s", data)
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("usage.jsonl has %d lines, want 1; content:\n%s", len(lines), data)
+	}
+	var rec usage.Record
+	if err := json.Unmarshal([]byte(lines[0]), &rec); err != nil {
+		t.Fatalf("usage line not valid JSON: %v: %s", err, lines[0])
+	}
+	if rec.Agent != "preprocessor" || rec.CostUSD != 0.01 || rec.ExitCode != 0 || !rec.Parsed {
+		t.Errorf("unexpected usage record: %+v", rec)
 	}
 }
 
