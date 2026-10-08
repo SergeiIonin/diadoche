@@ -19,7 +19,7 @@
 | 014 | 014_built_in_adr_step.md | DONE |
 | 015 | 015_planner_tester_use_adrs.md | DONE |
 | 019 | 019_task_dependency_graph.md | DONE |
-| 020 | 020_parallel_tasks_serial_merge.md | QUEUED |
+| 020 | 020_parallel_tasks_serial_merge.md | DONE |
 | 021 | 021_parallel_limits_budgets_adr.md | QUEUED |
 | 022 | 022_smoke_config_and_runner.md | QUEUED |
 | 023 | 023_smoke_in_iteration.md | QUEUED |
