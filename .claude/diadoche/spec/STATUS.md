@@ -12,7 +12,7 @@
 | 010 | 010_run_logs_and_artifacts.md | DONE |
 | 011 | 011_dry_run_no_side_effects.md | DONE |
 | 012 | 012_worker_decisions_report.md | DONE |
-| 013 | 013_on_task_done_hook.md | QUEUED |
+| 013 | 013_on_task_done_hook.md | DONE |
 | 014 | 014_built_in_adr_step.md | QUEUED |
 | 015 | 015_planner_tester_use_adrs.md | QUEUED |
 | 016 | 016_on_fail_policy_escalate_block.md | QUEUED |
