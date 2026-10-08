@@ -62,6 +62,12 @@ type workspace struct {
 	// run's branch (the merge or fast-forward tip, or the in-place commit).
 	// Set by finishDoneWorktree/commitDone, read by the on-task-done hooks.
 	mergeCommit string
+
+	// attempt is 2 once a merge conflict made the task re-execute
+	// (--parallel), else 1; conflictBranch is then where its first attempt
+	// was kept, "" when unknown.
+	attempt        int
+	conflictBranch string
 }
 
 func (w *workspace) removeBaseFile() { _ = os.Remove(w.baseFile) }
@@ -162,7 +168,7 @@ func (o *Orchestrator) failTask(ctx context.Context, specFile, num string, ws *w
 	if errors.As(cause, &budget) && budget.task {
 		reason = cause.Error()
 	}
-	if err := specs.SetStatusReason(o.Layout, specFile, specs.StatusFailed, reason); err != nil {
+	if err := o.setStatusReason(specFile, specs.StatusFailed, reason); err != nil {
 		o.Log.Printf("task %s: also failed to record FAILED status: %v", specFile, err)
 	} else {
 		fields := []runlog.Field{runlog.F("status", specs.StatusFailed)}
@@ -328,11 +334,14 @@ func taskID(specFile, num string) string {
 // failedBranchPrefix, blockedBranchPrefix and splitBranchPrefix prefix the
 // branches a FAILED task's changes, with --worktree=false a BLOCKED task's
 // changes, and a task split by --on-fail split's changes are parked on
-// (waitingBranchPrefix, in waiting.go, a WAITING task's in place).
+// (waitingBranchPrefix, in waiting.go, a WAITING task's in place);
+// conflictBranchPrefix the branch a re-executed task's conflicting first
+// attempt is kept on (--parallel, see reexecTask).
 const (
-	failedBranchPrefix  = "diadoche/failed/"
-	blockedBranchPrefix = "diadoche/blocked/"
-	splitBranchPrefix   = "diadoche/split/"
+	failedBranchPrefix   = "diadoche/failed/"
+	blockedBranchPrefix  = "diadoche/blocked/"
+	splitBranchPrefix    = "diadoche/split/"
+	conflictBranchPrefix = "diadoche/conflict/"
 )
 
 // failedBranchName returns diadoche/failed/<num>-<slug>, see

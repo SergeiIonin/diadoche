@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -1224,5 +1225,117 @@ func TestBlockForDependencyCascades(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDiscoverTaskFilesIgnoresArchivedAttempts(t *testing.T) {
+	dir := t.TempDir()
+	for _, f := range []string{"001_x.md", "001_ATTEMPT1_IMPL_PLAN.md", "001_ATTEMPT1_REVIEW_2.md", "001_attempt2_review_1.md"} {
+		writeSpec(t, filepath.Join(dir, f), "x")
+	}
+	got, err := DiscoverTaskFiles(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, []string{"001_x.md"}) {
+		t.Errorf("DiscoverTaskFiles = %v, want only 001_x.md", got)
+	}
+}
+
+func TestPendingPredecessors(t *testing.T) {
+	l := NewLayout(t.TempDir())
+	if err := l.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		"001_a.md": "# A\nDepends-on: none\n",
+		"002_b.md": "# B\nDepends-on: none\n",
+		"003_c.md": "# C\nDepends-on: 001, 002\n",
+		"004_d.md": "# D\n",                  // implicit: the pending task before it
+		"005_e.md": "# E\nDepends-on: 000\n", // 000 is DONE: no edge
+		"000_z.md": "# Z\n",
+	}
+	for f, c := range files {
+		writeSpec(t, filepath.Join(l.SpecDir, f), c)
+	}
+	if err := WriteStatus(l.StatusPath, []Row{
+		{Num: "000", Spec: "000_z.md", Status: StatusDone},
+		{Num: "001", Spec: "001_a.md", Status: StatusDone},
+		{Num: "002", Spec: "002_b.md", Status: StatusInProgress},
+		{Num: "003", Spec: "003_c.md", Status: StatusQueued},
+		{Num: "004", Spec: "004_d.md", Status: StatusQueued},
+		{Num: "005", Spec: "005_e.md", Status: StatusQueued},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(l.StatusPath)
+
+	got, err := PendingPredecessors(l, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][]string{
+		"002_b.md": {},
+		"003_c.md": {"002_b.md"}, // 001 is DONE
+		"004_d.md": {"003_c.md"},
+		"005_e.md": {},
+	}
+	for spec, w := range want {
+		if !slices.Equal(got[spec], w) {
+			t.Errorf("%s: predecessors = %v, want %v", spec, got[spec], w)
+		}
+	}
+	if _, ok := got["001_a.md"]; ok {
+		t.Error("a DONE task must not be listed")
+	}
+
+	// 001 is DONE in STATUS.md but not merged yet: it holds 003 back.
+	got, err = PendingPredecessors(l, []string{"001_a.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got["003_c.md"], []string{"001_a.md", "002_b.md"}) {
+		t.Errorf("003 with 001 also pending: predecessors = %v, want [001_a.md 002_b.md]", got["003_c.md"])
+	}
+	if after, _ := os.ReadFile(l.StatusPath); string(after) != string(before) {
+		t.Error("PendingPredecessors must not write STATUS.md")
+	}
+}
+
+func TestSyncSkipsUnchangedWrites(t *testing.T) {
+	l := NewLayout(t.TempDir())
+	if err := l.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	writeSpec(t, filepath.Join(l.SpecDir, "001_a.md"), "# A\n")
+	if _, _, err := Sync(l); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
+	for _, p := range []string{l.StatusPath, l.QueuePath} {
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := Sync(l); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{l.StatusPath, l.QueuePath} {
+		if fi, err := os.Stat(p); err != nil || !fi.ModTime().Equal(old) {
+			t.Errorf("%s was rewritten by a Sync that changed nothing", filepath.Base(p))
+		}
+	}
+
+	writeSpec(t, filepath.Join(l.SpecDir, "002_b.md"), "# B\n")
+	if _, queue, err := Sync(l); err != nil || !slices.Equal(queue, []string{"001_a.md", "002_b.md"}) {
+		t.Fatalf("Sync = %v, %v", queue, err)
+	}
+	for _, p := range []string{l.StatusPath, l.QueuePath} {
+		if fi, err := os.Stat(p); err != nil || fi.ModTime().Equal(old) {
+			t.Errorf("%s was not rewritten for a new spec", filepath.Base(p))
+		}
+	}
+	if b, _ := os.ReadFile(l.StatusPath); !strings.Contains(string(b), "002_b.md") {
+		t.Errorf("STATUS.md = %s, want 002_b.md", b)
 	}
 }

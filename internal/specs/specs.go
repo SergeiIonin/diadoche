@@ -24,10 +24,14 @@
 // one of them is FAILED or BLOCKED (see CheckDependencies,
 // BlockForDependency and BlockDependents). ValidateGraph rejects declared
 // dependencies on missing tasks and dependency cycles; the pending queue is
-// ordered topologically (see pendingQueue).
+// ordered topologically (see pendingQueue). A scheduler running several
+// tasks at once starts a task only when CheckDependencies finds no blocker
+// and nothing unfinished, and PendingPredecessors lists no pending task
+// before it in that graph.
 package specs
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"math"
@@ -133,8 +137,10 @@ var taskFileRe = regexp.MustCompile(`^(\d+)[_-](.+)\.md$`)
 
 // generatedRe matches slugs produced by diadoche itself, which are not
 // user-authored task specs: NNN_IMPL_PLAN.md, NNN_REVIEW_<M>.md,
-// NNN_FAILED.md, NNN_BLOCKED.md and NNN_WAITING.md.
-var generatedRe = regexp.MustCompile(`(?i)^(IMPL_PLAN|REVIEW_\d+|FAILED|BLOCKED|WAITING)$`)
+// NNN_FAILED.md, NNN_BLOCKED.md and NNN_WAITING.md, plus a re-executed
+// task's archived first attempt, NNN_ATTEMPT<K>_IMPL_PLAN.md and
+// NNN_ATTEMPT<K>_REVIEW_<M>.md.
+var generatedRe = regexp.MustCompile(`(?i)^(IMPL_PLAN|REVIEW_\d+|FAILED|BLOCKED|WAITING|ATTEMPT\d+_(IMPL_PLAN|REVIEW_\d+))$`)
 
 // DiscoverTaskFiles lists user-authored task spec filenames in specDir,
 // excluding STATUS.md, QUEUE.md and diadoche-generated files.
@@ -211,6 +217,11 @@ func ReadStatus(path string) ([]Row, error) {
 }
 
 func WriteStatus(path string, rows []Row) error {
+	return WriteFileAtomic(path, renderStatus(rows))
+}
+
+// renderStatus is the STATUS.md table of rows.
+func renderStatus(rows []Row) []byte {
 	var b strings.Builder
 	b.WriteString("| # | Spec | Status |\n")
 	b.WriteString("|---|------|--------|\n")
@@ -221,7 +232,7 @@ func WriteStatus(path string, rows []Row) error {
 		}
 		fmt.Fprintf(&b, "| %s | %s | %s |\n", r.Num, r.Spec, status)
 	}
-	return WriteFileAtomic(path, []byte(b.String()))
+	return []byte(b.String())
 }
 
 // ReadQueue returns the items of QUEUE.md, one spec filename per line.
@@ -253,11 +264,25 @@ func ReadQueue(path string) ([]string, error) {
 }
 
 func WriteQueue(path string, items []string) error {
+	return WriteFileAtomic(path, renderQueue(items))
+}
+
+// renderQueue is the QUEUE.md of items.
+func renderQueue(items []string) []byte {
 	var b strings.Builder
 	for _, it := range items {
 		fmt.Fprintf(&b, "- %s\n", it)
 	}
-	return WriteFileAtomic(path, []byte(b.String()))
+	return []byte(b.String())
+}
+
+// writeIfChanged writes data to path unless the file already holds exactly
+// data.
+func writeIfChanged(path string, data []byte) error {
+	if old, err := os.ReadFile(path); err == nil && bytes.Equal(old, data) {
+		return nil
+	}
+	return WriteFileAtomic(path, data)
 }
 
 // WriteFileAtomic replaces path with data via a temp file + rename, so a
@@ -303,11 +328,14 @@ func Sync(l Layout) (rows []Row, queue []string, err error) {
 	if err != nil {
 		return
 	}
-	if err = WriteStatus(l.StatusPath, rows); err != nil {
+	// A file that wouldn't change is not rewritten: besides sparing the
+	// write, that narrows the window in which this read-modify-write could
+	// overwrite an agent's concurrent edit of STATUS.md (--parallel).
+	if err = writeIfChanged(l.StatusPath, renderStatus(rows)); err != nil {
 		return
 	}
 	queue = pendingQueue(l, rows)
-	err = WriteQueue(l.QueuePath, queue)
+	err = writeIfChanged(l.QueuePath, renderQueue(queue))
 	return
 }
 
@@ -372,28 +400,70 @@ func mergedRows(l Layout) ([]Row, error) {
 // among declared edges (ValidateGraph rejects those) never loses a task: the
 // tasks left on it follow in base order.
 func pendingQueue(l Layout, rows []Row) []string {
+	items, deps := pendingGraph(l, rows)
+	n := len(items)
+	out := make([]string, 0, n)
+	placed := make([]bool, n)
+	for len(out) < n {
+		next := -1
+		for i := range items {
+			if placed[i] {
+				continue
+			}
+			ready := true
+			for _, d := range deps[i] {
+				ready = ready && placed[d]
+			}
+			if ready {
+				next = i
+				break
+			}
+		}
+		if next < 0 {
+			for i := range items {
+				if !placed[i] {
+					placed[i] = true
+					out = append(out, items[i])
+				}
+			}
+			break
+		}
+		placed[next] = true
+		out = append(out, items[next])
+	}
+	return out
+}
+
+// pendingGraph is the dependency graph of pendingQueue: items are the
+// specs of the pending rows in base order, deps[i] the indices of the
+// items items[i] must come after (declared and implicit edges, see
+// pendingQueue).
+func pendingGraph(l Layout, rows []Row) (items []string, deps [][]int) {
 	type pending struct {
 		key  []int
 		spec string
 	}
-	var items []pending
+	var ps []pending
 	for _, r := range rows {
 		if !isPending(r.Status) {
 			continue
 		}
-		items = append(items, pending{key: queueKey(l, r.Spec, rowNumber(r.Num), nil), spec: r.Spec})
+		ps = append(ps, pending{key: queueKey(l, r.Spec, rowNumber(r.Num), nil), spec: r.Spec})
 	}
-	sort.SliceStable(items, func(i, j int) bool { return slices.Compare(items[i].key, items[j].key) < 0 })
+	sort.SliceStable(ps, func(i, j int) bool { return slices.Compare(ps[i].key, ps[j].key) < 0 })
+	for _, p := range ps {
+		items = append(items, p.spec)
+	}
 
 	n := len(items)
-	deps := make([][]int, n) // deps[i]: indices i must come after
+	deps = make([][]int, n) // deps[i]: indices i must come after
 	declared := make([]bool, n)
-	for i, it := range items {
+	for i, spec := range items {
 		var nums []string
-		nums, declared[i] = readDependsOn(l, it.spec)
+		nums, declared[i] = readDependsOn(l, spec)
 		for _, d := range nums {
 			for j, other := range items {
-				if j != i && sameTaskNumber(TaskNumber(other.spec), d) && !slices.Contains(deps[i], j) {
+				if j != i && sameTaskNumber(TaskNumber(other), d) && !slices.Contains(deps[i], j) {
 					deps[i] = append(deps[i], j)
 				}
 			}
@@ -422,37 +492,37 @@ func pendingQueue(l Layout, rows []Row) []string {
 			deps[i] = append(deps[i], i-1)
 		}
 	}
+	return items, deps
+}
 
-	out := make([]string, 0, n)
-	placed := make([]bool, n)
-	for len(out) < n {
-		next := -1
-		for i := range items {
-			if placed[i] {
-				continue
-			}
-			ready := true
-			for _, d := range deps[i] {
-				ready = ready && placed[d]
-			}
-			if ready {
-				next = i
-				break
-			}
-		}
-		if next < 0 {
-			for i := range items {
-				if !placed[i] {
-					placed[i] = true
-					out = append(out, items[i].spec)
-				}
-			}
-			break
-		}
-		placed[next] = true
-		out = append(out, items[next].spec)
+// PendingPredecessors is task 019's dependency graph as a scheduler sees
+// it: for every pending task, the spec files of the pending tasks it must
+// come after — the tasks its Depends-on line names, or, without the line,
+// the pending task right before it (see pendingQueue). alsoPending are
+// tasks that count as pending whatever STATUS.md says: tasks running now,
+// e.g. DONE by tester but not merged yet. A task with an empty list may
+// start once CheckDependencies finds no blocker and nothing unfinished.
+// It writes nothing.
+func PendingPredecessors(l Layout, alsoPending []string) (map[string][]string, error) {
+	rows, err := mergedRows(l)
+	if err != nil {
+		return nil, err
 	}
-	return out
+	for i := range rows {
+		if slices.Contains(alsoPending, rows[i].Spec) {
+			rows[i].Status = StatusInProgress
+		}
+	}
+	items, deps := pendingGraph(l, rows)
+	out := make(map[string][]string, len(items))
+	for i, spec := range items {
+		preds := []string{}
+		for _, j := range deps[i] {
+			preds = append(preds, items[j])
+		}
+		out[spec] = preds
+	}
+	return out, nil
 }
 
 // isPending reports whether status is QUEUED, IN_PROGRESS or PAUSED.

@@ -69,6 +69,18 @@ func splitPolicy(o *Orchestrator, ctx context.Context, in onFailInput) policyRes
 	}
 	reviews := taskReviews(o.Layout.SpecDir, in.num)
 
+	// The spec-locked section writes new spec files into the spec
+	// directory, so in a parallel run the merge owner runs it.
+	var res policyResult
+	if !o.onOwner(ctx, func() { res = o.splitLocked(ctx, in, specContent, reviews, noop) }) {
+		return policyResult{outcome: outcomeInterrupted, cause: ErrInterrupted}
+	}
+	return res
+}
+
+// splitLocked is splitPolicy's spec-locked section: the preprocessor's
+// call and the check of the spec files it wrote.
+func (o *Orchestrator) splitLocked(ctx context.Context, in onFailInput, specContent []byte, reviews []preprocessor.Review, noop func(string, error) policyResult) policyResult {
 	lock, err := speclock.Acquire(o.Layout.SpecDir, lockTimeout)
 	if err != nil {
 		return noop("spec_lock", err)
@@ -238,13 +250,16 @@ func (o *Orchestrator) splitTask(ctx context.Context, specFile, num string, ws *
 	var queue []string
 	lock, err := speclock.Acquire(o.Layout.SpecDir, lockTimeout)
 	if err == nil {
+		sh := o.shared()
+		sh.specMu.Lock()
 		queue, err = specs.ApplySplit(o.Layout, specFile, reason, parts)
+		sh.specMu.Unlock()
 		lock.Release()
 	}
 	if err != nil {
 		// The parts are on disk, so the next sync still queues them.
 		o.Log.Printf("task %s: couldn't queue the split in STATUS.md/QUEUE.md: %v", specFile, err)
-		if err := specs.SetStatusReason(o.Layout, specFile, specs.StatusBlocked, reason); err != nil {
+		if err := o.setStatusReason(specFile, specs.StatusBlocked, reason); err != nil {
 			o.Log.Printf("task %s: also failed to record BLOCKED status: %v", specFile, err)
 		}
 	}

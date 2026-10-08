@@ -14,10 +14,10 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	path := Path(t.TempDir())
 	want := State{
 		RunID: "20261008T120000Z-00ff00ff",
-		Task: &Task{
+		Tasks: []Task{{
 			Spec: "009_x.md", Num: "009", Iteration: 2, Agent: "worker", AgentState: AgentDone,
 			BaseCommit: "abc123", Worktree: ".claude/diadoche/worktrees/009-x",
-		},
+		}},
 		UpdatedAt: time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC),
 	}
 	if err := Save(path, want); err != nil {
@@ -27,8 +27,8 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.RunID != want.RunID || !got.UpdatedAt.Equal(want.UpdatedAt) || got.Task == nil || *got.Task != *want.Task {
-		t.Errorf("round trip = %+v (task %+v), want %+v (task %+v)", got, got.Task, want, want.Task)
+	if got.RunID != want.RunID || !got.UpdatedAt.Equal(want.UpdatedAt) || len(got.Tasks) != 1 || got.Tasks[0] != want.Tasks[0] {
+		t.Errorf("round trip = %+v, want %+v", got, want)
 	}
 }
 
@@ -45,14 +45,17 @@ func TestNilTaskIsJSONNull(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Task != nil {
-		t.Errorf("Task = %+v, want nil", got.Task)
+	if !strings.Contains(string(raw), `"tasks": []`) {
+		t.Errorf("file = %s, want \"tasks\": []", raw)
+	}
+	if len(got.Tasks) != 0 {
+		t.Errorf("Tasks = %+v, want none", got.Tasks)
 	}
 }
 
 func TestWorktreeOmittedWhenEmpty(t *testing.T) {
 	path := Path(t.TempDir())
-	if err := Save(path, State{RunID: "r", Task: &Task{Spec: "a.md", Iteration: 1, Agent: "planner", AgentState: AgentPending}}); err != nil {
+	if err := Save(path, State{RunID: "r", Tasks: []Task{{Spec: "a.md", Iteration: 1, Agent: "planner", AgentState: AgentPending}}}); err != nil {
 		t.Fatal(err)
 	}
 	if raw, _ := os.ReadFile(path); strings.Contains(string(raw), "worktree") {
@@ -94,7 +97,7 @@ func TestSaveIsAtomic(t *testing.T) {
 	}
 
 	for i, agent := range Agents {
-		s := State{RunID: "second", Task: &Task{Spec: "a.md", Iteration: i + 1, Agent: agent, AgentState: AgentRunning}}
+		s := State{RunID: "second", Tasks: []Task{{Spec: "a.md", Iteration: i + 1, Agent: agent, AgentState: AgentRunning}}}
 		if err := Save(path, s); err != nil {
 			t.Fatal(err)
 		}
@@ -103,7 +106,7 @@ func TestSaveIsAtomic(t *testing.T) {
 			t.Fatalf("file is not valid JSON after save %d: %s", i, raw)
 		}
 		got, err := Load(path)
-		if err != nil || got.Task.Agent != agent {
+		if err != nil || got.Tasks[0].Agent != agent {
 			t.Fatalf("Load after save %d = %+v, %v", i, got, err)
 		}
 	}
@@ -152,6 +155,7 @@ func TestValidate(t *testing.T) {
 		{Spec: "a.md", Iteration: 1, Agent: "tester", AgentState: "half"},
 		{Spec: "a.md", Iteration: 0, Agent: "tester", AgentState: AgentRunning},
 		{Iteration: 1, Agent: "tester", AgentState: AgentRunning},
+		{Spec: "a.md", Iteration: 1, Agent: "tester", AgentState: AgentRunning, Attempt: -1},
 	}
 	for _, b := range bad {
 		if err := b.Validate(); err == nil {
@@ -201,5 +205,66 @@ func TestWaitingRoundTripsAndIsOmittedWhenEmpty(t *testing.T) {
 	}
 	if s, err := Load(path); err != nil || s.RunID != "old" || s.Waiting != nil {
 		t.Errorf("old file = %+v, %v", s, err)
+	}
+}
+
+func TestSeveralTasksRoundTripAndMirrorTheFirstAsTask(t *testing.T) {
+	path := Path(t.TempDir())
+	a := Task{Spec: "001_a.md", Num: "001", Iteration: 1, Agent: "worker", AgentState: AgentRunning, BaseCommit: "abc", Worktree: ".claude/diadoche/worktrees/001-a"}
+	b := Task{Spec: "002_b.md", Num: "002", Iteration: 2, Agent: "planner", AgentState: AgentPending, BaseCommit: "def", Attempt: 2}
+	if err := Save(path, State{RunID: "r", Tasks: []Task{a, b}}); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(path)
+	var j struct {
+		Tasks []Task `json:"tasks"`
+		Task  *Task  `json:"task"`
+	}
+	if err := json.Unmarshal(raw, &j); err != nil {
+		t.Fatal(err)
+	}
+	if len(j.Tasks) != 2 || j.Task == nil || *j.Task != a {
+		t.Fatalf("file = %s, want two tasks and \"task\" = the first", raw)
+	}
+	if !strings.Contains(string(raw), `"attempt": 2`) || strings.Count(string(raw), `"attempt"`) != 1 {
+		t.Errorf("file = %s, want attempt only on the second record", raw)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Tasks) != 2 || got.Tasks[0] != a || got.Tasks[1] != b {
+		t.Errorf("Tasks = %+v, want %+v", got.Tasks, []Task{a, b})
+	}
+}
+
+func TestLegacySingleTaskFileLoadsAsOneRecord(t *testing.T) {
+	path := Path(t.TempDir())
+	old := `{"run_id": "old", "task": {"spec": "001_a.md", "num": "001", "iteration": 1, "agent": "tester", "agent_state": "running", "base_commit": "abc"}, "updated_at": "2026-10-08T12:00:00Z"}`
+	if err := os.WriteFile(path, []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Task{Spec: "001_a.md", Num: "001", Iteration: 1, Agent: "tester", AgentState: AgentRunning, BaseCommit: "abc"}
+	if len(got.Tasks) != 1 || got.Tasks[0] != want {
+		t.Errorf("Tasks = %+v, want [%+v]", got.Tasks, want)
+	}
+}
+
+func TestTasksWinOverTask(t *testing.T) {
+	path := Path(t.TempDir())
+	both := `{"run_id": "r", "tasks": [{"spec": "002_b.md", "num": "002", "iteration": 1, "agent": "planner", "agent_state": "pending"}], "task": {"spec": "001_a.md", "num": "001", "iteration": 1, "agent": "tester", "agent_state": "running"}}`
+	if err := os.WriteFile(path, []byte(both), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Tasks) != 1 || got.Tasks[0].Spec != "002_b.md" {
+		t.Errorf("Tasks = %+v, want only 002_b.md from \"tasks\"", got.Tasks)
 	}
 }

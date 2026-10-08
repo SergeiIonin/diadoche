@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	"diadoche/internal/gitutil"
 	"diadoche/internal/runstate"
@@ -21,8 +22,16 @@ import (
 var ErrInterrupted = fmt.Errorf("interrupted by signal: %w", context.Canceled)
 
 // stopRequested reports whether a graceful stop was asked for: the loop
-// then stops at the next point between agent calls.
+// then stops at the next point between agent calls. A parallel run's
+// internal stop (see runShared.stop) counts like a signal.
 func (o *Orchestrator) stopRequested() bool {
+	if o.sh != nil {
+		select {
+		case <-o.sh.stop:
+			return true
+		default:
+		}
+	}
 	if o.StopRequested == nil {
 		return false
 	}
@@ -39,10 +48,16 @@ func (o *Orchestrator) stopRequested() bool {
 // first signal ends them at once; agent calls use ctx itself.
 func (o *Orchestrator) gracefulCtx(ctx context.Context) (context.Context, context.CancelFunc) {
 	sctx, cancel := context.WithCancel(ctx)
-	if o.StopRequested != nil {
+	var internal <-chan struct{}
+	if o.sh != nil {
+		internal = o.sh.stop
+	}
+	if o.StopRequested != nil || internal != nil {
 		go func() {
 			select {
 			case <-o.StopRequested:
+				cancel()
+			case <-internal:
 				cancel()
 			case <-sctx.Done():
 			}
@@ -55,10 +70,11 @@ func (o *Orchestrator) gracefulCtx(ctx context.Context) (context.Context, contex
 // sync (queue is QUEUE.md then). It is off in --dry-run (which never gets
 // here, see dryrun.go) and in a test's simulated loop, so neither makes a
 // real run resume from fake progress. With --fresh the saved state
-// is ignored (except the WAITING tasks' records); otherwise a saved, unfinished task that still agrees with
-// STATUS.md and QUEUE.md becomes o.resume and is moved to the head of the
-// queue. A state that doesn't agree is ignored with a warning: the spec/
-// files are then the fallback, as without the file.
+// is ignored (except the WAITING tasks' records); otherwise every saved,
+// unfinished task that still agrees with STATUS.md and QUEUE.md is kept to
+// resume (see takeResume) and moved to the head of the queue, in the
+// file's order. A record that doesn't agree is ignored with a warning: the
+// spec/ files are then the fallback, as without the file.
 //
 // The file is runtime state, rewritten after every step, so it is kept out
 // of git (.git/info/exclude): the bookkeeping commits of .claude/diadoche
@@ -93,18 +109,27 @@ func (o *Orchestrator) initRunState(ctx context.Context, queue []string) {
 		return
 	}
 
-	if saved != nil && saved.Task != nil {
-		if reason := o.contradiction(*saved.Task, queue); reason != "" {
-			o.Log.Printf("warning: ignoring %s: %s", runstate.FileName, reason)
-		} else {
-			t := *saved.Task
-			o.resume = &t
-			if queue[0] != t.Spec {
-				reordered := append([]string{t.Spec}, slices.DeleteFunc(slices.Clone(queue), func(s string) bool { return s == t.Spec })...)
-				if err := specs.WriteQueue(o.Layout.QueuePath, reordered); err != nil {
-					o.Log.Printf("warning: could not move %s to the head of %s: %v", t.Spec, o.Layout.QueuePath, err)
-				}
+	if saved != nil {
+		sh := o.shared()
+		var heads []string
+		for _, t := range saved.Tasks {
+			if reason := o.contradiction(t, queue); reason != "" {
+				o.Log.Printf("warning: ignoring %s: %s", runstate.FileName, reason)
+				continue
 			}
+			if slices.Contains(heads, t.Spec) {
+				continue
+			}
+			sh.resumes = append(sh.resumes, t)
+			heads = append(heads, t.Spec)
+		}
+		if len(heads) > 0 && !slices.Equal(queue[:min(len(heads), len(queue))], heads) {
+			reordered := append(slices.Clone(heads), slices.DeleteFunc(slices.Clone(queue), func(s string) bool { return slices.Contains(heads, s) })...)
+			if err := o.writeQueue(reordered); err != nil {
+				o.Log.Printf("warning: could not move %s to the head of %s: %v", strings.Join(heads, ", "), o.Layout.QueuePath, err)
+			}
+		}
+		for _, t := range sh.resumes {
 			iter, agent := t.Next()
 			o.Log.Printf("%s: task %s (run %s) will resume at iteration %d, agent %s", runstate.FileName, t.Spec, saved.RunID, iter, agentLabel(agent))
 		}
@@ -142,25 +167,39 @@ func (o *Orchestrator) contradiction(t runstate.Task, queue []string) string {
 	return fmt.Sprintf("task %s has no row in %s", t.Spec, filepath.Base(o.Layout.StatusPath))
 }
 
-// saveState writes run-state.json: the current task's record, else a
-// resume record not consumed yet (so a run stopped before reaching it
-// keeps it), else no task. A write failure is only a warning, like usage
-// accounting: the spec/ files still let the next run resume.
+// saveState writes run-state.json: the record of every active task, then
+// every resume record not taken yet (so a run stopped before reaching it
+// keeps it), and the WAITING tasks' records. A write failure is only a
+// warning, like usage accounting: the spec/ files still let the next run
+// resume.
 func (o *Orchestrator) saveState() {
 	if !o.stateOn {
 		return
 	}
-	task := o.cur
-	if task == nil {
-		task = o.resume
+	sh := o.shared()
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	o.saveStateLocked()
+}
+
+// saveStateLocked is saveState for a caller holding sh.mu, so a change and
+// its save are one step and concurrent saves never reorder.
+func (o *Orchestrator) saveStateLocked() {
+	if !o.stateOn {
+		return
 	}
+	sh := o.sh
 	s := runstate.State{RunID: o.runID, UpdatedAt: o.now().UTC()}
-	if len(o.waiting) > 0 {
-		s.Waiting = maps.Clone(o.waiting)
+	if len(sh.waiting) > 0 {
+		s.Waiting = maps.Clone(sh.waiting)
 	}
-	if task != nil {
-		t := *task
-		s.Task = &t
+	for _, t := range sh.active {
+		s.Tasks = append(s.Tasks, *t)
+	}
+	for _, t := range sh.resumes {
+		if !slices.ContainsFunc(s.Tasks, func(a runstate.Task) bool { return a.Spec == t.Spec }) {
+			s.Tasks = append(s.Tasks, t)
+		}
 	}
 	if err := runstate.Save(o.statePath, s); err != nil {
 		o.Log.Printf("warning: could not write %s: %v", o.statePath, err)
@@ -168,7 +207,8 @@ func (o *Orchestrator) saveState() {
 }
 
 // beginTaskState starts the record of specFile at iteration iter, agent
-// pending, with the task's base commit and (in worktree mode) worktree.
+// pending, with the task's base commit, (in worktree mode) worktree and
+// attempt, replacing any active record of the same task.
 func (o *Orchestrator) beginTaskState(specFile, num string, ws *workspace, iter int, agent string) {
 	t := &runstate.Task{Spec: specFile, Num: num, Iteration: iter, Agent: agent, AgentState: runstate.AgentPending}
 	if ws != nil {
@@ -176,9 +216,20 @@ func (o *Orchestrator) beginTaskState(specFile, num string, ws *workspace, iter 
 		if ws.worktree {
 			t.Worktree = o.relPath(ws.dir)
 		}
+		if ws.attempt > 1 {
+			t.Attempt = ws.attempt
+		}
+	}
+	sh := o.shared()
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if i := slices.IndexFunc(sh.active, func(a *runstate.Task) bool { return a.Spec == specFile }); i >= 0 {
+		sh.active[i] = t
+	} else {
+		sh.active = append(sh.active, t)
 	}
 	o.cur = t
-	o.saveState()
+	o.saveStateLocked()
 }
 
 // setAgentState records that agent of iteration iter is now in state.
@@ -186,30 +237,49 @@ func (o *Orchestrator) setAgentState(iter int, agent, state string) {
 	if o.cur == nil {
 		return
 	}
+	sh := o.shared()
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 	o.cur.Iteration, o.cur.Agent, o.cur.AgentState = iter, agent, state
-	o.saveState()
+	o.saveStateLocked()
 }
 
 // closeTaskState ends the current task's record: it's DONE, FAILED or
 // BLOCKED, so there's nothing left to resume. A WAITING task's record is
-// not closed but moved to o.waiting (see waitTask).
+// not closed but moved to the WAITING records (see waitTask).
 func (o *Orchestrator) closeTaskState() {
-	o.cur = nil
-	o.saveState()
+	sh := o.shared()
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	o.dropCurLocked()
+	o.saveStateLocked()
 }
 
-// takeResume returns and clears the resume record if it is specFile's,
-// else the record specFile kept while it was WAITING (re-queued by
-// --resume-waiting, or by hand), if any.
-func (o *Orchestrator) takeResume(specFile string) *runstate.Task {
-	r := o.resume
-	if r != nil && r.Spec == specFile {
-		o.resume = nil
-		return r
+// dropCurLocked removes the current task's record from the active ones;
+// the caller holds sh.mu.
+func (o *Orchestrator) dropCurLocked() {
+	if o.cur != nil {
+		cur := o.cur
+		o.sh.active = slices.DeleteFunc(o.sh.active, func(a *runstate.Task) bool { return a == cur })
 	}
-	if w, ok := o.waiting[specFile]; ok {
-		delete(o.waiting, specFile)
-		o.saveState()
+	o.cur = nil
+}
+
+// takeResume returns and clears specFile's resume record, else the record
+// specFile kept while it was WAITING (re-queued by --resume-waiting, or by
+// hand), if any.
+func (o *Orchestrator) takeResume(specFile string) *runstate.Task {
+	sh := o.shared()
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if i := slices.IndexFunc(sh.resumes, func(r runstate.Task) bool { return r.Spec == specFile }); i >= 0 {
+		r := sh.resumes[i]
+		sh.resumes = slices.Delete(sh.resumes, i, i+1)
+		return &r
+	}
+	if w, ok := sh.waiting[specFile]; ok {
+		delete(sh.waiting, specFile)
+		o.saveStateLocked()
 		return &w
 	}
 	return nil

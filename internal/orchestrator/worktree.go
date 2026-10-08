@@ -29,7 +29,12 @@ func (o *Orchestrator) worktreePath(id string) string {
 // tree's git status, and refuses to start on a dirty main tree.
 func (o *Orchestrator) prepareWorktreeRun(ctx context.Context) error {
 	if !gitutil.HasCommits(ctx, o.Cfg.Dir) {
-		o.Log.Printf("the repository has no commits yet, and per-task worktrees need one to branch from; running this time with --worktree=false")
+		if o.Cfg.Parallel > 1 {
+			o.Log.Printf("the repository has no commits yet, and per-task worktrees need one to branch from; running this time with --worktree=false and --parallel 1")
+			o.Cfg.Parallel = 1
+		} else {
+			o.Log.Printf("the repository has no commits yet, and per-task worktrees need one to branch from; running this time with --worktree=false")
+		}
 		o.Cfg.Worktree = false
 		return nil
 	}
@@ -132,14 +137,21 @@ func (o *Orchestrator) prepareWorktree(ctx context.Context, specFile, num string
 // conflict, typically) is aborted and the task becomes BLOCKED instead,
 // keeping its worktree and branch for a human to sort out; that is not an
 // error for the run, which moves on to the next task.
-func (o *Orchestrator) finishDoneWorktree(ctx context.Context, specFile string, ws *workspace) error {
+//
+// With allowReexec (a parallel run's first attempt) a merge conflict
+// instead reports reexec: the branch holds the task's commit, the merge
+// was aborted, and the caller re-executes the task from the new HEAD (see
+// reexecTask). A conflict on the second attempt makes the task BLOCKED
+// with the first attempt's branch named, and the tasks depending on it
+// BLOCKED too.
+func (o *Orchestrator) finishDoneWorktree(ctx context.Context, specFile string, ws *workspace, allowReexec bool) (reexec bool, err error) {
 	specContent, err := os.ReadFile(filepath.Join(o.Layout.SpecDir, specFile))
 	if err != nil {
-		return fmt.Errorf("read spec file: %w", err)
+		return false, fmt.Errorf("read spec file: %w", err)
 	}
 	committed, err := gitutil.CommitAllExcluding(ctx, ws.dir, taskTitle(specContent, specFile), ws.exclude...)
 	if err != nil {
-		return fmt.Errorf("commit %s on %s: %w", specFile, ws.branch, err)
+		return false, fmt.Errorf("commit %s on %s: %w", specFile, ws.branch, err)
 	}
 
 	if committed {
@@ -147,20 +159,42 @@ func (o *Orchestrator) finishDoneWorktree(ctx context.Context, specFile string, 
 		ff, err := gitutil.Merge(ctx, o.Cfg.Dir, ws.branch, "Merge branch '"+ws.branch+"'")
 		var mErr *gitutil.MergeError
 		if errors.As(err, &mErr) {
+			if allowReexec && mErr.Conflict {
+				o.Log.Printf("task %s: merge of %s into %s conflicted; re-executing it once from the new HEAD", specFile, ws.branch, target)
+				return true, nil
+			}
 			reason := fmt.Sprintf("merge of %s into %s failed (%s); worktree kept at %s", ws.branch, target, mErr.Error(), o.relPath(ws.dir))
-			if err := specs.SetStatusReason(o.Layout, specFile, specs.StatusBlocked, reason); err != nil {
+			statusFields := []runlog.Field{runlog.F("status", specs.StatusBlocked), runlog.F("reason", "merge_failed")}
+			blockedFields := []runlog.Field{runlog.F("branch", ws.branch), runlog.F("into", target)}
+			second := ws.attempt > 1
+			if second {
+				reason += fmt.Sprintf("; merge conflict again after re-execution from %s", ws.base)
+				if ws.conflictBranch != "" {
+					reason += fmt.Sprintf("; first attempt's changes on %s", ws.conflictBranch)
+				}
+				statusFields = []runlog.Field{runlog.F("status", specs.StatusBlocked), runlog.F("reason", "merge_conflict"), runlog.F("attempt", ws.attempt)}
+				blockedFields = append(blockedFields, runlog.F("attempt", ws.attempt))
+			}
+			if err := o.setStatusReason(specFile, specs.StatusBlocked, reason); err != nil {
 				o.Log.Printf("task %s: also failed to record BLOCKED status: %v", specFile, err)
 			} else {
-				o.event(specFile, 0, "", "status", runlog.F("status", specs.StatusBlocked), runlog.F("reason", "merge_failed"))
+				o.event(specFile, 0, "", "status", statusFields...)
 			}
-			o.event(specFile, 0, "", "merge_blocked", runlog.F("branch", ws.branch), runlog.F("into", target))
+			o.event(specFile, 0, "", "merge_blocked", blockedFields...)
 			o.Log.Printf("task %s: BLOCKED: %s; the worktree and branch %s are kept for a human to resolve", specFile, reason, ws.branch)
+			if second {
+				deps, err := o.blockDependents(specFile)
+				if err != nil {
+					o.Log.Printf("task %s: couldn't block the tasks that depend on it: %v", specFile, err)
+				}
+				o.reportDependencyBlocks(deps, specFile)
+			}
 			ws.removeBaseFile()
 			o.commitBookkeeping(ctx, specFile, "diadoche: BLOCKED "+specFile)
-			return nil
+			return false, nil
 		}
 		if err != nil {
-			return fmt.Errorf("merge %s: %w", ws.branch, err)
+			return false, fmt.Errorf("merge %s: %w", ws.branch, err)
 		}
 		how := "merge commit"
 		if ff {
@@ -183,14 +217,14 @@ func (o *Orchestrator) finishDoneWorktree(ctx context.Context, specFile string, 
 	}
 
 	if err := gitutil.WorktreeRemove(ctx, o.Cfg.Dir, ws.dir); err != nil {
-		return &fatalError{fmt.Errorf("task %s: remove worktree: %w", specFile, err)}
+		return false, &fatalError{fmt.Errorf("task %s: remove worktree: %w", specFile, err)}
 	}
 	if err := gitutil.DeleteBranch(ctx, o.Cfg.Dir, ws.branch); err != nil {
-		return &fatalError{fmt.Errorf("task %s: delete branch: %w", specFile, err)}
+		return false, &fatalError{fmt.Errorf("task %s: delete branch: %w", specFile, err)}
 	}
 	ws.removeBaseFile()
 	o.commitBookkeeping(ctx, specFile, "diadoche: complete "+specFile)
-	return nil
+	return false, nil
 }
 
 // failWorktree is park for worktree mode: the FAILED task's changes are

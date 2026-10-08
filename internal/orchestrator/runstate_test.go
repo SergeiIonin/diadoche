@@ -117,9 +117,17 @@ func readState(t *testing.T, layout specs.Layout) *runstate.State {
 
 func writeState(t *testing.T, layout specs.Layout, task *runstate.Task) {
 	t.Helper()
-	if err := runstate.Save(runstate.Path(layout.Root), runstate.State{RunID: "old-run", Task: task, UpdatedAt: time.Now()}); err != nil {
+	if err := runstate.Save(runstate.Path(layout.Root), runstate.State{RunID: "old-run", Tasks: []runstate.Task{*task}, UpdatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// firstTask is the first record of st's active tasks, nil when none.
+func firstTask(st *runstate.State) *runstate.Task {
+	if len(st.Tasks) == 0 {
+		return nil
+	}
+	return &st.Tasks[0]
 }
 
 func bufferedOrchestrator(dir string, layout specs.Layout, runner agents.Runner, cfg config.Config) (*Orchestrator, *bytes.Buffer) {
@@ -175,10 +183,10 @@ func TestResumeContinuesAtTesterOfSameIteration(t *testing.T) {
 	assertInterruptedNotParked(t, o.Run(context.Background()), layout)
 
 	st := readState(t, layout)
-	if st.Task == nil {
+	if firstTask(st) == nil {
 		t.Fatal("state has no task after the interrupt")
 	}
-	if got := *st.Task; got.Spec != "001_example.md" || got.Num != "001" || got.Iteration != 2 || got.Agent != "worker" || got.AgentState != runstate.AgentDone || got.BaseCommit != head {
+	if got := *firstTask(st); got.Spec != "001_example.md" || got.Num != "001" || got.Iteration != 2 || got.Agent != "worker" || got.AgentState != runstate.AgentDone || got.BaseCommit != head {
 		t.Fatalf("state = %+v, want 001 iteration 2 worker done on base %s", got, head)
 	}
 	if run1.count("tester") != 1 {
@@ -202,8 +210,8 @@ func TestResumeContinuesAtTesterOfSameIteration(t *testing.T) {
 	if msg := gitOut(t, dir, "log", "-1", "--format=%s"); msg != "diadoche: complete 001_example.md" {
 		t.Errorf("last commit = %q, want the task's DONE commit", msg)
 	}
-	if st := readState(t, layout); st.Task != nil {
-		t.Errorf("final state task = %+v, want null", st.Task)
+	if st := readState(t, layout); firstTask(st) != nil {
+		t.Errorf("final state task = %+v, want null", firstTask(st))
 	}
 }
 
@@ -223,15 +231,15 @@ func TestRunStateRecordsEveryStep(t *testing.T) {
 			t.Fatalf("%s call: run-state.json is not valid JSON: %s", c.agent, raw)
 		}
 		st := readState(t, layout)
-		if st.RunID == "" || st.UpdatedAt.IsZero() || st.Task == nil {
+		if st.RunID == "" || st.UpdatedAt.IsZero() || firstTask(st) == nil {
 			t.Fatalf("%s call: state = %+v", c.agent, st)
 		}
 		want := runstate.Task{
 			Spec: "001_example.md", Num: "001", Iteration: 1, Agent: c.agent, AgentState: runstate.AgentRunning,
 			BaseCommit: head, Worktree: ".claude/diadoche/worktrees/001-example",
 		}
-		if *st.Task != want {
-			t.Errorf("%s call: state task = %+v, want %+v", c.agent, *st.Task, want)
+		if *firstTask(st) != want {
+			t.Errorf("%s call: state task = %+v, want %+v", c.agent, *firstTask(st), want)
 		}
 		seen = append(seen, c.agent)
 		return nil, nil
@@ -247,7 +255,7 @@ func TestRunStateRecordsEveryStep(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run-state.json gone after the run: %v", err)
 	}
-	if !strings.Contains(string(raw), `"task": null`) || readState(t, layout).Task != nil {
+	if !strings.Contains(string(raw), `"task": null`) || firstTask(readState(t, layout)) != nil {
 		t.Errorf("final state = %s, want task null", raw)
 	}
 }
@@ -273,8 +281,8 @@ func TestRunStateRecordsAFinishedPlanner(t *testing.T) {
 		Spec: "001_example.md", Num: "001", Iteration: 1, Agent: "planner", AgentState: runstate.AgentDone,
 		BaseCommit: head, Worktree: ".claude/diadoche/worktrees/001-example",
 	}
-	if st := readState(t, layout); st.Task == nil || *st.Task != want {
-		t.Errorf("state task = %+v, want %+v", st.Task, want)
+	if st := readState(t, layout); firstTask(st) == nil || *firstTask(st) != want {
+		t.Errorf("state task = %+v, want %+v", firstTask(st), want)
 	}
 }
 
@@ -350,8 +358,8 @@ func TestFreshIgnoresSavedState(t *testing.T) {
 		if !strings.Contains(logBuf.String(), "--fresh") {
 			t.Errorf("log doesn't mention --fresh:\n%s", logBuf)
 		}
-		if st := readState(t, layout); st.RunID == "old-run" || st.Task != nil {
-			t.Errorf("state = %+v (task %+v), want a new run id and no task", st, st.Task)
+		if st := readState(t, layout); st.RunID == "old-run" || firstTask(st) != nil {
+			t.Errorf("state = %+v (task %+v), want a new run id and no task", st, firstTask(st))
 		}
 	})
 
@@ -495,8 +503,8 @@ func TestSignalDuringAgentCallFinishesCallThenStops(t *testing.T) {
 	if n := f.runner.count("tester"); n != 0 {
 		t.Errorf("tester called %d times after the signal", n)
 	}
-	if st := readState(t, f.layout); st.Task == nil || st.Task.Agent != "worker" || st.Task.AgentState != runstate.AgentDone {
-		t.Errorf("state task = %+v, want worker done", st.Task)
+	if st := readState(t, f.layout); firstTask(st) == nil || firstTask(st).Agent != "worker" || firstTask(st).AgentState != runstate.AgentDone {
+		t.Errorf("state task = %+v, want worker done", firstTask(st))
 	}
 }
 
@@ -511,8 +519,8 @@ func TestShutdownTimeoutKillsCallAndKeepsAgentRunning(t *testing.T) {
 	})
 	err := f.runAndSignal(t, 1)
 	assertInterruptedNotParked(t, err, f.layout)
-	if st := readState(t, f.layout); st.Task == nil || st.Task.Agent != "worker" || st.Task.AgentState != runstate.AgentRunning {
-		t.Fatalf("state task = %+v, want worker running", st.Task)
+	if st := readState(t, f.layout); firstTask(st) == nil || firstTask(st).Agent != "worker" || firstTask(st).AgentState != runstate.AgentRunning {
+		t.Fatalf("state task = %+v, want worker running", firstTask(st))
 	}
 
 	r := &taskRunner{layout: f.layout}
@@ -545,8 +553,8 @@ func TestSecondSignalStopsImmediately(t *testing.T) {
 	if waited > time.Second {
 		t.Errorf("the call was killed %s after the first signal, want at once on the second", waited)
 	}
-	if st := readState(t, f.layout); st.Task == nil || st.Task.Agent != "worker" || st.Task.AgentState != runstate.AgentRunning {
-		t.Errorf("state task = %+v, want worker running", st.Task)
+	if st := readState(t, f.layout); firstTask(st) == nil || firstTask(st).Agent != "worker" || firstTask(st).AgentState != runstate.AgentRunning {
+		t.Errorf("state task = %+v, want worker running", firstTask(st))
 	}
 }
 

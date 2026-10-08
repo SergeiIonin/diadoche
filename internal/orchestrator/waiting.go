@@ -95,7 +95,7 @@ func (o *Orchestrator) waitTask(ctx context.Context, specFile, num string, ws *w
 	reportPath := filepath.Join(o.Layout.SpecDir, num+"_WAITING.md")
 	reason := fmt.Sprintf("%s needs a human decision in iteration %d: answer in %s, then rerun with --resume-waiting (see %s)",
 		nh.agent, nh.iter, questions.FileName, o.relPath(reportPath))
-	if err := specs.SetStatusReason(o.Layout, specFile, specs.StatusWaiting, reason); err != nil {
+	if err := o.setStatusReason(specFile, specs.StatusWaiting, reason); err != nil {
 		o.Log.Printf("task %s: also failed to record WAITING status: %v", specFile, err)
 	} else {
 		o.event(specFile, nh.iter, nh.agent, "status", runlog.F("status", specs.StatusWaiting), runlog.F("reason", "needs_human"))
@@ -113,6 +113,8 @@ func (o *Orchestrator) waitTask(ctx context.Context, specFile, num string, ws *w
 		o.Log.Printf("warning: task %s: %s answered %s, but %s has no question for it", specFile, nh.agent, questions.Marker, questions.FileName)
 	}
 
+	sh := o.shared()
+	sh.mu.Lock()
 	if o.stateOn && o.cur != nil {
 		rec := *o.cur
 		if ws != nil && !ws.worktree {
@@ -120,13 +122,14 @@ func (o *Orchestrator) waitTask(ctx context.Context, specFile, num string, ws *w
 			// with the parked changes re-applied on top.
 			rec.BaseCommit = ""
 		}
-		if o.waiting == nil {
-			o.waiting = map[string]runstate.Task{}
+		if sh.waiting == nil {
+			sh.waiting = map[string]runstate.Task{}
 		}
-		o.waiting[specFile] = rec
+		sh.waiting[specFile] = rec
 	}
-	o.cur = nil
-	o.saveState()
+	o.dropCurLocked()
+	o.saveStateLocked()
+	sh.mu.Unlock()
 
 	where := "The task made no code changes (simulated run)."
 	if ws != nil {
@@ -200,7 +203,10 @@ func (o *Orchestrator) resumeWaitingTasks() error {
 		return fmt.Errorf("acquire spec lock: %w", err)
 	}
 	defer lock.Release()
+	sh := o.shared()
+	sh.specMu.Lock()
 	resumed, err := specs.ResumeWaiting(o.Layout)
+	sh.specMu.Unlock()
 	if err != nil {
 		return fmt.Errorf("--resume-waiting: %w", err)
 	}
@@ -230,18 +236,22 @@ func (o *Orchestrator) resumeWaitingTasks() error {
 // loadWaiting takes over the saved records of WAITING tasks, logging where
 // each task re-queued by --resume-waiting continues.
 func (o *Orchestrator) loadWaiting(saved map[string]runstate.Task) {
-	o.waiting = maps.Clone(saved)
-	for spec, rec := range o.waiting {
+	waiting := maps.Clone(saved)
+	for spec, rec := range waiting {
 		if rec.Spec != spec || rec.Validate() != nil {
 			o.Log.Printf("warning: ignoring the WAITING record of %s in %s: not a record diadoche writes", spec, runstate.FileName)
-			delete(o.waiting, spec)
+			delete(waiting, spec)
 			continue
 		}
-		if status, err := specs.GetStatus(o.Layout, spec); err == nil && status != specs.StatusWaiting {
+		if status, err := o.getStatus(spec); err == nil && status != specs.StatusWaiting {
 			iter, agent := rec.Next()
 			o.Log.Printf("%s: WAITING task %s will resume at iteration %d, agent %s", runstate.FileName, spec, iter, agentLabel(agent))
 		}
 	}
+	sh := o.shared()
+	sh.mu.Lock()
+	sh.waiting = waiting
+	sh.mu.Unlock()
 }
 
 // restoreWaiting brings a task that was WAITING back to where it stopped:

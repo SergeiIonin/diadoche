@@ -145,6 +145,9 @@ func (o *Orchestrator) recordDecisions(specFile, num string, iter int, output st
 		o.artifactWarn(specFile, decisions.FileName, err)
 		return
 	}
+	sh := o.shared()
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 	if o.decisions == nil {
 		o.decisions = map[string]string{}
 	}
@@ -156,5 +159,8 @@ func (o *Orchestrator) recordDecisions(specFile, num string, iter int, output st
 // stays valid after the task's merge or commit. It is "" when the task has
 // no such file in this run: --dry-run, not DONE, or the write failed.
 func (o *Orchestrator) DecisionsPath(specFile string) string {
+	sh := o.shared()
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 	return o.decisions[specFile]
 }

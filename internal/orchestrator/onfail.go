@@ -178,7 +178,7 @@ func escalatePolicy(o *Orchestrator, ctx context.Context, in onFailInput) policy
 	switch {
 	case done:
 		reason := fmt.Sprintf("on-fail: escalate succeeded (planner/worker on %s)", o.escPlanner.Model)
-		if err := specs.SetStatusReason(o.Layout, in.specFile, specs.StatusDone, reason); err != nil {
+		if err := o.setStatusReason(in.specFile, specs.StatusDone, reason); err != nil {
 			o.Log.Printf("task %s: couldn't record the escalation in STATUS.md: %v", in.specFile, err)
 		}
 		return policyResult{outcome: outcomeDone, detail: detail}
@@ -223,7 +223,7 @@ func (o *Orchestrator) blockTask(ctx context.Context, specFile, num string, ws *
 	}
 	reason := fmt.Sprintf("not DONE after %d iteration(s); on-fail policies applied: %s (see %s)",
 		o.Cfg.Iter, strings.Join(names, ", "), o.relPath(reportPath))
-	if err := specs.SetStatusReason(o.Layout, specFile, specs.StatusBlocked, reason); err != nil {
+	if err := o.setStatusReason(specFile, specs.StatusBlocked, reason); err != nil {
 		o.Log.Printf("task %s: also failed to record BLOCKED status: %v", specFile, err)
 	} else {
 		o.event(specFile, 0, "", "status", runlog.F("status", specs.StatusBlocked), runlog.F("reason", "on_fail"))
@@ -250,7 +250,7 @@ func (o *Orchestrator) blockTask(ctx context.Context, specFile, num string, ws *
 		}
 	}
 
-	deps, err := specs.BlockDependents(o.Layout, specFile)
+	deps, err := o.blockDependents(specFile)
 	if err != nil {
 		o.Log.Printf("task %s: couldn't block the tasks that depend on it: %v", specFile, err)
 	}

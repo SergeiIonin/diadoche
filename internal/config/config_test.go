@@ -782,3 +782,48 @@ func TestParseHelpMentionsADR(t *testing.T) {
 		}
 	}
 }
+
+func TestParseParallelDefaultsToOne(t *testing.T) {
+	cfg, err := Parse([]string{"--dir", "."})
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+	if cfg.Parallel != 1 {
+		t.Fatalf("Parallel = %d, want 1", cfg.Parallel)
+	}
+	cfg, err = Parse([]string{"--dir", ".", "--parallel", "3"})
+	if err != nil {
+		t.Fatalf("Parse --parallel 3 failed: %v", err)
+	}
+	if cfg.Parallel != 3 || !cfg.Worktree {
+		t.Fatalf("Parallel = %d, Worktree = %v, want 3 and true", cfg.Parallel, cfg.Worktree)
+	}
+}
+
+func TestParseParallelBelowOneIsAnError(t *testing.T) {
+	for _, v := range []string{"0", "-1"} {
+		_, err := Parse([]string{"--dir", ".", "--parallel", v})
+		if err == nil || !strings.Contains(err.Error(), "--parallel") {
+			t.Errorf("--parallel %s: err = %v, want an error naming --parallel", v, err)
+		}
+	}
+}
+
+func TestParseParallelRequiresWorktree(t *testing.T) {
+	_, err := Parse([]string{"--dir", ".", "--parallel", "2", "--worktree=false"})
+	if err == nil || !strings.Contains(err.Error(), "--parallel") || !strings.Contains(err.Error(), "--worktree") {
+		t.Fatalf("err = %v, want an error naming --parallel and --worktree", err)
+	}
+	if _, err := Parse([]string{"--dir", ".", "--parallel", "1", "--worktree=false"}); err != nil {
+		t.Fatalf("--parallel 1 --worktree=false: %v", err)
+	}
+}
+
+func TestHelpDescribesParallel(t *testing.T) {
+	out := captureStdout(t, func() { _, _ = Parse([]string{"--help"}) })
+	for _, want := range []string{"[--parallel N]", "PARALLEL TASKS", "diadoche/conflict/", `"tasks"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("help output missing %q", want)
+		}
+	}
+}

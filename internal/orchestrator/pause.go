@@ -112,7 +112,7 @@ func (o *Orchestrator) runAgentPausing(ctx context.Context, c agentCall, a *agen
 		result, err := o.runAgent(ctx, c, a, prompt)
 		if err == nil {
 			if paused {
-				if err := specs.SetStatus(o.Layout, c.specFile, specs.StatusInProgress); err != nil {
+				if err := o.setStatus(c.specFile, specs.StatusInProgress); err != nil {
 					o.Log.Printf("%s could not set status back to %s: %v", prefix, specs.StatusInProgress, err)
 				} else {
 					o.event(c.specFile, c.iter, a.Name, "status", runlog.F("status", specs.StatusInProgress))
@@ -150,7 +150,7 @@ func (o *Orchestrator) runAgentPausing(ctx context.Context, c agentCall, a *agen
 			o.pauseBackoff = min(wait*2, pauseMaxBackoff)
 		}
 
-		if err := specs.SetStatusReason(o.Layout, c.specFile, specs.StatusPaused, reason); err != nil {
+		if err := o.setStatusReason(c.specFile, specs.StatusPaused, reason); err != nil {
 			o.Log.Printf("%s could not record %s status: %v", prefix, specs.StatusPaused, err)
 		} else {
 			o.event(c.specFile, c.iter, a.Name, "status", runlog.F("status", specs.StatusPaused))

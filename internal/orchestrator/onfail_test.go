@@ -302,15 +302,15 @@ func TestOnFailBlockEndsBlockedAndIsNotRetried(t *testing.T) {
 	}
 
 	saved, err := runstate.Load(runstate.Path(layout.Root))
-	if err != nil || saved == nil || saved.Task != nil {
+	if err != nil || saved == nil || firstTask(saved) != nil {
 		t.Fatalf("run-state.json = %+v, %v; want no task", saved, err)
 	}
 
 	// A stale run-state.json pointing at the BLOCKED task must not bring
 	// it back either.
-	stale := runstate.State{RunID: "stale", Task: &runstate.Task{
+	stale := runstate.State{RunID: "stale", Tasks: []runstate.Task{{
 		Spec: "001_example.md", Num: "001", Iteration: 1, Agent: "planner", AgentState: runstate.AgentRunning,
-	}}
+	}}}
 	if err := runstate.Save(runstate.Path(layout.Root), stale); err != nil {
 		t.Fatal(err)
 	}

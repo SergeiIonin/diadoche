@@ -56,6 +56,15 @@
 // --dry-run never changes state: it walks the queue read-only and prints
 // the prompts each agent would get, and the hooks it would run (see
 // dryrun.go).
+//
+// With --parallel N > 1 (see parallel.go) up to N tasks ready by the
+// dependency graph run at once, each in its own worktree and goroutine;
+// Run's goroutine is the merge owner, which starts the tasks and merges
+// the finished ones one at a time, in the order they finished, along with
+// every other main-tree, main-branch and spec-directory step. A merge
+// conflict re-executes the task once from the new HEAD; a second one makes
+// it BLOCKED. Each task logs through its own view of the Orchestrator,
+// whose lines carry the task's id.
 package orchestrator
 
 import (
@@ -135,15 +144,24 @@ type Orchestrator struct {
 	statePath string
 	stateOn   bool
 
-	// resume is the saved task record a restarted run continues with,
-	// until processTask takes it; cur is the current task's record.
-	resume *runstate.Task
-	cur    *runstate.Task
+	// cur is the current task's record, one of sh.active; each task view
+	// has its own (see taskView).
+	cur *runstate.Task
 
-	// waiting are the run-state.json records of WAITING tasks, keyed by
-	// spec file, each as it was before the call that answered NEEDS_HUMAN
-	// (see waiting.go); a re-queued WAITING task resumes from its record.
-	waiting map[string]runstate.Task
+	// sh is the state shared by every view of the run: the active and
+	// saved task records, the WAITING records, the spec-file mutex and
+	// the internal stop (see parallel.go).
+	sh *runShared
+
+	// owner is where a task view of a parallel run sends the work only the
+	// merge owner may do (see onOwner); nil in the serial loop.
+	owner chan<- ownerJob
+
+	// onMerge and onFinished are for tests only: called right before and
+	// after a DONE task's merge (or commit), and when a parallel run's
+	// owner is done with a task.
+	onMerge    func(specFile string, enter bool)
+	onFinished func(specFile string)
 
 	// run is this run's directory under .claude/diadoche/runs, holding
 	// run.log and the tasks' artifacts; nil in --dry-run or when it
@@ -153,7 +171,8 @@ type Orchestrator struct {
 	// decisions maps a spec file to the absolute path of the decisions.json
 	// this run wrote for it. The file lives under runs/, outside any
 	// worktree, so it outlives the task's merge; later steps such as the
-	// ADR step read it (see DecisionsPath).
+	// ADR step read it (see DecisionsPath). Guarded by sh.mu; Run creates
+	// it before any task view, so all views share it.
 	decisions map[string]string
 
 	// escPlanner and escWorker are planner and worker on the escalation
@@ -203,6 +222,10 @@ func New(cfg config.Config) *Orchestrator {
 }
 
 func (o *Orchestrator) Run(ctx context.Context) (err error) {
+	o.shared()
+	if o.decisions == nil {
+		o.decisions = map[string]string{}
+	}
 	if o.Cfg.DryRun {
 		return o.dryRun(ctx)
 	}
@@ -309,6 +332,9 @@ func (o *Orchestrator) Run(ctx context.Context) (err error) {
 				runDir = o.run.ID
 			}
 			o.event("", 0, "", "run_start", runlog.F("run", runDir), runlog.F("state_run", o.runID))
+			if o.parallel() > 1 {
+				return o.runParallel(ctx, planner, worker, tester, uw)
+			}
 		}
 
 		processedAny := false
@@ -321,7 +347,7 @@ func (o *Orchestrator) Run(ctx context.Context) (err error) {
 				o.printUsageSummary(uw)
 				return ErrInterrupted
 			}
-			next, err := specs.PopQueue(o.Layout)
+			next, err := o.popQueue()
 			if err != nil {
 				return fmt.Errorf("pop queue: %w", err)
 			}
@@ -337,7 +363,7 @@ func (o *Orchestrator) Run(ctx context.Context) (err error) {
 			//
 			// A task that stopped being pending after QUEUE.md was built
 			// (e.g. BLOCKED because a task it depends on was) is skipped.
-			if status, err := specs.GetStatus(o.Layout, next); err == nil &&
+			if status, err := o.getStatus(next); err == nil &&
 				(status == specs.StatusDone || status == specs.StatusFailed || status == specs.StatusBlocked || status == specs.StatusWaiting) {
 				o.Log.Printf("skipping %s: it is %s", next, status)
 				continue
@@ -356,7 +382,7 @@ func (o *Orchestrator) Run(ctx context.Context) (err error) {
 				return fmt.Errorf("check dependencies of %s: %w", next, err)
 			}
 			if chk.Blocker.Spec != "" {
-				rows, err := specs.BlockForDependency(o.Layout, next, chk.Blocker)
+				rows, err := o.blockForDependency(next, chk.Blocker)
 				if err != nil {
 					o.Log.Printf("task %s: couldn't block it or the tasks that depend on it: %v", next, err)
 				}
@@ -401,7 +427,6 @@ func (o *Orchestrator) Run(ctx context.Context) (err error) {
 			// Every task left waits for one that will never become DONE in
 			// this run: validation ruled cycles out, so STATUS.md was
 			// probably edited by hand.
-			o.cur = nil
 			o.saveState()
 			o.printUsageSummary(uw)
 			return fmt.Errorf("no pending task is ready and none is in flight (a hand-edited STATUS.md?): %s", strings.Join(deferred, "; "))
@@ -410,7 +435,6 @@ func (o *Orchestrator) Run(ctx context.Context) (err error) {
 			// Nothing left to do and nothing new showed up in this round's
 			// sync: no leftover work, no new task specs. We're done.
 			// run-state.json stays, with no task: nothing to continue.
-			o.cur = nil
 			o.saveState()
 			o.printUsageSummary(uw)
 			return nil
@@ -505,14 +529,31 @@ func (o *Orchestrator) syncQueueLocked() error {
 		return fmt.Errorf("acquire spec lock: %w", err)
 	}
 	defer lock.Release()
-	_, _, err = specs.Sync(o.Layout)
+	return o.syncSpecs()
+}
+
+// processTask runs one task start to finish: startTask, runTask, then
+// finishTask, back to back (the serial loop).
+func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner, worker, tester *agents.Agent, uw *usage.Writer) error {
+	tr, err := o.startTask(ctx, specFile)
+	if err != nil {
+		return err
+	}
+	_, err = o.finishTask(ctx, o.runTask(ctx, tr, planner, worker, tester, uw), uw)
 	return err
 }
 
-func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner, worker, tester *agents.Agent, uw *usage.Writer) error {
+// startTask sets specFile up to run, on the merge owner: its saved record
+// (if any), its workspace or worktree, IN_PROGRESS in STATUS.md. An error
+// setting the workspace up is fatal.
+func (o *Orchestrator) startTask(ctx context.Context, specFile string) (*taskRun, error) {
 	o.Log.Printf("=== task %s ===", specFile)
 	num := specs.TaskNumber(specFile)
 	resume := o.takeResume(specFile)
+	tr := &taskRun{specFile: specFile, num: num, view: o, resume: resume, attempt: 1}
+	if resume != nil && resume.Attempt > 1 {
+		tr.attempt = resume.Attempt
+	}
 
 	var ws *workspace
 	if !o.offline() {
@@ -526,7 +567,13 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 			ws, err = o.prepareWorkspace(ctx, specFile, num)
 		}
 		if err != nil {
-			return &fatalError{err}
+			return nil, &fatalError{err}
+		}
+		ws.attempt = tr.attempt
+		if tr.attempt > 1 {
+			if b := conflictBranchPrefix + taskID(specFile, num); gitutil.BranchExists(ctx, o.Cfg.Dir, b) {
+				ws.conflictBranch = b
+			}
 		}
 		if resume != nil {
 			o.checkResumedWorkspace(specFile, ws, resume)
@@ -539,12 +586,21 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 		o.event(specFile, 0, "", "task_start")
 	}
 
-	if err := specs.SetStatus(o.Layout, specFile, specs.StatusInProgress); err != nil {
-		return err
+	if err := o.setStatus(specFile, specs.StatusInProgress); err != nil {
+		return nil, err
 	}
 	o.event(specFile, 0, "", "status", runlog.F("status", specs.StatusInProgress))
+	tr.ws = ws
+	return tr, nil
+}
 
-	done, cause := o.runIterations(ctx, specFile, num, ws, resume, planner, worker, tester, uw)
+// runTask runs a started task's iterations and, when they ran out, its
+// --on-fail chain, then writes its final.diff: only agent calls and the
+// task's own worktree, so in a parallel run it runs on the task's own
+// goroutine.
+func (o *Orchestrator) runTask(ctx context.Context, tr *taskRun, planner, worker, tester *agents.Agent, uw *usage.Writer) taskOutcome {
+	specFile, num, ws := tr.specFile, tr.num, tr.ws
+	done, cause := o.runIterations(ctx, specFile, num, ws, tr.resume, tr.priorAttempt, planner, worker, tester, uw)
 	// Iterations exhausted: the --on-fail chain decides (see onfail.go).
 	// Every outcome of its escalated iteration is then handled below like
 	// the same outcome of a normal one.
@@ -554,6 +610,18 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 		done, cause = onFail.done, onFail.cause
 	}
 	o.writeFinalDiff(ctx, specFile, num, ws)
+	return taskOutcome{tr: tr, done: done, cause: cause, onFail: onFail}
+}
+
+// finishTask carries out a task's outcome, on the merge owner: merge or
+// commit and the task-done handlers for DONE, WAITING, split, BLOCKED or
+// FAILED with their changes preserved, or the task left pending for the
+// next run. The error is the task's, as for the serial loop (a
+// *fatalError stops the run). reexec reports a merge conflict the task is
+// re-executed for (--parallel): its record then stays active.
+func (o *Orchestrator) finishTask(ctx context.Context, out taskOutcome, uw *usage.Writer) (reexec bool, err error) {
+	specFile, num, ws := out.tr.specFile, out.tr.num, out.tr.ws
+	done, cause, onFail := out.done, out.cause, out.onFail
 	taskEnd := func(status, reason string) {
 		fields := []runlog.Field{runlog.F("status", status)}
 		if reason != "" {
@@ -569,7 +637,7 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 		o.saveState()
 		o.Log.Printf("task %s: interrupted while paused; it stays PAUSED and is resumed by the next run", specFile)
 		taskEnd(specs.StatusPaused, "interrupted")
-		return &fatalError{cause}
+		return false, &fatalError{cause}
 	}
 	if !done && (errors.Is(cause, ErrInterrupted) || ctx.Err() != nil) {
 		// A signal is never a reason to fail a task: nothing is parked.
@@ -577,9 +645,9 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 		o.Log.Printf("task %s: interrupted by signal; it stays IN_PROGRESS and the next run resumes it %s", specFile, o.resumePoint())
 		taskEnd(specs.StatusInProgress, "interrupted")
 		if cause == nil || errors.Is(cause, ErrInterrupted) {
-			return &fatalError{cmp.Or(cause, ErrInterrupted)}
+			return false, &fatalError{cmp.Or(cause, ErrInterrupted)}
 		}
-		return &fatalError{fmt.Errorf("%w (%v)", ErrInterrupted, cause)}
+		return false, &fatalError{fmt.Errorf("%w (%v)", ErrInterrupted, cause)}
 	}
 	var nh *needsHumanError
 	if errors.As(cause, &nh) {
@@ -588,15 +656,15 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 		err := o.waitTask(ctx, specFile, num, ws, nh)
 		taskEnd(specs.StatusWaiting, "needs_human")
 		if err != nil {
-			return &fatalError{fmt.Errorf("task %s: preserve WAITING changes: %w", specFile, err)}
+			return false, &fatalError{fmt.Errorf("task %s: preserve WAITING changes: %w", specFile, err)}
 		}
-		return nil
+		return false, nil
 	}
 	if errors.Is(cause, ErrRunBudgetExceeded) {
 		o.saveState()
 		o.Log.Printf("task %s: run budget exhausted; leaving it pending with its changes in place", specFile)
 		taskEnd(specs.StatusInProgress, "run_budget")
-		return &fatalError{cause}
+		return false, &fatalError{cause}
 	}
 	if cause != nil && usagelimit.Mentions(cause.Error()) {
 		// Not a failure: the account's usage window ran out. Nothing is
@@ -606,14 +674,24 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 		o.saveState()
 		o.Log.Printf("task %s: interrupted by a claude usage limit; leaving it IN_PROGRESS with its changes in place", specFile)
 		taskEnd(specs.StatusInProgress, "usage_limit")
-		return &fatalError{cause}
+		return false, &fatalError{cause}
 	}
-	defer o.closeTaskState()
+	closeState := true
+	defer func() {
+		if closeState {
+			o.closeTaskState()
+		}
+	}()
 	if done {
 		o.Log.Printf("task %s: DONE", specFile)
+		if o.onMerge != nil {
+			o.onMerge(specFile, true)
+		}
 		var err error
 		if ws != nil && ws.worktree {
-			err = o.finishDoneWorktree(ctx, specFile, ws)
+			// Only a parallel run re-executes a conflicting task, and only
+			// once.
+			reexec, err = o.finishDoneWorktree(ctx, specFile, ws, o.parallel() > 1 && ws.attempt < 2)
 		} else {
 			if ws != nil {
 				ws.removeBaseFile()
@@ -624,8 +702,15 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 				ws.mergeCommit = landed
 			}
 		}
+		if o.onMerge != nil {
+			o.onMerge(specFile, false)
+		}
+		if reexec {
+			closeState = false
+			return true, nil
+		}
 		// finishDoneWorktree turns a task whose merge failed BLOCKED.
-		status, serr := specs.GetStatus(o.Layout, specFile)
+		status, serr := o.getStatus(specFile)
 		if serr != nil || status == "" {
 			status = specs.StatusDone
 		}
@@ -636,34 +721,34 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 			}
 		}
 		taskEnd(status, reason)
-		return err
+		return false, err
 	}
 	if len(onFail.split) > 0 {
 		// Not a failure: the split-off tasks carry on in its place.
 		err := o.splitTask(ctx, specFile, num, ws, onFail.applied, onFail.split)
 		taskEnd(specs.StatusBlocked, "split")
 		if err != nil {
-			return &fatalError{fmt.Errorf("task %s: preserve split changes: %w", specFile, err)}
+			return false, &fatalError{fmt.Errorf("task %s: preserve split changes: %w", specFile, err)}
 		}
-		return nil
+		return false, nil
 	}
 	if onFail.blocked {
 		err := o.blockTask(ctx, specFile, num, ws, onFail.applied)
 		taskEnd(specs.StatusBlocked, "on_fail")
 		if err != nil {
-			return &fatalError{fmt.Errorf("task %s: preserve BLOCKED changes: %w", specFile, err)}
+			return false, &fatalError{fmt.Errorf("task %s: preserve BLOCKED changes: %w", specFile, err)}
 		}
-		return nil
+		return false, nil
 	}
 	if cause == nil {
 		o.Log.Printf("task %s: FAILED after %d iteration(s)", specFile, o.Cfg.Iter)
 	}
-	err := o.failTask(ctx, specFile, num, ws, cause)
+	err = o.failTask(ctx, specFile, num, ws, cause)
 	taskEnd(specs.StatusFailed, "")
 	if err != nil {
-		return &fatalError{fmt.Errorf("task %s: park FAILED changes: %w", specFile, err)}
+		return false, &fatalError{fmt.Errorf("task %s: park FAILED changes: %w", specFile, err)}
 	}
-	return cause
+	return false, cause
 }
 
 // runIterations runs up to cfg.Iter planner/worker/tester rounds for one
@@ -677,7 +762,11 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 // loop then starts at the first agent of its iteration that hadn't
 // finished (see runstate.Task.Next), unless the reviews on disk are
 // already past it.
-func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, ws *workspace, resume *runstate.Task, planner, worker, tester *agents.Agent, uw *usage.Writer) (done bool, err error) {
+//
+// priorAttempt, when set, is a re-executed task's first-attempt history
+// (see reexecTask): planner and worker get it in iteration 1 in place of
+// the previous review.
+func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, ws *workspace, resume *runstate.Task, priorAttempt string, planner, worker, tester *agents.Agent, uw *usage.Writer) (done bool, err error) {
 	specPath := filepath.Join(o.Layout.SpecDir, specFile)
 	specContent, err := os.ReadFile(specPath)
 	if err != nil {
@@ -711,7 +800,7 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 		}
 		done, err := o.runIteration(ctx, iterationInput{
 			specFile: specFile, num: num, specContent: specContent, ws: ws, iter: iter,
-			resumePoint: iter == startIter, startAgent: startAgent,
+			resumePoint: iter == startIter, startAgent: startAgent, priorAttempt: priorAttempt,
 			planner: planner, worker: worker, tester: tester, uw: uw,
 		})
 		if done || err != nil {
@@ -743,6 +832,10 @@ type iterationInput struct {
 	// escalated marks the extra iteration of --on-fail escalate, numbered
 	// --ITER+1, with planner and worker on the escalation model.
 	escalated bool
+
+	// priorAttempt replaces the previous review in iteration 1: a
+	// re-executed task's first-attempt history (see reexecTask).
+	priorAttempt string
 
 	planner, worker, tester *agents.Agent
 	uw                      *usage.Writer
@@ -779,6 +872,9 @@ func (o *Orchestrator) runIteration(ctx context.Context, in iterationInput) (don
 		if b, err := os.ReadFile(prevReviewPath); err == nil {
 			priorReview = string(b)
 		}
+	}
+	if iter == 1 && in.priorAttempt != "" {
+		priorReview = in.priorAttempt
 	}
 	questionsBlock := o.questionsBlock(specFile)
 
@@ -961,7 +1057,7 @@ func (o *Orchestrator) runIteration(ctx context.Context, in iterationInput) (don
 		return false, fmt.Errorf("tester: %w", err)
 	}
 
-	status, err := specs.GetStatus(o.Layout, specFile)
+	status, err := o.getStatus(specFile)
 	if err != nil {
 		return false, err
 	}
@@ -1006,7 +1102,10 @@ func (o *Orchestrator) runIteration(ctx context.Context, in iterationInput) (don
 func (o *Orchestrator) runStep(ctx context.Context, c agentCall, a *agents.Agent, prompt string) (agents.RunResult, error) {
 	var before *runstate.Task
 	if o.cur != nil {
+		sh := o.shared()
+		sh.mu.Lock()
 		b := *o.cur
+		sh.mu.Unlock()
 		before = &b
 	}
 	o.setAgentState(c.iter, a.Name, runstate.AgentRunning)
@@ -1020,8 +1119,11 @@ func (o *Orchestrator) runStep(ctx context.Context, c agentCall, a *agents.Agent
 	}
 	if !o.Cfg.DryRun && asksHuman(a.Name, result.Output) {
 		if before != nil && o.cur != nil {
+			sh := o.shared()
+			sh.mu.Lock()
 			*o.cur = *before
-			o.saveState()
+			o.saveStateLocked()
+			sh.mu.Unlock()
 		}
 		o.Log.Printf("%s answered %s", c.logPrefix(o.Cfg.Iter, a.Name), questions.Marker)
 		return result, &needsHumanError{agent: a.Name, iter: c.iter}

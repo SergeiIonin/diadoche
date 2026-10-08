@@ -77,6 +77,7 @@ const helpSynopsis = `SYNOPSIS
              [--max-call-cost <usd>] [--max-cost-per-task <usd>]
              [--max-cost-per-run <usd>] [--allow-dirty]
              [--stable-system-prompt=<bool>] [--worktree=<bool>]
+             [--parallel N]
              [--red-green=<bool>] [--test-globs <list>]
              [--fresh] [--shutdown-timeout <duration>]
              [--on-task-done <command>]... [--hook-timeout <duration>]
@@ -198,6 +199,30 @@ const helpDescription = `DESCRIPTION
     interrupted while a task is pending leaves its worktree in place, and
     the next run resumes the task in it. A repository without any commit yet has
     nothing to branch from, so such a run falls back to --worktree=false.
+
+    PARALLEL TASKS (--parallel N, default 1): up to N tasks that are ready
+    by the dependency graph run at the same time, each in its own worktree
+    and branch with its own iterations; --parallel > 1 requires --worktree.
+    A task is ready when every task its Depends-on line names is DONE and
+    merged; a spec without a Depends-on line still waits for the task
+    before it, so it never runs alongside it. Everything that touches the
+    main working tree, the current branch or the spec directory as a whole
+    is done by one owner, one task at a time: merges happen one at a time,
+    in the order the tasks finish, and the bookkeeping commits, the
+    on-task-done hooks and the ADR step run serially after each merge.
+    A merge conflict re-executes the task once from the new HEAD: its first
+    attempt is kept on diadoche/conflict/<NNN>-<slug>, its plan and reviews
+    are archived as spec/<NNN>_ATTEMPT1_IMPL_PLAN.md and
+    spec/<NNN>_ATTEMPT1_REVIEW_<M>.md (planner sees them), and its
+    iterations run again up to --ITER. A second conflict makes it BLOCKED
+    (the reason names the conflict and the kept branch) and blocks the
+    tasks that depend on it. One task failing does not stop the others;
+    three tasks failing with none finishing in between still end the run,
+    after the tasks in flight finish. Every log line of a task starts with
+    [<NNN>-<slug>], and run-state.json lists every active task. SIGINT or
+    SIGTERM stops all tasks at their next step; --shutdown-timeout applies
+    once to all in-flight calls together. --dry-run shows which tasks
+    could run concurrently. --parallel 1 is the one-task-at-a-time loop.
 
     FAILED TASKS (--worktree=false): every task starts from a clean working
     tree. When a task
@@ -423,11 +448,14 @@ const helpShutdown = `SIGNALS AND RESTART STATE
     file + rename, so it is never half-written): the run id, the current
     task (spec file and number), the iteration, the agent and its state
     (pending, running or done), the task's base commit, its worktree (with
-    --worktree) and the time of the update. A finished task leaves "task":
-    null; the file stays after the run, so the next one sees there is
-    nothing to continue.
+    --worktree) and the time of the update. "tasks" lists one such record
+    per active task (several with --parallel), each with its "attempt" when
+    a merge conflict made it re-execute; "task" mirrors the first of them
+    for older readers. A finished run leaves "tasks": [] and "task": null;
+    the file stays after the run, so the next one sees there is nothing to
+    continue. A file with only the older single "task" field still resumes.
 
-    On start, an unfinished task in the file is moved to the head of the
+    On start, every unfinished task in the file is moved to the head of the
     queue and continued with the first agent of that iteration that had not
     finished - a done agent is not called again, a running one (cut off) is
     repeated - with the same base commit and worktree. The state is ignored,
@@ -714,11 +742,13 @@ FILES
         (added once; the file is created if missing).
 
     <project>/.claude/diadoche/run-state.json
-        Where the run is (see SIGNALS AND RESTART STATE): run_id, task
-        (spec, num, iteration, agent, agent_state pending|running|done,
-        base_commit, worktree), updated_at, and "waiting": the records of
-        WAITING tasks by spec file, as they were before the NEEDS_HUMAN call
-        (omitted when none). "task": null when no task is in progress. Kept out of git via .git/info/exclude. Not written in
+        Where the run is (see SIGNALS AND RESTART STATE): run_id, tasks
+        (one record per active task: spec, num, iteration, agent,
+        agent_state pending|running|done, base_commit, worktree, attempt),
+        task (the first of them, for older readers), updated_at, and
+        "waiting": the records of WAITING tasks by spec file, as they were
+        before the NEEDS_HUMAN call (omitted when none). "tasks": [] and
+        "task": null when no task is in progress. Kept out of git via .git/info/exclude. Not written in
         --dry-run.
 
 `
@@ -840,6 +870,12 @@ type Config struct {
 	// working tree and a FAILED task's changes are parked.
 	Worktree bool
 
+	// Parallel is how many tasks ready by the dependency graph run at the
+	// same time (--parallel), each in its own worktree; merges stay one at
+	// a time. 1 is the serial loop; > 1 requires Worktree. 0 in a
+	// hand-built Config means 1.
+	Parallel int
+
 	// RedGreen runs the red-green check after worker: the task's new and
 	// changed test files are run on the base commit, and tests that pass
 	// there fail the iteration. The zero value is off; Parse defaults it
@@ -926,6 +962,7 @@ func Parse(args []string) (*Config, error) {
 	allowDirty := fs.Bool("allow-dirty", false, "skip the dirty-working-tree check (at run start with --worktree, before each task with --worktree=false); with --worktree=false those files are never parked when the task FAILS")
 	worktree := fs.Bool("worktree", true, "run each task in its own git worktree .claude/diadoche/worktrees/<NNN>-<slug> on branch diadoche/<NNN>-<slug>, merging it into the current branch once DONE; --worktree=false works in the main working tree and parks FAILED changes instead")
 	stableSystemPrompt := fs.Bool("stable-system-prompt", true, "pass claude --exclude-dynamic-system-prompt-sections, keeping the shared prompt prefix identical between calls; set to false for a claude CLI without that flag")
+	parallel := fs.Int("parallel", 1, "run up to N tasks that are ready by the dependency graph at the same time, each in its own worktree; merges into the current branch stay one at a time, in the order tasks finish; requires --worktree")
 	redGreen := fs.Bool("red-green", true, "after worker, run the task's new/changed test files on the base commit in a temporary worktree; tests that pass there fail the iteration")
 	testGlobs := fs.String("test-globs", "", "comma-separated test-file globs for non-Go projects, e.g. 'test_*.py,*.spec.ts'; default: inferred from the plan's ## Test Command; *_test.go always counts")
 	maxCallCost := fs.Float64("max-call-cost", 0, "fail the task if a single agent call's cost in USD exceeds this — checked after the call returns, so it cannot preempt the spend (0 = no limit)")
@@ -1002,6 +1039,12 @@ func Parse(args []string) (*Config, error) {
 	if *hookTimeout <= 0 {
 		return nil, fmt.Errorf("--hook-timeout must be > 0, got %s", *hookTimeout)
 	}
+	if *parallel < 1 {
+		return nil, fmt.Errorf("--parallel must be >= 1, got %d", *parallel)
+	}
+	if *parallel > 1 && !*worktree {
+		return nil, fmt.Errorf("--parallel %d requires --worktree (concurrent tasks need separate trees), but --worktree=false was given", *parallel)
+	}
 
 	globs := splitCSV(*testGlobs)
 	if err := redgreen.ValidateGlobs(globs); err != nil {
@@ -1066,6 +1109,7 @@ func Parse(args []string) (*Config, error) {
 		MaxCostPerRunUSD:   *maxCostPerRun,
 		AllowDirty:         *allowDirty,
 		Worktree:           *worktree,
+		Parallel:           *parallel,
 		StableSystemPrompt: *stableSystemPrompt,
 		RedGreen:           *redGreen,
 		TestGlobs:          globs,

@@ -91,6 +91,10 @@ Flags:
   `diadoche/<NNN>-<slug>`, merging it into the current branch once `DONE`
   (default `true`). `--worktree=false` works in the main working tree and
   parks a `FAILED` task's changes instead. See "Worktrees" below.
+- `--parallel N` — run up to N tasks that are ready by the dependency graph
+  at the same time, each in its own worktree; merges into the current
+  branch stay one at a time, in the order the tasks finish (default `1`,
+  one task at a time). Requires `--worktree`. See "Parallel tasks" below.
 - `--allow-dirty` — skip the dirty-working-tree check (at run start with
   `--worktree`, before each task with `--worktree=false`); with
   `--worktree=false` those files are never parked if the task fails. See
@@ -531,27 +535,35 @@ half-written):
 ```json
 {
   "run_id": "20261008T120000Z-1a2b3c4d",
-  "task": {
-    "spec": "009_x.md",
-    "num": "009",
-    "iteration": 2,
-    "agent": "worker",
-    "agent_state": "done",
-    "base_commit": "<sha>",
-    "worktree": ".claude/diadoche/worktrees/009-x"
-  },
+  "tasks": [
+    {
+      "spec": "009_x.md",
+      "num": "009",
+      "iteration": 2,
+      "agent": "worker",
+      "agent_state": "done",
+      "base_commit": "<sha>",
+      "worktree": ".claude/diadoche/worktrees/009-x"
+    }
+  ],
+  "task": { "spec": "009_x.md", "...": "the first record of tasks" },
   "updated_at": "2026-10-08T12:34:56Z"
 }
 ```
 
-`agent_state` is `pending`, `running` or `done`; `worktree` is only there
-when the task runs in its own worktree. When a task is DONE, FAILED or
-BLOCKED, and at the end of the run, `task` is `null`: the file stays, so the
+`tasks` holds one record per active task — several with `--parallel` — in
+the order they started; `task` mirrors the first of them for older
+readers, and a file with only `task` (written before `tasks` existed) is
+still resumed. `agent_state` is `pending`, `running` or `done`; `worktree`
+is only there when the task runs in its own worktree; `attempt` is `2` for
+a task re-executed after a merge conflict (see "Parallel tasks"). When a
+task is DONE, FAILED or BLOCKED its record leaves the list, and at the end
+of the run `tasks` is `[]` and `task` is `null`: the file stays, so the
 next run sees that there is nothing to continue. The file is kept out of
 git (`.git/info/exclude`), and nothing is read or written in `--dry-run`.
 
-On start, an unfinished task in the file is moved to the head of the queue
-and continued in the same iteration, with the same base commit and
+On start, every unfinished task in the file is moved to the head of the
+queue and continued in the same iteration, with the same base commit and
 worktree. A `done` agent is not called again: after worker comes tester,
 and after tester the next iteration. A `running` or `pending` agent is
 repeated, because it was cut off. So a run stopped between worker and
@@ -690,6 +702,42 @@ never runs `git stash`: commit the changes first, or pass `--allow-dirty`
 to skip the check (or `--worktree=false`). A repository without any commit
 yet has nothing to branch from, so such a run falls back to
 `--worktree=false`.
+
+## Parallel tasks (`--parallel N`)
+
+With `--parallel N` (default `1`, which is the one-task-at-a-time loop) up
+to N tasks run at the same time, each in its own worktree and branch, each
+with its own iterations. `--parallel` greater than 1 requires
+`--worktree`.
+
+- A task is ready when every task its `Depends-on` line names is `DONE`
+  and merged. A spec without a `Depends-on` line still waits for the task
+  before it, so it never runs alongside it; `Depends-on: none` is what lets
+  tasks run in parallel. When fewer than N tasks are ready, only those run;
+  each merge re-checks the graph for tasks it unblocked.
+- Everything that touches the main working tree, the current branch or
+  the spec directory as a whole is done by one owner: merges happen one at
+  a time, in the order the tasks finished, and the bookkeeping commits, the
+  `--on-task-done` hooks and the ADR step run after each merge, one task at
+  a time.
+- A merge conflict re-executes the task once from the new `HEAD`: its first
+  attempt is kept on `diadoche/conflict/<NNN>-<slug>`, its plan and reviews
+  are archived as `spec/<NNN>_ATTEMPT1_IMPL_PLAN.md` and
+  `spec/<NNN>_ATTEMPT1_REVIEW_<M>.md` (planner and worker get them as
+  history), and its iterations run again up to `--ITER`. A second conflict
+  makes the task `BLOCKED`, with a reason naming the conflict and the kept
+  branch, and the tasks that depend on it `BLOCKED` too. Both are `reexec`
+  and `merge_blocked` events in `run.log`.
+- One task failing does not stop the others. Three tasks failing with no
+  task finishing in between still end the run, once the tasks in flight
+  have finished and been merged or preserved.
+- Every log line of a task starts with `[<NNN>-<slug>]`.
+- `run-state.json` lists every active task; a restarted run resumes all of
+  them, with whatever `--parallel` it is given.
+- `SIGINT`/`SIGTERM` stops every task at its next step; `--shutdown-timeout`
+  applies once to all in-flight calls together.
+- `--dry-run` shows which tasks could run concurrently, in waves, and
+  starts nothing; the merge order depends on which task finishes first.
 
 ## FAILED tasks (`--worktree=false`)
 

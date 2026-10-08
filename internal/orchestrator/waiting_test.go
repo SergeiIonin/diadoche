@@ -140,8 +140,8 @@ func TestNeedsHumanPutsTaskWaitingWithoutSpendingAnIteration(t *testing.T) {
 	if got, ok := st.Waiting["001_example.md"]; !ok || got != want {
 		t.Errorf("waiting record = %+v (present %v), want %+v", got, ok, want)
 	}
-	if st.Task != nil {
-		t.Errorf("current task = %+v, want none", st.Task)
+	if firstTask(st) != nil {
+		t.Errorf("current task = %+v, want none", firstTask(st))
 	}
 
 	if !fileExists(filepath.Join(layout.Root, "worktrees", "001-example")) {

@@ -310,7 +310,7 @@ func (o *Orchestrator) runTaskDoneHooks(ctx context.Context, specFile, num strin
 		return false
 	}
 	reason := strings.Join(fragments, "; ")
-	if err := specs.SetStatusReason(o.Layout, specFile, specs.StatusDone, reason); err != nil {
+	if err := o.setStatusReason(specFile, specs.StatusDone, reason); err != nil {
 		o.Log.Printf("warning: task %s: couldn't record the on-task-done warning in STATUS.md: %v", specFile, err)
 	} else {
 		o.event(specFile, 0, "", "status", runlog.F("status", specs.StatusDone), runlog.F("reason", "on_task_done_failed"))

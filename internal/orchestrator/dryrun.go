@@ -52,8 +52,9 @@ func (o *Orchestrator) dryRun(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("dry-run: read queue: %w", err)
 	}
+	var waiting []string
 	if o.Cfg.ResumeWaiting {
-		waiting, err := specs.WaitingSpecs(o.Layout)
+		waiting, err = specs.WaitingSpecs(o.Layout)
 		if err != nil {
 			return fmt.Errorf("dry-run: read waiting tasks: %w", err)
 		}
@@ -68,6 +69,12 @@ func (o *Orchestrator) dryRun(ctx context.Context) error {
 		o.Log.Print("dry-run: no pending tasks")
 	} else {
 		o.Log.Printf("dry-run: %d pending task(s) in queue order: %s", len(queue), strings.Join(queue, ", "))
+	}
+	// offline() keeps o.parallel() at 1 in a dry run: read the flags.
+	if n := o.Cfg.Parallel; n > 1 && o.Cfg.Worktree && len(queue) > 0 {
+		if err := o.dryRunWaves(queue, waiting, n); err != nil {
+			return err
+		}
 	}
 	if o.Cfg.Worktree {
 		o.Log.Printf("dry-run: a real run would run each task in its own git worktree under %s; the dry run shows %s as the work dir",
@@ -127,6 +134,49 @@ func (o *Orchestrator) dryRun(ctx context.Context) error {
 	}
 
 	o.Log.Print("dry-run: no state was changed")
+	return nil
+}
+
+// dryRunWaves reports which tasks of queue a --parallel n run could run
+// concurrently: wave 1 are the tasks with no pending predecessor in the
+// dependency graph, wave k+1 those whose latest predecessor is in wave k.
+// waiting are WAITING tasks --resume-waiting would queue. The merge order
+// depends on which task finishes first, which a dry run can't know.
+func (o *Orchestrator) dryRunWaves(queue, waiting []string, n int) error {
+	preds, err := specs.PendingPredecessors(o.Layout, waiting)
+	if err != nil {
+		return fmt.Errorf("dry-run: read the dependency graph: %w", err)
+	}
+	wave := map[string]int{}
+	var waveOf func(spec string, depth int) int
+	waveOf = func(spec string, depth int) int {
+		if w, ok := wave[spec]; ok {
+			return w
+		}
+		w := 1
+		if depth <= len(queue) {
+			for _, p := range preds[spec] {
+				if slices.Contains(queue, p) {
+					w = max(w, waveOf(p, depth+1)+1)
+				}
+			}
+		}
+		wave[spec] = w
+		return w
+	}
+	var waves [][]string
+	for _, spec := range queue {
+		w := waveOf(spec, 0)
+		for len(waves) < w {
+			waves = append(waves, nil)
+		}
+		waves[w-1] = append(waves[w-1], spec)
+	}
+	o.Log.Printf("dry-run: --parallel %d: tasks that could run concurrently (up to %d at a time):", n, n)
+	for i, ws := range waves {
+		o.Log.Printf("dry-run:   wave %d: %s", i+1, strings.Join(ws, ", "))
+	}
+	o.Log.Print("dry-run: merges would happen one at a time in the order tasks finish, which a dry run cannot know")
 	return nil
 }
 
