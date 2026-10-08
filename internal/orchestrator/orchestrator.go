@@ -305,15 +305,22 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 			planBytes, _ := os.ReadFile(implPlanPath)
 			if !implplan.HasRequiredSections(string(planBytes)) {
 				note := fmt.Sprintf(
-					"Implementation plan rejected: %s must contain both a \"## %s\" section "+
-						"(the exact file paths to create or modify, one per bullet) and a \"## %s\" section "+
-						"(the command to run this project's tests and linter). Rewrite the plan to include "+
-						"both sections in full, using exactly these headings.",
-					implPlanFile, implplan.FilesHeading, implplan.TestCommandHeading)
+					"Implementation plan rejected: %s must contain both a \"## %s\" section and a "+
+						"\"## %s\" section, using exactly these headings.\n\n"+
+						"\"## %s\" must list at least one file, one per bullet, in the format\n"+
+						"    %s\n"+
+						"with the path first (backticks optional) — only the path is parsed, so it must be "+
+						"exact and relative to the repository root — and the list must be exhaustive, since "+
+						"worker works strictly from it without exploring the repository. Prose such as "+
+						"\"(none yet)\" or \"TBD\" does not count as a file.\n\n"+
+						"\"## %s\" holds the concrete command(s) that run this project's tests and linter.\n\n"+
+						"Rewrite the plan with both sections filled in.",
+					implPlanFile, implplan.FilesHeading, implplan.TestCommandHeading,
+					implplan.FilesHeading, implplan.FilesBulletFormat, implplan.TestCommandHeading)
 				if err := os.WriteFile(reviewPath, []byte(note), 0o644); err != nil {
 					return false, fmt.Errorf("write plan-contract review: %w", err)
 				}
-				o.Log.Printf("%s iteration %d: %s is missing the required Files/Test Command sections; retrying planner next iteration", specFile, iter, implPlanFile)
+				o.Log.Printf("%s iteration %d: %s is missing or empty in the required Files/Test Command sections (Files must list at least one file); retrying planner next iteration", specFile, iter, implPlanFile)
 				continue
 			}
 		}

@@ -110,13 +110,17 @@ preprocessor) are guarded by a `spec/.lock` file lock, so a concurrent
 2. For each task pulled off the queue, status is set to `IN_PROGRESS`, and
    diadoche runs up to `--ITER` rounds of:
    - **planner** (model `claude-opus-5-5` by default) — writes
-     `spec/NNN_IMPL_PLAN.md`, which must contain a `## Files` section (the
-     exact paths to create/modify) and a `## Test Command` section (how to
-     run this project's tests/linter). If either is missing, the iteration
-     is treated as failed and planner is asked again, still within the same
-     `--ITER` budget.
+     `spec/NNN_IMPL_PLAN.md`, which must contain a `## Files` section and a
+     `## Test Command` section (the command(s) that run this project's tests
+     and linter). Each `## Files` entry is one line,
+     `- <path> — create|modify: <one line on what the file is for>`, with the
+     path first; diadoche parses only the path. If either section is missing,
+     or `## Files` lists no file at all, the iteration is treated as failed
+     and planner is asked again, still within the same `--ITER` budget.
    - **worker** (model `claude-opus-5-5` by default) — implements the plan,
-     working from its `## Files` list instead of re-exploring the repo;
+     working only from its `## Files` list instead of re-exploring the repo;
+     if another file turns out to be needed, worker first appends it to
+     `## Files` with a one-line justification and only then edits it;
    - **tester** (model `claude-sonnet-5-5` by default) — reviews a `git diff`
      of the worker's changes (see "Diff-scoped tester" below) plus the plan's
      test command, writes `spec/NNN_REVIEW_M.md`, and, if the task is

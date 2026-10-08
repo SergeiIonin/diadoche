@@ -3,6 +3,7 @@ package agents
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -120,5 +121,37 @@ func TestBuiltinDefaultModels(t *testing.T) {
 		if a.Model != model {
 			t.Errorf("%s: built-in default model = %q, want %q", name, a.Model, model)
 		}
+	}
+}
+
+// TestEmbeddedPlannerAndWorkerPromptsCarryPlanContract pins the
+// IMPL_PLAN.md contract into the built-in prompts: planner must describe
+// both required sections and the per-file create/modify marker, and worker
+// must be told to work from that list and how to extend it. The headings are
+// spelled out literally here on purpose — implplan parses the same strings.
+func TestEmbeddedPlannerAndWorkerPromptsCarryPlanContract(t *testing.T) {
+	planner, err := LoadOrDefault(t.TempDir(), "planner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"## Files", "## Test Command", "create", "modify", "linter", "at least one file"} {
+		if !strings.Contains(planner.SystemPrompt, want) {
+			t.Errorf("embedded planner prompt is missing %q", want)
+		}
+	}
+
+	worker, err := LoadOrDefault(t.TempDir(), "worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"## Files", "justif", "IMPL_PLAN.md"} {
+		if !strings.Contains(worker.SystemPrompt, want) {
+			t.Errorf("embedded worker prompt is missing %q", want)
+		}
+	}
+	// The ban on editing spec files must not swallow the one exception
+	// worker needs: appending to the plan's Files section.
+	if strings.Contains(worker.SystemPrompt, "spec/NNN_*") {
+		t.Error("embedded worker prompt still bans all spec/NNN_* files, which contradicts appending to the plan's Files section")
 	}
 }

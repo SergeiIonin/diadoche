@@ -55,8 +55,10 @@ func setTestGitEnv(t *testing.T) {
 }
 
 // validPlanFixture is IMPL_PLAN.md content satisfying implplan's required
-// contract (non-empty Files and Test Command sections).
-const validPlanFixture = "## Files\n- some/file.go\n\n## Test Command\ngo test ./...\n"
+// contract: a Files section listing at least one file in the annotated
+// per-file format planner is asked for, and a Test Command section. Every
+// end-to-end test below runs through this format on purpose.
+const validPlanFixture = "## Files\n- some/file.go — modify: exercised by the orchestrator tests\n\n## Test Command\ngo test ./...\n"
 
 // fakeRunner simulates a real planner/worker/tester: the worker writes a
 // file change, and the tester marks the task DONE in STATUS.md, exactly
@@ -773,6 +775,9 @@ type planContractRunner struct {
 	workerCalls   int
 	testerCalls   int
 	alwaysInvalid bool
+	// invalidContent is what the rejected planner call writes; zero value
+	// means free-form notes with no required sections at all.
+	invalidContent string
 }
 
 func (r *planContractRunner) Run(_ context.Context, _ string, a *agents.Agent, _ string) (agents.RunResult, error) {
@@ -782,6 +787,9 @@ func (r *planContractRunner) Run(_ context.Context, _ string, a *agents.Agent, _
 		content := validPlanFixture
 		if r.alwaysInvalid || r.plannerCalls == 1 {
 			content = "just some free-form notes, no required sections"
+			if r.invalidContent != "" {
+				content = r.invalidContent
+			}
 		}
 		if err := os.WriteFile(filepath.Join(r.layout.SpecDir, "001_IMPL_PLAN.md"), []byte(content), 0o644); err != nil {
 			return agents.RunResult{}, err
@@ -852,6 +860,59 @@ func TestProcessTaskRetriesPlannerWithinITERBudgetWhenPlanInvalid(t *testing.T) 
 	}
 }
 
+// TestProcessTaskRetriesPlannerWhenFilesSectionIsEmpty covers the second
+// way a plan can break the contract: both headings are there, but the Files
+// section lists no file at all.
+func TestProcessTaskRetriesPlannerWhenFilesSectionIsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	layout := specs.NewLayout(dir)
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	writeAgentFixtures(t, layout.AgentsDir)
+	specFile := "001_example.md"
+	if err := os.WriteFile(filepath.Join(layout.SpecDir, specFile), []byte("# Example\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &planContractRunner{
+		layout:         layout,
+		invalidContent: "## Files\n(none yet)\n\n## Test Command\ngo test ./...\n",
+	}
+	o := &Orchestrator{
+		Cfg:    config.Config{Dir: dir, Iter: 3, DryRun: true},
+		Layout: layout,
+		Runner: runner,
+		Log:    log.New(io.Discard, "", 0),
+	}
+	if err := o.Run(context.Background()); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	if runner.plannerCalls != 2 {
+		t.Errorf("plannerCalls = %d, want 2 (one rejected for an empty Files list, one accepted)", runner.plannerCalls)
+	}
+	if runner.workerCalls != 1 || runner.testerCalls != 1 {
+		t.Errorf("workerCalls=%d testerCalls=%d, want 1 and 1 (only after the plan listed a file)", runner.workerCalls, runner.testerCalls)
+	}
+
+	note, err := os.ReadFile(filepath.Join(layout.SpecDir, "001_REVIEW_1.md"))
+	if err != nil {
+		t.Fatalf("expected a contract-violation review for the empty Files list: %v", err)
+	}
+	if !strings.Contains(string(note), "Files") {
+		t.Errorf("expected the rejection note to mention the Files section; got: %s", note)
+	}
+
+	status, err := specs.GetStatus(layout, specFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != specs.StatusDone {
+		t.Fatalf("status = %s, want DONE", status)
+	}
+}
+
 func TestProcessTaskFailsTaskIfPlanNeverBecomesValid(t *testing.T) {
 	dir := t.TempDir()
 	layout := specs.NewLayout(dir)
@@ -875,6 +936,12 @@ func TestProcessTaskFailsTaskIfPlanNeverBecomesValid(t *testing.T) {
 		t.Fatalf("Run failed: %v", err)
 	}
 
+	// Each rejected plan consumes exactly one iteration of the same --ITER
+	// budget (Iter=2 => two planner calls) and the run itself does not fail:
+	// o.Run returned nil above, only the task is marked FAILED.
+	if runner.plannerCalls != 2 {
+		t.Errorf("plannerCalls = %d, want 2 (= --ITER: one rejection per iteration, no extra retries)", runner.plannerCalls)
+	}
 	if runner.workerCalls != 0 || runner.testerCalls != 0 {
 		t.Errorf("workerCalls=%d testerCalls=%d, want 0 and 0 — an invalid plan must never reach worker/tester", runner.workerCalls, runner.testerCalls)
 	}
@@ -1090,6 +1157,71 @@ func TestProcessTaskTruncatesOversizedDiffForTester(t *testing.T) {
 	}
 	if strings.Contains(prompt, sentinel) {
 		t.Errorf("expected the full diff body (with the sentinel) to be dropped once truncated; got:\n%s", prompt)
+	}
+}
+
+// TestProcessTaskOversizedDiffIsRestrictedToAnnotatedPlanFiles is the
+// end-to-end proof that implplan.Files extracts a usable path out of an
+// annotated bullet: with the path only reachable through "- `big.txt` —
+// modify: ...", the restricted diff handed to tester must still contain
+// big.txt's changes.
+func TestProcessTaskOversizedDiffIsRestrictedToAnnotatedPlanFiles(t *testing.T) {
+	requireGit(t)
+	dir := t.TempDir()
+	setTestGitEnv(t)
+	ctx := context.Background()
+
+	if err := gitutil.EnsureRepo(ctx, dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "big.txt"), []byte(strings.Repeat("line\n", 50)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := gitutil.CommitAll(ctx, dir, "seed big.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	layout := specs.NewLayout(dir)
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	writeAgentFixtures(t, layout.AgentsDir)
+	specFile := "001_example.md"
+	if err := os.WriteFile(filepath.Join(layout.SpecDir, specFile), []byte("# Example\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	const sentinel = "UNIQUE_SENTINEL_XYZ"
+	const annotatedPlan = "## Files\n- `big.txt` — modify: rewrite contents\n\n## Test Command\ngo test ./...\n"
+	runner := &scriptedRunner{
+		layout: layout,
+		onPlanner: func(specDir string) error {
+			return os.WriteFile(filepath.Join(specDir, "001_IMPL_PLAN.md"), []byte(annotatedPlan), 0o644)
+		},
+		onWorker: func(dir string) error {
+			return os.WriteFile(filepath.Join(dir, "big.txt"), []byte(sentinel+"\n"+strings.Repeat("changed line\n", 50)), 0o644)
+		},
+		markDoneOnTester: true,
+	}
+	o := &Orchestrator{
+		Cfg:    config.Config{Dir: dir, Iter: 1, MaxDiffBytes: 20}, // tiny threshold: forces truncation
+		Layout: layout,
+		Runner: runner,
+		Log:    log.New(io.Discard, "", 0),
+	}
+	if err := o.Run(ctx); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	if runner.testerCalls != 1 {
+		t.Fatalf("testerCalls = %d, want 1", runner.testerCalls)
+	}
+	prompt := runner.testerPrompts[0]
+	if !strings.Contains(prompt, "exceeded --max-diff-bytes") {
+		t.Errorf("expected tester prompt to note the diff was truncated; got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, sentinel) {
+		t.Errorf("expected the diff restricted to the plan's annotated Files entry to include big.txt's changes; got:\n%s", prompt)
 	}
 }
 

@@ -22,18 +22,25 @@ The plan must:
 
 ```
 ## Files
-- <path to file 1 to create or modify>
-- <path to file 2>
+- <path> — create: <one line: what this new file is for>
+- <path> — modify: <one line: what changes in it>
 ...
 ```
 
-The complete, exact list of paths to every file that must be created or modified to solve the task — worker will work strictly from this list without re-exploring the repository, so the list must be exhaustive.
+Rules for this section:
+- the path comes first on the bullet (backticks around it are optional), then the `create`/`modify` marker, then the one-line purpose;
+- one file per bullet, each bullet on a single line, no sub-bullets and no wrapping;
+- diadoche parses only the path token and ignores everything after it, so the path must be exact and relative to the repository root;
+- the section must list at least one file and must be exhaustive — tests, documentation and agent prompts included;
+- worker works strictly from this list without exploring the repository, so anything you leave out is something worker will not know about.
 
 ```
 ## Test Command
 <command(s) that run this project's tests and linter>
 ```
 
-The concrete command (or commands) worker and tester should use to run this project's tests/linter (check the Makefile/package.json/CI config etc., if present, instead of guessing).
+The concrete command (or commands) worker and tester should use to run this project's tests and linter — this is the plan's commands section. Read the Makefile / package.json / CI config, if present, instead of guessing.
+
+A plan missing either section, or with a `## Files` section that lists no files, makes the iteration fail and planner is asked to write the plan again.
 
 Do not modify any files other than the plan file.
