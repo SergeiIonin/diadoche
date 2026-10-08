@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"diadoche/internal/agents"
 )
@@ -440,6 +441,37 @@ func TestParseHelpMentionsBudgetsAndPauses(t *testing.T) {
 		_, _ = Parse([]string{"--help"})
 	})
 	for _, want := range []string{"--max-cost-per-task", "--max-cost-per-run", "USAGE LIMITS", "PAUSED"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("help output missing %q", want)
+		}
+	}
+}
+
+func TestParseFreshAndShutdownTimeout(t *testing.T) {
+	cfg, err := Parse(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Fresh || cfg.ShutdownTimeout != 2*time.Minute {
+		t.Errorf("defaults: Fresh=%v ShutdownTimeout=%s, want false/2m", cfg.Fresh, cfg.ShutdownTimeout)
+	}
+	cfg, err = Parse([]string{"--fresh", "--shutdown-timeout", "5s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Fresh || cfg.ShutdownTimeout != 5*time.Second {
+		t.Errorf("Fresh=%v ShutdownTimeout=%s, want true/5s", cfg.Fresh, cfg.ShutdownTimeout)
+	}
+	if _, err := Parse([]string{"--shutdown-timeout", "-1s"}); err == nil || !strings.Contains(err.Error(), "--shutdown-timeout") {
+		t.Errorf("negative --shutdown-timeout: err = %v, want a --shutdown-timeout error", err)
+	}
+}
+
+func TestParseHelpMentionsRestartState(t *testing.T) {
+	out := captureStdout(t, func() {
+		_, _ = Parse([]string{"--help"})
+	})
+	for _, want := range []string{"--fresh", "--shutdown-timeout", "run-state.json", "SIGNALS AND RESTART STATE"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("help output missing %q", want)
 		}

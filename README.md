@@ -103,6 +103,12 @@ Flags:
 - `--test-globs` — comma-separated test-file globs for non-Go projects,
   e.g. `'test_*.py,*.spec.ts'` (default: inferred from the plan's
   `## Test Command`; `*_test.go` always counts).
+- `--fresh` — ignore the saved `.claude/diadoche/run-state.json` and start
+  from the head of the queue; the file is rewritten from scratch. See
+  "Restart state and graceful shutdown" below.
+- `--shutdown-timeout` — on SIGINT/SIGTERM, wait this long for the running
+  agent call to finish before killing it (default `2m`); a second signal
+  exits immediately.
 - `-h` / `-help` / `--help` — print the full man-page-style help and exit.
 
 ## Preprocessor (`--preprocess`)
@@ -255,9 +261,75 @@ budgets are excluded, since waiting doesn't lift them. Then:
    a successful call the task is `IN_PROGRESS` again and the backoff starts
    over at 5 minutes.
 
-SIGINT/SIGTERM interrupts the pause at once (diadoche exits with status
+SIGINT/SIGTERM interrupts the pause at once, already on the first signal
+and without waiting for `--shutdown-timeout` (diadoche exits with status
 130): the task stays `PAUSED`, and the next run re-queues it like an
 `IN_PROGRESS` one and resumes it with its changes in place.
+
+## Restart state and graceful shutdown
+
+After every step diadoche writes `.claude/diadoche/run-state.json`
+(through a temp file in the same directory + rename, so the file is never
+half-written):
+
+```json
+{
+  "run_id": "20261008T120000Z-1a2b3c4d",
+  "task": {
+    "spec": "009_x.md",
+    "num": "009",
+    "iteration": 2,
+    "agent": "worker",
+    "agent_state": "done",
+    "base_commit": "<sha>",
+    "worktree": ".claude/diadoche/worktrees/009-x"
+  },
+  "updated_at": "2026-10-08T12:34:56Z"
+}
+```
+
+`agent_state` is `pending`, `running` or `done`; `worktree` is only there
+when the task runs in its own worktree. When a task is DONE, FAILED or
+BLOCKED, and at the end of the run, `task` is `null`: the file stays, so the
+next run sees that there is nothing to continue. The file is kept out of
+git (`.git/info/exclude`), and nothing is read or written in `--dry-run`.
+
+On start, an unfinished task in the file is moved to the head of the queue
+and continued in the same iteration, with the same base commit and
+worktree. A `done` agent is not called again: after worker comes tester,
+and after tester the next iteration. A `running` or `pending` agent is
+repeated, because it was cut off. So a run stopped between worker and
+tester continues with tester; planner and worker are not called again.
+
+The state adds to `STATUS.md`/`QUEUE.md`, it does not replace them. It is
+ignored, with a `warning: ignoring run-state.json: <reason>` log line, when
+the task is no longer pending in `STATUS.md` (e.g. DONE), is not in the
+queue, or the record is malformed. It is also ignored when it is behind the
+reviews on disk. In all these cases the `spec/` files (plan, reviews,
+`NNN_BASE`) decide where to resume, as they do when there is no file.
+`--fresh` ignores the saved state and starts from the head of the queue.
+
+Signals:
+
+- the first SIGINT/SIGTERM lets the agent call in flight finish (up to
+  `--shutdown-timeout`, default 2 minutes), then diadoche saves the state
+  and exits with status 130. The task stays pending and is never FAILED
+  because of a signal;
+- when the timeout runs out, the call is killed. `claude` runs in its own
+  process group, which is killed as a whole, together with its tool
+  subprocesses. The state still has that agent as `running`, so the next
+  run repeats it;
+- a second signal kills the call and exits at once.
+
+Since `claude` has its own process group, a terminal Ctrl-C reaches only
+diadoche, not the call it wants to let finish.
+
+**diadoche-restarter.** The restarter stops diadoche by sending SIGTERM
+to its whole process group every 200 ms (SIGKILL after 10 s). The repeat
+counts as diadoche's second signal, so the stop stays immediate and the
+restarter never waits for `--shutdown-timeout`. diadoche records the agent
+as `running` before every call, so even after a SIGKILL `run-state.json`
+lets the next run repeat the same agent.
 
 ## Diff-scoped tester
 

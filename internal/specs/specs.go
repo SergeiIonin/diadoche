@@ -194,7 +194,7 @@ func WriteStatus(path string, rows []Row) error {
 		}
 		fmt.Fprintf(&b, "| %s | %s | %s |\n", r.Num, r.Spec, status)
 	}
-	return writeFileAtomic(path, []byte(b.String()))
+	return WriteFileAtomic(path, []byte(b.String()))
 }
 
 // ReadQueue returns the items of QUEUE.md, one spec filename per line.
@@ -230,14 +230,16 @@ func WriteQueue(path string, items []string) error {
 	for _, it := range items {
 		fmt.Fprintf(&b, "- %s\n", it)
 	}
-	return writeFileAtomic(path, []byte(b.String()))
+	return WriteFileAtomic(path, []byte(b.String()))
 }
 
-// writeFileAtomic replaces path with data via a temp file + rename, so a
+// WriteFileAtomic replaces path with data via a temp file + rename, so a
 // diadoche process killed mid-write (e.g. by diadoche-restarter on a usage
 // limit) never leaves STATUS.md/QUEUE.md truncated — an empty STATUS.md
-// would silently forget which tasks are already DONE.
-func writeFileAtomic(path string, data []byte) error {
+// would silently forget which tasks are already DONE. The temp file lives
+// in path's own directory, so the rename never crosses a filesystem. Also
+// used for .claude/diadoche/run-state.json (see package runstate).
+func WriteFileAtomic(path string, data []byte) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp*")
 	if err != nil {
 		return err

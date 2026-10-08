@@ -17,6 +17,8 @@ func TestExitCode(t *testing.T) {
 	}{
 		{"success", nil, 0},
 		{"interrupted", fmt.Errorf("interrupted while paused: %w", context.Canceled), exitInterrupted},
+		{"signal stop", orchestrator.ErrInterrupted, exitInterrupted},
+		{"signal stop, wrapped", fmt.Errorf("x: %w", orchestrator.ErrInterrupted), exitInterrupted},
 		{"run budget", fmt.Errorf("budget exceeded: %w", orchestrator.ErrRunBudgetExceeded), 1},
 		{"other", errors.New("boom"), 1},
 	}

@@ -53,8 +53,9 @@ func (e *budgetError) Unwrap() error {
 	return ErrRunBudgetExceeded
 }
 
-// pauseInterruptedError is a limit pause cut short by the run's context
-// (SIGINT/SIGTERM). Its message is diadoche's own wording only — never the
+// pauseInterruptedError is a limit pause cut short by a signal: the first
+// one (a graceful stop, see Orchestrator.StopRequested) ends a pause at
+// once, as does the run's context being cancelled. Its message is diadoche's own wording only — never the
 // claude error text — so diadoche-restarter doesn't take it for a limit.
 type pauseInterruptedError struct{ err error }
 
@@ -149,7 +150,10 @@ func (o *Orchestrator) runAgentPausing(ctx context.Context, c agentCall, a *agen
 			o.Log.Printf("%s could not record %s status: %v", prefix, specs.StatusPaused, err)
 		}
 		o.Log.Printf("%s paused: claude %s (%s), retrying the same call in %s", prefix, hit.Kind, until, wait)
-		if err := o.sleep(ctx, wait); err != nil {
+		sctx, cancel := o.gracefulCtx(ctx)
+		err = o.sleep(sctx, wait)
+		cancel()
+		if err != nil {
 			return result, &pauseInterruptedError{err}
 		}
 		paused = true

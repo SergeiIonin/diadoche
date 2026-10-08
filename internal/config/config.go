@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"diadoche/internal/agents"
 	"diadoche/internal/redgreen"
@@ -25,6 +26,10 @@ const (
 	// fits the limit) and an instruction to open the files it needs
 	// itself. 200 KB, as required by 004_tester_gets_diff.md.
 	DefaultMaxDiffBytes = 204_800
+
+	// DefaultShutdownTimeout is how long the first SIGINT/SIGTERM waits for
+	// the agent call in flight before killing it (--shutdown-timeout).
+	DefaultShutdownTimeout = 2 * time.Minute
 )
 
 // ErrHelp is returned by Parse when the user asked for help (-h, -help or
@@ -48,6 +53,7 @@ const helpSynopsis = `SYNOPSIS
              [--max-cost-per-run <usd>] [--allow-dirty]
              [--stable-system-prompt=<bool>] [--worktree=<bool>]
              [--red-green=<bool>] [--test-globs <list>]
+             [--fresh] [--shutdown-timeout <duration>]
     diadoche --preprocess --task <path> [--dir <path>] [--claude-bin <path>]
              [--preprocessor-model <name>]
     diadoche --initialize <project-path>
@@ -83,7 +89,11 @@ const helpDescription = `DESCRIPTION
     reviews) lives in spec/ itself, so a restarted run resumes the
     lowest-numbered pending task exactly where it left off, reusing any
     implementation plan and reviews already on disk instead of redoing
-    completed work.
+    completed work. .claude/diadoche/run-state.json additionally records
+    the position down to the agent (see SIGNALS AND RESTART STATE), so a
+    run stopped between worker and tester continues with tester; the
+    spec/ files are the fallback when that file is missing or contradicts
+    STATUS.md/QUEUE.md.
 
     spec/NNN_IMPL_PLAN.md must contain two sections, with these exact
     headings: "## Files" (every path to create or modify) and
@@ -290,13 +300,47 @@ const helpUsageLimits = `USAGE LIMITS
     each further time-less pause up to 1 hour. Then the same call of the
     same agent in the same iteration is retried; after a successful call
     the task is IN_PROGRESS again and the backoff starts over at 5 minutes.
-    SIGINT/SIGTERM interrupts the wait at once: the task stays PAUSED and
-    is resumed (like IN_PROGRESS) by the next run.
+    SIGINT/SIGTERM interrupts the wait at once (already the first signal,
+    no --shutdown-timeout wait): the task stays PAUSED and is resumed (like
+    IN_PROGRESS) by the next run.
 
     diadoche-restarter works alongside: diadoche's own pause log lines are
     never claude limit messages and the claude error text of a refused call
     is not printed, so the restarter does not kill a pausing diadoche; it
     remains a fallback for crashes and limit errors that escape the pause.
+
+`
+
+const helpShutdown = `SIGNALS AND RESTART STATE
+    After every step diadoche writes .claude/diadoche/run-state.json (temp
+    file + rename, so it is never half-written): the run id, the current
+    task (spec file and number), the iteration, the agent and its state
+    (pending, running or done), the task's base commit, its worktree (with
+    --worktree) and the time of the update. A finished task leaves "task":
+    null; the file stays after the run, so the next one sees there is
+    nothing to continue.
+
+    On start, an unfinished task in the file is moved to the head of the
+    queue and continued with the first agent of that iteration that had not
+    finished - a done agent is not called again, a running one (cut off) is
+    repeated - with the same base commit and worktree. The state is ignored,
+    with a "warning: ignoring run-state.json: <reason>" log line, when it
+    contradicts STATUS.md or QUEUE.md (the task is DONE or FAILED by now,
+    or not queued at all), or is behind the reviews on disk; the spec/ files
+    then decide where to resume, as without the file. --fresh ignores the
+    saved state and rewrites the file from scratch (the spec/ files still
+    count). Nothing is read or written in --dry-run.
+
+    The first SIGINT/SIGTERM lets the agent call in flight finish, waiting
+    up to --shutdown-timeout (default 2m); then diadoche saves the state
+    and exits with code 130. The task stays pending and is never FAILED
+    for it. When the timeout runs out the call is killed (claude runs in
+    its own process group, which is killed as a whole), the state still
+    records that agent as running, and the next run repeats it. A second
+    signal exits at once. diadoche-restarter repeats its SIGTERM every
+    200 ms, so it stops diadoche at once, and the saved state lets the next
+    run repeat the agent that was cut off. --preprocess stops on the first
+    signal.
 
 `
 
@@ -353,6 +397,13 @@ FILES
     <project>/.claude/diadoche/usage.jsonl
         One JSON line per agent call: time, task, agent, iteration, model,
         token counts, cost (USD), duration.
+
+    <project>/.claude/diadoche/run-state.json
+        Where the run is (see SIGNALS AND RESTART STATE): run_id, task
+        (spec, num, iteration, agent, agent_state pending|running|done,
+        base_commit, worktree), updated_at. "task": null when no task is in
+        progress. Kept out of git via .git/info/exclude. Not written in
+        --dry-run.
 
 `
 
@@ -465,6 +516,15 @@ type Config struct {
 	// projects; *_test.go always counts. Empty means: inferred from the
 	// plan's "## Test Command".
 	TestGlobs []string
+
+	// Fresh ignores the saved .claude/diadoche/run-state.json and starts
+	// from the head of the queue; the file is rewritten from scratch.
+	Fresh bool
+
+	// ShutdownTimeout is how long the first SIGINT/SIGTERM waits for the
+	// agent call in flight to finish before killing it; a second signal
+	// doesn't wait. 0 kills it at once. See DefaultShutdownTimeout.
+	ShutdownTimeout time.Duration
 }
 
 // TaskPath resolves --task relative to --dir, unless it's already absolute.
@@ -504,6 +564,8 @@ func Parse(args []string) (*Config, error) {
 	testGlobs := fs.String("test-globs", "", "comma-separated test-file globs for non-Go projects, e.g. 'test_*.py,*.spec.ts'; default: inferred from the plan's ## Test Command; *_test.go always counts")
 	maxCallCost := fs.Float64("max-call-cost", 0, "fail the task if a single agent call's cost in USD exceeds this — checked after the call returns, so it cannot preempt the spend (0 = no limit)")
 	maxCostPerTask := fs.Float64("max-cost-per-task", 0, "fail the task once the total recorded cost of the task in usage.jsonl, previous runs included, exceeds this many USD; checked after each agent call (0 = no limit)")
+	fresh := fs.Bool("fresh", false, "ignore the saved .claude/diadoche/run-state.json and start from the head of the queue (the file is rewritten from scratch)")
+	shutdownTimeout := fs.Duration("shutdown-timeout", DefaultShutdownTimeout, "on SIGINT/SIGTERM, wait this long for the running agent call to finish before killing it; a second signal exits immediately")
 	maxCostPerRun := fs.Float64("max-cost-per-run", 0, "stop the run after the current agent call once this run's recorded cost exceeds this many USD; the current task stays pending and diadoche exits non-zero (0 = no limit)")
 
 	if err := fs.Parse(args); err != nil {
@@ -560,6 +622,9 @@ func Parse(args []string) (*Config, error) {
 	if *maxCostPerRun < 0 {
 		return nil, fmt.Errorf("--max-cost-per-run must be >= 0, got %g", *maxCostPerRun)
 	}
+	if *shutdownTimeout < 0 {
+		return nil, fmt.Errorf("--shutdown-timeout must be >= 0, got %s", *shutdownTimeout)
+	}
 
 	globs := splitCSV(*testGlobs)
 	if err := redgreen.ValidateGlobs(globs); err != nil {
@@ -606,6 +671,8 @@ func Parse(args []string) (*Config, error) {
 		StableSystemPrompt: *stableSystemPrompt,
 		RedGreen:           *redGreen,
 		TestGlobs:          globs,
+		Fresh:              *fresh,
+		ShutdownTimeout:    *shutdownTimeout,
 	}, nil
 }
 
@@ -647,6 +714,7 @@ func printHelp(fs *flag.FlagSet, w io.Writer) {
 	fmt.Fprint(w, helpModels)
 	fmt.Fprint(w, helpCallBudget)
 	fmt.Fprint(w, helpUsageLimits)
+	fmt.Fprint(w, helpShutdown)
 	fmt.Fprint(w, helpFlagsHeader)
 	fs.SetOutput(w)
 	fs.PrintDefaults()

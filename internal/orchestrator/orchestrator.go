@@ -14,9 +14,20 @@
 // (PAUSED in STATUS.md) and is retried once the limit lifts, without
 // spending an iteration; --max-cost-per-task and --max-cost-per-run are
 // checked after every agent call (see pause.go).
+//
+// After every step the run's position — task, iteration, agent and whether
+// that agent is pending, running or done, plus the task's base commit and
+// worktree — is saved to .claude/diadoche/run-state.json (see runstate.go).
+// A restarted run continues with the first unfinished agent of that
+// iteration instead of starting it over; the spec/ files (plan, reviews,
+// NNN_BASE) remain the fallback when the file is missing or contradicts
+// STATUS.md/QUEUE.md. A signal (Orchestrator.StopRequested) lets the agent
+// call in flight finish, then Run saves the state and returns
+// ErrInterrupted; the task stays pending and is never failed for it.
 package orchestrator
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -30,6 +41,7 @@ import (
 	"diadoche/internal/config"
 	"diadoche/internal/gitutil"
 	"diadoche/internal/implplan"
+	"diadoche/internal/runstate"
 	"diadoche/internal/skills"
 	"diadoche/internal/speclock"
 	"diadoche/internal/specs"
@@ -74,6 +86,23 @@ type Orchestrator struct {
 	// priorCosts is the spend usage.jsonl held when the run started, for
 	// --max-cost-per-task.
 	priorCosts usage.Costs
+
+	// StopRequested, once closed, asks the run to stop at the next point
+	// between agent calls (the first SIGINT/SIGTERM, see package shutdown).
+	// The agent call in flight runs on until Run's ctx is cancelled. nil
+	// means never.
+	StopRequested <-chan struct{}
+
+	// runID, statePath and stateOn are this run's run-state.json; stateOn
+	// is false in --dry-run, where nothing is saved.
+	runID     string
+	statePath string
+	stateOn   bool
+
+	// resume is the saved task record a restarted run continues with,
+	// until processTask takes it; cur is the current task's record.
+	resume *runstate.Task
+	cur    *runstate.Task
 }
 
 func New(cfg config.Config) *Orchestrator {
@@ -175,14 +204,29 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		uw = w
 	}
 
+	stateInitialized := false
 	for {
 		if err := o.syncQueueLocked(); err != nil {
 			return fmt.Errorf("sync spec queue: %w", err)
+		}
+		if !stateInitialized {
+			stateInitialized = true
+			queue, err := specs.ReadQueue(o.Layout.QueuePath)
+			if err != nil {
+				return fmt.Errorf("read queue: %w", err)
+			}
+			o.initRunState(ctx, queue)
 		}
 
 		processedAny := false
 		consecutiveFailures := 0
 		for {
+			if o.stopRequested() {
+				o.saveState()
+				o.Log.Printf("stop requested: exiting before the next task")
+				o.printUsageSummary(uw)
+				return ErrInterrupted
+			}
 			next, err := specs.PopQueue(o.Layout)
 			if err != nil {
 				return fmt.Errorf("pop queue: %w", err)
@@ -195,6 +239,7 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			// STATUS.md, so the next run's sync puts it back in the queue.
 			if err := o.runBudgetExceeded(uw); err != nil {
 				o.Log.Printf("run stopped before task %s: %v", next, err)
+				o.saveState()
 				o.printUsageSummary(uw)
 				return err
 			}
@@ -219,6 +264,9 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		if !processedAny {
 			// Nothing left to do and nothing new showed up in this round's
 			// sync: no leftover work, no new task specs. We're done.
+			// run-state.json stays, with no task: nothing to continue.
+			o.cur = nil
+			o.saveState()
 			o.printUsageSummary(uw)
 			return nil
 		}
@@ -249,9 +297,13 @@ func (o *Orchestrator) syncQueueLocked() error {
 func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner, worker, tester *agents.Agent, uw *usage.Writer) error {
 	o.Log.Printf("=== task %s ===", specFile)
 	num := specs.TaskNumber(specFile)
+	resume := o.takeResume(specFile)
 
 	var ws *workspace
 	if !o.Cfg.DryRun {
+		if resume != nil {
+			o.seedBaseFromResume(num, resume)
+		}
 		var err error
 		if o.Cfg.Worktree {
 			ws, err = o.prepareWorktree(ctx, specFile, num)
@@ -261,20 +313,37 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 		if err != nil {
 			return &fatalError{err}
 		}
+		if resume != nil {
+			o.checkResumedWorkspace(specFile, ws, resume)
+		}
 	}
 
 	if err := specs.SetStatus(o.Layout, specFile, specs.StatusInProgress); err != nil {
 		return err
 	}
 
-	done, cause := o.runIterations(ctx, specFile, num, ws, planner, worker, tester, uw)
-	if errors.Is(cause, ErrRunBudgetExceeded) {
-		o.Log.Printf("task %s: run budget exhausted; leaving it pending with its changes in place", specFile)
-		return &fatalError{cause}
-	}
+	done, cause := o.runIterations(ctx, specFile, num, ws, resume, planner, worker, tester, uw)
+
+	// The resumable outcomes below keep the task's run-state.json record
+	// (the next run continues from it); every other one closes it.
 	var interrupted *pauseInterruptedError
 	if errors.As(cause, &interrupted) {
+		o.saveState()
 		o.Log.Printf("task %s: interrupted while paused; it stays PAUSED and is resumed by the next run", specFile)
+		return &fatalError{cause}
+	}
+	if !done && (errors.Is(cause, ErrInterrupted) || ctx.Err() != nil) {
+		// A signal is never a reason to fail a task: nothing is parked.
+		o.saveState()
+		o.Log.Printf("task %s: interrupted by signal; it stays IN_PROGRESS and the next run resumes it %s", specFile, o.resumePoint())
+		if cause == nil || errors.Is(cause, ErrInterrupted) {
+			return &fatalError{cmp.Or(cause, ErrInterrupted)}
+		}
+		return &fatalError{fmt.Errorf("%w (%v)", ErrInterrupted, cause)}
+	}
+	if errors.Is(cause, ErrRunBudgetExceeded) {
+		o.saveState()
+		o.Log.Printf("task %s: run budget exhausted; leaving it pending with its changes in place", specFile)
 		return &fatalError{cause}
 	}
 	if cause != nil && usagelimit.Mentions(cause.Error()) {
@@ -282,9 +351,11 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 		// parked and the task stays IN_PROGRESS, so the next run (e.g. by
 		// diadoche-restarter once the window reopens) resumes it with its
 		// changes still in the working tree (or its worktree).
+		o.saveState()
 		o.Log.Printf("task %s: interrupted by a claude usage limit; leaving it IN_PROGRESS with its changes in place", specFile)
 		return &fatalError{cause}
 	}
+	defer o.closeTaskState()
 	if done {
 		o.Log.Printf("task %s: DONE", specFile)
 		if ws != nil && ws.worktree {
@@ -310,7 +381,12 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 // done reports whether tester marked the task DONE; a non-nil err is why
 // the task was cut short (an agent error, --max-call-cost, ...). Both
 // false and nil means the iteration budget ran out.
-func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, ws *workspace, planner, worker, tester *agents.Agent, uw *usage.Writer) (done bool, err error) {
+//
+// resume, when non-nil, is the task's saved run-state.json record: the
+// loop then starts at the first agent of its iteration that hadn't
+// finished (see runstate.Task.Next), unless the reviews on disk are
+// already past it.
+func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, ws *workspace, resume *runstate.Task, planner, worker, tester *agents.Agent, uw *usage.Writer) (done bool, err error) {
 	specPath := filepath.Join(o.Layout.SpecDir, specFile)
 	specContent, err := os.ReadFile(specPath)
 	if err != nil {
@@ -324,12 +400,27 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 	// exists on disk (planner/worker/tester already ran for them before the
 	// process died) instead of always restarting this task from iteration 1
 	// and burning through the --ITER budget again on work already done.
-	startIter := lastCompletedIteration(o.Layout.SpecDir, num, o.Cfg.Iter) + 1
-	if startIter > 1 {
+	completed := lastCompletedIteration(o.Layout.SpecDir, num, o.Cfg.Iter)
+	startIter, startAgent := completed+1, ""
+	if resume != nil {
+		// The state may lawfully be ahead of the reviews (an empty-diff
+		// iteration writes none), but never behind them.
+		if rIter, rAgent := resume.Next(); rIter >= completed {
+			startIter, startAgent = rIter, rAgent
+			o.Log.Printf("%s: resuming from %s at iteration %d, agent %s", specFile, runstate.FileName, startIter, agentLabel(startAgent))
+		} else {
+			o.Log.Printf("warning: %s: %s is behind the reviews on disk; resuming from spec/ files", specFile, runstate.FileName)
+		}
+	}
+	if startAgent == "" && startIter > 1 {
 		o.Log.Printf("%s: resuming at iteration %d/%d (found review(s) from a previous run)", specFile, startIter, o.Cfg.Iter)
 	}
+	o.beginTaskState(specFile, num, ws, startIter, cmp.Or(startAgent, runstate.Agents[0]))
 
 	for iter := startIter; iter <= o.Cfg.Iter; iter++ {
+		if o.stopRequested() {
+			return false, ErrInterrupted
+		}
 		o.Log.Printf("--- %s iteration %d/%d ---", specFile, iter, o.Cfg.Iter)
 		call := agentCall{specFile: specFile, iter: iter, workDir: o.Cfg.Dir, uw: uw, tally: &iterationTally{}}
 		if ws != nil {
@@ -354,15 +445,42 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 		// the required Files/Test Command sections (e.g. left over from
 		// before this validation existed) is never reused — planner runs
 		// again so the contract is enforced even across a restart.
-		reusingPlan := false
+		//
+		// Resumed from run-state.json, the plan is reused when planner had
+		// finished (worker or tester is next), and worker is skipped too
+		// when tester is next; a planner cut off mid-call runs again, as
+		// its plan file may be a partial write.
+		reusingPlan, skipWorker := false, false
 		if iter == startIter {
+			planOK := false
 			if b, err := os.ReadFile(implPlanPath); err == nil {
-				if plan := strings.TrimSpace(string(b)); plan != "" && implplan.HasRequiredSections(plan) {
+				plan := strings.TrimSpace(string(b))
+				planOK = plan != "" && implplan.HasRequiredSections(plan)
+			}
+			switch startAgent {
+			case "planner":
+			case "worker", "tester":
+				if planOK {
+					reusingPlan, skipWorker = true, startAgent == "tester"
+					o.Log.Printf("%s: reusing existing %s from before the restart", specFile, implPlanFile)
+				} else {
+					o.Log.Printf("warning: %s: %s says %s is next, but %s is missing the required sections; starting the iteration with planner", specFile, runstate.FileName, startAgent, implPlanFile)
+				}
+			default:
+				if planOK {
 					reusingPlan = true
 					o.Log.Printf("%s: reusing existing %s from before the restart", specFile, implPlanFile)
 				}
 			}
 		}
+		first := "planner"
+		switch {
+		case skipWorker:
+			first = "tester"
+		case reusingPlan:
+			first = "worker"
+		}
+		o.setAgentState(iter, first, runstate.AgentPending)
 
 		if !reusingPlan {
 			plannerPrompt := fmt.Sprintf("Task spec (%s):\n%s\n", specFile, specContent)
@@ -371,7 +489,7 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 			}
 			plannerPrompt += fmt.Sprintf("\nWrite (or update) the implementation plan to %s.", implPlanPath)
 
-			result, err := o.runAgentPausing(ctx, call, planner, plannerPrompt)
+			result, err := o.runStep(ctx, call, planner, plannerPrompt)
 			if err := o.checkBudgets(specFile, uw); err != nil {
 				return false, err
 			}
@@ -403,6 +521,9 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 				o.Log.Printf("%s iteration %d: %s is missing or empty in the required Files/Test Command sections (Files must list at least one file); retrying planner next iteration", specFile, iter, implPlanFile)
 				continue
 			}
+			if o.stopRequested() {
+				return false, ErrInterrupted
+			}
 		}
 
 		implPlanBytes, err := os.ReadFile(implPlanPath)
@@ -411,21 +532,26 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 		}
 		plan := string(implPlanBytes)
 
-		workerPrompt := fmt.Sprintf("Task spec (%s):\n%s\n\nImplementation plan (%s):\n%s\n", specFile, specContent, implPlanFile, plan)
-		if priorReview != "" {
-			workerPrompt += fmt.Sprintf("\nFeedback from the previous review, address every point:\n%s\n", priorReview)
-		}
-		workerPrompt += "\nImplement the plan in this repository."
+		if !skipWorker {
+			workerPrompt := fmt.Sprintf("Task spec (%s):\n%s\n\nImplementation plan (%s):\n%s\n", specFile, specContent, implPlanFile, plan)
+			if priorReview != "" {
+				workerPrompt += fmt.Sprintf("\nFeedback from the previous review, address every point:\n%s\n", priorReview)
+			}
+			workerPrompt += "\nImplement the plan in this repository."
 
-		workerResult, err := o.runAgentPausing(ctx, call, worker, workerPrompt)
-		if err := o.checkBudgets(specFile, uw); err != nil {
-			return false, err
-		}
-		if err != nil {
-			return false, fmt.Errorf("worker: %w", err)
-		}
-		if err := o.checkCallCost("worker", workerResult); err != nil {
-			return false, err
+			workerResult, err := o.runStep(ctx, call, worker, workerPrompt)
+			if err := o.checkBudgets(specFile, uw); err != nil {
+				return false, err
+			}
+			if err != nil {
+				return false, fmt.Errorf("worker: %w", err)
+			}
+			if err := o.checkCallCost("worker", workerResult); err != nil {
+				return false, err
+			}
+			if o.stopRequested() {
+				return false, ErrInterrupted
+			}
 		}
 
 		testCommand := implplan.TestCommand(plan)
@@ -477,7 +603,7 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 				"update the row for %q in %s to status DONE.",
 			specFile, specContent, implPlanFile, plan, testCommand, diffNote, diffForTester, guidance, reviewPath, specFile, o.Layout.StatusPath)
 
-		testerResult, err := o.runAgentPausing(ctx, call, tester, testerPrompt)
+		testerResult, err := o.runStep(ctx, call, tester, testerPrompt)
 		if err != nil {
 			return false, fmt.Errorf("tester: %w", err)
 		}
@@ -499,9 +625,31 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 		if err := o.checkCallCost("tester", testerResult); err != nil {
 			return false, err
 		}
+		// A stop requested meanwhile is honoured at the top of the next
+		// iteration; after the last one the budget is spent anyway.
 	}
 
 	return false, nil
+}
+
+// runStep is runAgentPausing that records the agent in run-state.json:
+// running before the call, done once it succeeded. A failed call stays
+// running, so a resumed run repeats it. A call killed because Run's ctx
+// was cancelled (--shutdown-timeout, a second signal) is ErrInterrupted;
+// its error deliberately leaves out claude's output, so nothing in it
+// looks like a limit line to diadoche-restarter.
+func (o *Orchestrator) runStep(ctx context.Context, c agentCall, a *agents.Agent, prompt string) (agents.RunResult, error) {
+	o.setAgentState(c.iter, a.Name, runstate.AgentRunning)
+	result, err := o.runAgentPausing(ctx, c, a, prompt)
+	if err != nil {
+		var paused *pauseInterruptedError
+		if ctx.Err() != nil && !errors.As(err, &paused) {
+			return result, fmt.Errorf("%s call stopped: %w", a.Name, ErrInterrupted)
+		}
+		return result, err
+	}
+	o.setAgentState(c.iter, a.Name, runstate.AgentDone)
+	return result, nil
 }
 
 // agentCall is where in the loop one agent turn happens: which task and

@@ -377,3 +377,38 @@ func TestSyncRequeuesPaused(t *testing.T) {
 		t.Errorf("PAUSED row not round-tripped: %+v", persisted[2])
 	}
 }
+
+func TestWriteFileAtomicReplacesViaRename(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	if err := os.WriteFile(path, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer old.Close()
+	oldInfo, err := old.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := WriteFileAtomic(path, []byte("new")); err != nil {
+		t.Fatal(err)
+	}
+
+	newInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(oldInfo, newInfo) {
+		t.Error("WriteFileAtomic rewrote the file in place; want a new file renamed over it")
+	}
+	if b, _ := os.ReadFile(path); string(b) != "new" {
+		t.Errorf("contents = %q, want %q", b, "new")
+	}
+	if leftovers, _ := filepath.Glob(filepath.Join(dir, ".state.json.tmp*")); len(leftovers) != 0 {
+		t.Errorf("temp files left behind: %v", leftovers)
+	}
+}

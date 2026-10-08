@@ -175,6 +175,12 @@ func (r *Restarter) runOnce(ctx context.Context) (hitLine string, err error) {
 // stop terminates diadoche's whole process group (diadoche plus any claude
 // it has in flight): SIGTERM, repeated so a child forked while the first
 // one was in flight is caught too, then SIGKILL after killGrace.
+//
+// The repeat also matters to diadoche itself: its first signal only asks
+// it to stop after the agent call in flight (up to --shutdown-timeout),
+// and a second one means "exit now". So the repeated SIGTERM keeps this
+// stop immediate, and run-state.json still lets the next run repeat the
+// agent that was cut off.
 func (r *Restarter) stop(cmd *exec.Cmd, done <-chan error) error {
 	deadline := time.After(killGrace)
 	tick := time.NewTicker(200 * time.Millisecond)

@@ -94,6 +94,10 @@ type Runner interface {
 // TotalCostUSD) possible, and carries the agent's text answer in the result
 // object's "result" field (RunResult.Output); the raw stdout/stderr is still
 // captured as-is for error messages and as a fallback output.
+//
+// On Unix claude runs in its own process group, so a terminal Ctrl-C
+// reaches only diadoche, which lets the call finish (see --shutdown-timeout);
+// cancelling ctx kills claude's whole group with SIGKILL.
 type CLIRunner struct {
 	Bin string // defaults to "claude"
 
@@ -113,6 +117,10 @@ type CLIRunner struct {
 	// window) stops it. Zero/negative means no limit.
 	MaxCallDuration time.Duration
 }
+
+// callWaitDelay bounds how long Run waits for a killed call's output pipes
+// to close (exec.Cmd.WaitDelay).
+const callWaitDelay = 5 * time.Second
 
 func (r CLIRunner) Run(ctx context.Context, workDir string, a *Agent, prompt string) (RunResult, error) {
 	bin := r.Bin
@@ -143,6 +151,10 @@ func (r CLIRunner) Run(ctx context.Context, workDir string, a *Agent, prompt str
 
 	cmd := exec.CommandContext(callCtx, bin, args...)
 	cmd.Dir = workDir
+	configureProcessGroup(cmd)
+	// A grandchild that outlives a killed claude may still hold its
+	// stdout/stderr pipes open; don't let that block Wait.
+	cmd.WaitDelay = callWaitDelay
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
