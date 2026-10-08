@@ -141,6 +141,36 @@ func TestEmbeddedTesterPromptIsDiffScoped(t *testing.T) {
 	}
 }
 
+// TestEmbeddedPlannerPromptAsksForRelevantADRs pins the ADR half of the
+// plan: planner reads the index and always writes the section, "none"
+// included, next to the two required sections.
+func TestEmbeddedPlannerPromptAsksForRelevantADRs(t *testing.T) {
+	planner, err := LoadOrDefault(t.TempDir(), "planner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"docs/adr/README.md", "## Relevant ADRs", "`none`", "Accepted", "## Files", "## Test Command"} {
+		if !strings.Contains(planner.SystemPrompt, want) {
+			t.Errorf("embedded planner prompt is missing %q", want)
+		}
+	}
+}
+
+// TestEmbeddedTesterPromptBlocksOnUnrecordedADRContradiction pins the
+// tester's blocking rule for a diff contradicting an Accepted ADR without
+// a matching entry in worker's ## Decisions.
+func TestEmbeddedTesterPromptBlocksOnUnrecordedADRContradiction(t *testing.T) {
+	tester, err := LoadOrDefault(t.TempDir(), "tester")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"## Relevant ADRs", "`Accepted`", "## Decisions", "**blocking**", "do not mark the task `DONE`", "not blocking"} {
+		if !strings.Contains(tester.SystemPrompt, want) {
+			t.Errorf("embedded tester prompt is missing %q", want)
+		}
+	}
+}
+
 // TestEmbeddedPlannerAndWorkerPromptsCarryPlanContract pins the
 // IMPL_PLAN.md contract into the built-in prompts: planner must describe
 // both required sections and the per-file create/modify marker, and worker

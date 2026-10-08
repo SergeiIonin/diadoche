@@ -52,8 +52,8 @@ Flags:
   told about every skill that's present.
 - `--dry-run` — walk the queue read-only: for every pending task, in queue
   order, print the prompts planner, worker and tester would get in
-  iteration 1 (the plan and the diff, which don't exist in a dry run, are
-  shown as labelled `[dry-run placeholder]`s). `claude` is not invoked,
+  iteration 1 (the plan, the diff and tester's relevant-ADRs block, which
+  don't exist in a dry run, are shown as labelled `[dry-run placeholder]`s). `claude` is not invoked,
   nothing is written (`STATUS.md`, `QUEUE.md`, spec files, `usage.jsonl`,
   run state, run artifacts) and git is not touched; the run ends with
   `dry-run: no state was changed`.
@@ -196,6 +196,11 @@ same `diadoche: on-task-done for <NNN>-<slug>` commit.
   directory.
   `--dry-run` calls no agent and writes nothing.
 
+The records are read back by the loop: planner lists the relevant ones under
+`## Relevant ADRs` in its plan, and tester gets those ADRs (with worker's
+`## Decisions`) and treats an unrecorded contradiction with an `Accepted` one
+as a blocking remark; see "How it works".
+
 Each ADR looks like this:
 
 ```
@@ -304,6 +309,10 @@ preprocessor) are guarded by a `spec/.lock` file lock, so a concurrent
      path first; diadoche parses only the path. If either section is missing,
      or `## Files` lists no file at all, the iteration is treated as failed
      and planner is asked again, still within the same `--ITER` budget.
+     Planner also reads `docs/adr/README.md`, if it exists, and writes an
+     optional `## Relevant ADRs` section: one `- <NNNN> — <title>` bullet per
+     relevant ADR, or `none`. A missing section is only a warning in the log,
+     never a failed iteration.
    - **worker** (model `claude-opus-5-5` by default) — implements the plan,
      working only from its `## Files` list instead of re-exploring the repo;
      if another file turns out to be needed, worker first appends it to
@@ -320,7 +329,13 @@ preprocessor) are guarded by a `spec/.lock` file lock, so a concurrent
    - **tester** (model `claude-sonnet-5-5` by default) — reviews a `git diff`
      of the worker's changes (see "Diff-scoped tester" below) plus the plan's
      test command, writes `spec/NNN_REVIEW_M.md`, and, if the task is
-     genuinely done, sets `spec/STATUS.md` to `DONE` itself.
+     genuinely done, sets `spec/STATUS.md` to `DONE` itself. Its prompt also
+     carries the ADRs listed under the plan's `## Relevant ADRs` — numbers,
+     statuses and full contents, read from the task's `docs/adr/` — plus
+     worker's `## Decisions`, or says explicitly that there are no relevant
+     ADRs. A diff that contradicts an `Accepted` ADR without worker recording
+     it as a decision is a blocking remark: tester does not mark the task
+     `DONE`.
 3. Once tester marks a task `DONE`, diadoche commits it (with `--worktree`,
    on the task's branch, then merges it) and moves on to the next task in
    the queue. If iterations run out without `DONE`, diadoche itself sets

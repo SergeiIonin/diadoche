@@ -21,7 +21,7 @@ import (
 // pending task, in queue order, it sends the iteration-1 planner, worker
 // and tester prompts through o.Runner (agents.DryRunRunner in production,
 // which prints them), with labelled placeholders where a real input (the
-// plan, the diff) doesn't exist.
+// plan, the diff, the relevant-ADRs block) doesn't exist.
 //
 // It changes nothing: no STATUS.md, QUEUE.md or spec/ file is written (not
 // even the spec directory or its lock), no usage.jsonl, run-state.json or
@@ -101,7 +101,7 @@ func (o *Orchestrator) dryRun(ctx context.Context) error {
 			{tester, testerPrompt(testerPromptInput{
 				specFile: specFile, specContent: specContent, implPlanFile: implPlanFile, plan: plan,
 				testCommand: dryRunTestCommand, diff: dryRunDiff, guidance: normalDiffGuidance,
-				reviewPath: reviewPath, statusPath: o.Layout.StatusPath,
+				adrs: dryRunADRs, reviewPath: reviewPath, statusPath: o.Layout.StatusPath,
 			})},
 		}
 		for _, c := range calls {

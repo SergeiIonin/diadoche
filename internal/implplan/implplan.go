@@ -17,10 +17,20 @@
 // the humans and agents reading the plan, so the parser stays compatible
 // with older plans that list bare paths. Files documents the exact
 // extraction rule.
+//
+// A third, optional section, "## Relevant ADRs", lists the architecture
+// decision records (docs/adr/) planner found relevant to the task, one per
+// bullet, the number first, or "none". It is never a pass/fail criterion:
+// HasRequiredSections ignores it, and RelevantADRs parses it.
+//
+//	## Relevant ADRs
+//	- 0003 — Use JSONL for the run log
 package implplan
 
 import (
+	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -30,6 +40,11 @@ import (
 const (
 	FilesHeading       = "Files"
 	TestCommandHeading = "Test Command"
+
+	// RelevantADRsHeading is the optional section listing the ADRs
+	// relevant to the task. It is not part of HasRequiredSections. Keep
+	// in sync with internal/agents/defaults/planner.md.
+	RelevantADRsHeading = "Relevant ADRs"
 )
 
 // FilesBulletFormat is the per-file bullet format planner's prompt asks for
@@ -155,6 +170,62 @@ func Files(plan string) []string {
 		}
 	}
 	return out
+}
+
+// ADRRef is one ADR listed under "## Relevant ADRs".
+type ADRRef struct {
+	Number string // four digits, e.g. "0003"
+	Title  string // may be empty
+}
+
+// adrBulletRe matches the text of a "## Relevant ADRs" bullet: optional
+// backticks, "[" and "*", an optional ADR / ADR- prefix, then 1–4 digits
+// not followed by another digit.
+var adrBulletRe = regexp.MustCompile("^[`\\[*]*(?i:ADR[- ]?)?(\\d{1,4})(?:$|[^\\d])")
+
+// RelevantADRs returns the ADRs listed under "## Relevant ADRs", in order,
+// numbers normalised to four digits and de-duplicated. present reports
+// whether the section exists at all, so an empty list ("none") is
+// distinguishable from a missing section. A line counts only if it is a
+// bullet ("-" or "*" plus whitespace) whose text starts with the number
+// (optionally back-quoted, linked or prefixed with "ADR"); prose and
+// "none" give no entries.
+func RelevantADRs(plan string) (refs []ADRRef, present bool) {
+	body, ok := find(plan, RelevantADRsHeading)
+	if !ok {
+		return nil, false
+	}
+	seen := map[string]bool{}
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if len(line) < 2 || (line[0] != '-' && line[0] != '*') {
+			continue
+		}
+		rest := strings.TrimLeft(line[1:], " \t")
+		if len(rest) == len(line)-1 {
+			continue
+		}
+		m := adrBulletRe.FindStringSubmatchIndex(rest)
+		if m == nil {
+			continue
+		}
+		n, _ := strconv.Atoi(rest[m[2]:m[3]])
+		num := fmt.Sprintf("%04d", n)
+		if seen[num] {
+			continue
+		}
+		seen[num] = true
+		title := rest[m[3]:]
+		if strings.HasPrefix(title, "](") {
+			if end := strings.Index(title, ")"); end >= 0 {
+				title = title[end+1:]
+			}
+		}
+		title = strings.TrimSpace(strings.TrimLeft(title, "`*]—–-:. \t"))
+		title = strings.TrimSpace(strings.TrimRight(title, "`*"))
+		refs = append(refs, ADRRef{Number: num, Title: title})
+	}
+	return refs, true
 }
 
 // TestCommand returns the raw body of the "## Test Command" section

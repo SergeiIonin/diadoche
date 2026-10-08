@@ -829,6 +829,7 @@ func (o *Orchestrator) runIteration(ctx context.Context, in iterationInput) (don
 		return false, fmt.Errorf("read impl plan: %w", err)
 	}
 	plan := string(implPlanBytes)
+	o.warnMissingRelevantADRs(specFile, implPlanFile, plan, iter)
 
 	// workerOutput is this iteration's worker answer, for its
 	// ## Decisions section; workerRan is false when a resumed run
@@ -894,10 +895,21 @@ func (o *Orchestrator) runIteration(ctx context.Context, in iterationInput) (don
 		}
 	}
 
+	// The ADRs are read from the task's work dir, the tree planner read
+	// the index from.
+	adrRoot := o.Cfg.Dir
+	if ws != nil && ws.dir != "" {
+		adrRoot = ws.dir
+	}
+	adrs := o.relevantADRsBlock(adrBlockInput{
+		specFile: specFile, iter: iter, plan: plan, root: adrRoot,
+		workerOutput: workerOutput, workerRan: workerRan,
+	})
+
 	prompt := testerPrompt(testerPromptInput{
 		specFile: specFile, specContent: specContent, implPlanFile: implPlanFile, plan: plan,
 		testCommand: testCommand, diffNote: diffNote, diff: diffForTester, guidance: guidance,
-		reviewPath: reviewPath, statusPath: o.Layout.StatusPath,
+		adrs: adrs, reviewPath: reviewPath, statusPath: o.Layout.StatusPath,
 	})
 	testerResult, err := o.runStep(ctx, call, tester, prompt)
 	if err != nil {

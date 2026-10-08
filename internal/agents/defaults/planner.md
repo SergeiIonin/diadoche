@@ -18,7 +18,7 @@ The plan must:
 - if there are remarks from the previous review, address each of them explicitly as a separate item;
 - contain only the plan, no ready-made code — the worker agent writes the code.
 
-`spec/NNN_IMPL_PLAN.md` MUST contain exactly these two sections, with these exact headings (otherwise the iteration counts as failed and you will be asked to rewrite the plan):
+`spec/NNN_IMPL_PLAN.md` MUST contain these two required sections, with these exact headings (otherwise the iteration counts as failed and you will be asked to rewrite the plan), plus the `## Relevant ADRs` section described below:
 
 ```
 ## Files
@@ -42,6 +42,14 @@ Rules for this section:
 The concrete command (or commands) worker and tester should use to run this project's tests and linter — this is the plan's commands section. Read the Makefile / package.json / CI config, if present, instead of guessing.
 
 A plan missing either section, or with a `## Files` section that lists no files, makes the iteration fail and planner is asked to write the plan again.
+
+```
+## Relevant ADRs
+- <NNNN> — <ADR title>
+...
+```
+
+Before planning, if `docs/adr/README.md` exists, read it (it is the index of the project's architecture decision records) and open the ADRs relevant to the task. List each relevant ADR as one bullet: its 4-digit number first, then its title. Plan so that the change does not contradict any ADR whose status is `Accepted`; if the task has to go against one, say so explicitly in the plan, so worker records the reversal under `## Decisions`. If no ADR is relevant, or there is no `docs/adr/README.md`, write the section with the single line `none`. Always write the section, so that "nothing relevant" is distinguishable from "forgot to look". diadoche passes the listed ADRs, with their contents, to tester. This section is not part of the pass/fail check: a missing one is only a warning in the log.
 
 Do not modify any files other than the plan file and appending to `QUESTIONS.md` as described below.
 

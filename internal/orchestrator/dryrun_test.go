@@ -174,7 +174,7 @@ func TestDryRunPrintsEveryAgentPromptPerTask(t *testing.T) {
 		if !strings.Contains(worker, dryRunPlan(task.num+"_IMPL_PLAN.md")) || !strings.Contains(worker, "Implement the plan in this repository.") {
 			t.Errorf("worker prompt for %s:\n%s", task.spec, worker)
 		}
-		for _, want := range []string{dryRunPlan(task.num + "_IMPL_PLAN.md"), dryRunTestCommand, dryRunDiff, task.num + "_REVIEW_1.md"} {
+		for _, want := range []string{dryRunPlan(task.num + "_IMPL_PLAN.md"), dryRunTestCommand, dryRunDiff, dryRunADRs, `Relevant ADRs (from the plan's "## Relevant ADRs" section`, task.num + "_REVIEW_1.md"} {
 			if !strings.Contains(tester, want) {
 				t.Errorf("tester prompt for %s lacks %q:\n%s", task.spec, want, tester)
 			}
@@ -188,7 +188,7 @@ func TestDryRunPrintsEveryAgentPromptPerTask(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	out := buf.String()
-	for _, want := range []string{"agent=planner", "agent=worker", "agent=tester", "Task spec (001_a.md)", "Task spec (002_b.md)", dryRunPlaceholder} {
+	for _, want := range []string{"agent=planner", "agent=worker", "agent=tester", "Task spec (001_a.md)", "Task spec (002_b.md)", dryRunPlaceholder, dryRunADRs} {
 		if !strings.Contains(out, want) {
 			t.Errorf("dry-run output lacks %q", want)
 		}

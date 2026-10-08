@@ -8,7 +8,8 @@ import (
 // The prompts planner, worker and tester get in each iteration, and the one
 // adr-writer gets after a DONE task (--adr). Both the
 // real loop (runIterations) and --dry-run (dryrun.go) build them here, so
-// a dry run prints exactly what a real run would send.
+// a dry run prints exactly what a real run would send. The tester's
+// relevant-ADRs block comes from testeradrs.go (dryRunADRs in a dry run).
 
 // reviewFeedback is the block that hands an agent the previous iteration's
 // review; empty when there is none.
@@ -48,8 +49,11 @@ type testerPromptInput struct {
 	diffNote     string // e.g. a note that the diff was truncated; may be empty
 	diff         string
 	guidance     string
-	reviewPath   string
-	statusPath   string
+	// adrs is the relevant-ADRs block (relevantADRsBlock), or dryRunADRs;
+	// never empty.
+	adrs       string
+	reviewPath string
+	statusPath string
 }
 
 // testerPrompt asks tester to review the diff, write the review and, if the
@@ -58,12 +62,14 @@ func testerPrompt(in testerPromptInput) string {
 	return fmt.Sprintf(
 		"Task spec (%s):\n%s\n\nImplementation plan (%s):\n%s\n\n"+
 			"Test/lint command from the plan:\n%s\n\n"+
+			"Relevant ADRs (from the plan's \"## Relevant ADRs\" section; an Accepted one the diff contradicts "+
+			"without a matching entry in worker's ## Decisions is a blocking remark):\n%s\n\n"+
 			"Diff of the worker's changes since this task started%s:\n%s\n\n"+
 			"%s\n\n"+
 			"Review the diff and the test results against the spec and plan. "+
 			"Write your findings to %s. If, and only if, the task is fully and correctly done, "+
 			"update the row for %q in %s to status DONE.",
-		in.specFile, in.specContent, in.implPlanFile, in.plan, in.testCommand, in.diffNote, in.diff, in.guidance, in.reviewPath, in.specFile, in.statusPath)
+		in.specFile, in.specContent, in.implPlanFile, in.plan, in.testCommand, in.adrs, in.diffNote, in.diff, in.guidance, in.reviewPath, in.specFile, in.statusPath)
 }
 
 // dryRunPlaceholder labels every stand-in --dry-run puts where a real input

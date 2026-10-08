@@ -228,3 +228,59 @@ func TestInferTestGlobs(t *testing.T) {
 		seen[x] = true
 	}
 }
+
+func TestRelevantADRs(t *testing.T) {
+	cases := []struct {
+		name        string
+		body        string
+		want        []ADRRef
+		wantPresent bool
+	}{
+		{"two plain bullets", "## Relevant ADRs\n- 0003 — Use JSONL\n- 0007: Merge strategy\n",
+			[]ADRRef{{"0003", "Use JSONL"}, {"0007", "Merge strategy"}}, true},
+		{"ADR- prefix", "## Relevant ADRs\n- ADR-0003 — T\n", []ADRRef{{"0003", "T"}}, true},
+		{"ADR space prefix", "## Relevant ADRs\n* adr 12. T\n", []ADRRef{{"0012", "T"}}, true},
+		{"backticks", "## Relevant ADRs\n- `0003` — T\n", []ADRRef{{"0003", "T"}}, true},
+		{"link", "## Relevant ADRs\n- [0003](docs/adr/0003-x.md) — T\n", []ADRRef{{"0003", "T"}}, true},
+		{"short number", "## Relevant ADRs\n- 3 — T\n", []ADRRef{{"0003", "T"}}, true},
+		{"no title", "## Relevant ADRs\n- 0004\n", []ADRRef{{"0004", ""}}, true},
+		{"duplicates", "## Relevant ADRs\n- 0003 — A\n- 3 — B\n- ADR-0003\n", []ADRRef{{"0003", "A"}}, true},
+		{"none", "## Relevant ADRs\nnone\n", nil, true},
+		{"bullet none", "## Relevant ADRs\n- none\n", nil, true},
+		{"parenthesised none", "## Relevant ADRs\n(none)\n", nil, true},
+		{"empty body", "## Relevant ADRs\n\n## Test Command\ngo test ./...\n", nil, true},
+		{"non-bullet number", "## Relevant ADRs\n0003 is not relevant\n- 0005 — T\n", []ADRRef{{"0005", "T"}}, true},
+		{"five digits", "## Relevant ADRs\n- 12345 — T\n", nil, true},
+		{"next section ends list", "## Relevant ADRs\n- 0001 — A\n\n## Other\n- 0002 — B\n", []ADRRef{{"0001", "A"}}, true},
+		{"no section", "## Files\n- a.go\n", nil, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, present := RelevantADRs("# Plan\n\n" + c.body)
+			if present != c.wantPresent {
+				t.Fatalf("present = %v, want %v", present, c.wantPresent)
+			}
+			if len(got) != len(c.want) {
+				t.Fatalf("RelevantADRs = %#v, want %#v", got, c.want)
+			}
+			for i := range got {
+				if got[i] != c.want[i] {
+					t.Fatalf("RelevantADRs = %#v, want %#v", got, c.want)
+				}
+			}
+		})
+	}
+}
+
+func TestHasRequiredSectionsIgnoresRelevantADRs(t *testing.T) {
+	if !HasRequiredSections(validPlan + "\n## Relevant ADRs\nnone\n") {
+		t.Fatal("expected a valid plan with an empty Relevant ADRs section to stay valid")
+	}
+	if !HasRequiredSections(validPlan + "\n## Relevant ADRs\n- 0001 — A\n") {
+		t.Fatal("expected a valid plan with a Relevant ADRs list to stay valid")
+	}
+	plan := "# Plan\n\n## Relevant ADRs\n- 0001 — A\n\n## Test Command\ngo test ./...\n"
+	if HasRequiredSections(plan) {
+		t.Fatal("expected a plan with Relevant ADRs but no Files section to be invalid")
+	}
+}
