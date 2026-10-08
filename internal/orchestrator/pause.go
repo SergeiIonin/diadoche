@@ -106,7 +106,7 @@ func sleepWallClock(ctx context.Context, until time.Time) error {
 // own wording and never quote the claude error, so diadoche-restarter
 // (usagelimit.IsLimitLine) doesn't kill a pausing diadoche.
 func (o *Orchestrator) runAgentPausing(ctx context.Context, c agentCall, a *agents.Agent, prompt string) (agents.RunResult, error) {
-	prefix := fmt.Sprintf("%s iter %d/%d: [%s]", c.specFile, c.iter, o.Cfg.Iter, a.Name)
+	prefix := c.logPrefix(o.Cfg.Iter, a.Name)
 	paused := false
 	for {
 		result, err := o.runAgent(ctx, c, a, prompt)

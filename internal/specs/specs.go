@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -266,8 +267,10 @@ func WriteFileAtomic(path string, data []byte) error {
 // QUEUED, IN_PROGRESS or PAUSED (new tasks, and any left mid-flight by a
 // previous, interrupted run), ordered by ascending task number — so a restart always
 // resumes with the lowest-numbered pending task first, regardless of what
-// order rows happen to sit in STATUS.md or the previous QUEUE.md. DONE,
-// FAILED and BLOCKED rows are not pending and never go back to the queue.
+// order rows happen to sit in STATUS.md or the previous QUEUE.md — except
+// that a spec with a Split-from line sorts at its original's position (see
+// pendingQueue). DONE, FAILED and BLOCKED rows are not pending and never go
+// back to the queue.
 func Sync(l Layout) (rows []Row, queue []string, err error) {
 	if err = l.Ensure(); err != nil {
 		return
@@ -279,7 +282,7 @@ func Sync(l Layout) (rows []Row, queue []string, err error) {
 	if err = WriteStatus(l.StatusPath, rows); err != nil {
 		return
 	}
-	queue = pendingQueue(rows)
+	queue = pendingQueue(l, rows)
 	err = WriteQueue(l.QueuePath, queue)
 	return
 }
@@ -293,7 +296,7 @@ func PendingQueue(l Layout) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return pendingQueue(rows), nil
+	return pendingQueue(l, rows), nil
 }
 
 // mergedRows reads STATUS.md and appends every discovered task file it
@@ -326,10 +329,13 @@ func mergedRows(l Layout) ([]Row, error) {
 // pendingQueue returns the specs of every QUEUED/IN_PROGRESS/PAUSED row in rows
 // (DONE, FAILED and BLOCKED rows are not pending),
 // sorted ascending by numeric task number (rows whose Num isn't a plain
-// integer sort after all that are, in their original relative order).
-func pendingQueue(rows []Row) []string {
+// integer sort after all that are, in their original relative order). A
+// spec whose file has a Split-from line sorts right where the spec it was
+// split from would, ahead of every higher-numbered task, the parts in their
+// own number order; this nests, so a split of a split lands in place too.
+func pendingQueue(l Layout, rows []Row) []string {
 	type pending struct {
-		num  int
+		key  []int
 		spec string
 	}
 	var items []pending
@@ -337,19 +343,51 @@ func pendingQueue(rows []Row) []string {
 		if r.Status != StatusQueued && r.Status != StatusInProgress && r.Status != StatusPaused {
 			continue
 		}
-		n, err := strconv.Atoi(r.Num)
-		if err != nil {
-			n = math.MaxInt
-		}
-		items = append(items, pending{num: n, spec: r.Spec})
+		items = append(items, pending{key: queueKey(l, r.Spec, rowNumber(r.Num), nil), spec: r.Spec})
 	}
-	sort.SliceStable(items, func(i, j int) bool { return items[i].num < items[j].num })
+	sort.SliceStable(items, func(i, j int) bool { return slices.Compare(items[i].key, items[j].key) < 0 })
 
 	out := make([]string, len(items))
 	for i, it := range items {
 		out[i] = it.spec
 	}
 	return out
+}
+
+// rowNumber is num as an integer, math.MaxInt if it isn't one.
+func rowNumber(num string) int {
+	n, err := strconv.Atoi(num)
+	if err != nil {
+		return math.MaxInt
+	}
+	return n
+}
+
+// maxSplitDepth bounds how many Split-from links queueKey follows.
+const maxSplitDepth = 32
+
+// queueKey is spec's sort key in the pending queue: [num] for a plain
+// spec, its original's key followed by num for one with a Split-from line.
+// An unreadable file has no Split-from line; a missing original is keyed
+// by its number alone; seen guards against Split-from cycles.
+func queueKey(l Layout, spec string, num int, seen map[string]bool) []int {
+	if seen[spec] || len(seen) >= maxSplitDepth {
+		return []int{num}
+	}
+	b, err := os.ReadFile(filepath.Join(l.SpecDir, spec))
+	if err != nil {
+		return []int{num}
+	}
+	parent := ParseSplitFrom(b)
+	if parent == "" || parent == spec {
+		return []int{num}
+	}
+	if seen == nil {
+		seen = map[string]bool{}
+	}
+	seen[spec] = true
+	key := queueKey(l, parent, rowNumber(TaskNumber(parent)), seen)
+	return append(slices.Clone(key), num)
 }
 
 // PopQueue removes and returns the first item of QUEUE.md, persisting the
@@ -405,6 +443,97 @@ func GetStatus(l Layout, specFile string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("spec %q not found in %s", specFile, l.StatusPath)
+}
+
+// ApplySplit records that original was split into parts (spec files in
+// the spec directory, in execution order) by --on-fail split: original
+// becomes BLOCKED with reason, one QUEUED row per part is inserted right
+// after it in STATUS.md (replacing any row a part already had), and
+// QUEUE.md is rebuilt, the parts first in place of original (they carry a
+// Split-from line, see pendingQueue). STATUS.md and QUEUE.md end up exactly
+// as a following Sync would leave them. The caller holds the spec lock.
+func ApplySplit(l Layout, original, reason string, parts []string) (queue []string, err error) {
+	rows, err := mergedRows(l)
+	if err != nil {
+		return nil, err
+	}
+	isPart := map[string]bool{}
+	for _, p := range parts {
+		isPart[p] = true
+	}
+	var out []Row
+	found := false
+	for _, r := range rows {
+		if isPart[r.Spec] {
+			continue
+		}
+		if r.Spec != original {
+			out = append(out, r)
+			continue
+		}
+		found = true
+		r.Status, r.Reason = StatusBlocked, reason
+		out = append(out, r)
+		for _, p := range parts {
+			out = append(out, Row{Num: TaskNumber(p), Spec: p, Status: StatusQueued})
+		}
+	}
+	if !found {
+		return nil, fmt.Errorf("spec %q not found in %s", original, l.StatusPath)
+	}
+	if err := WriteStatus(l.StatusPath, out); err != nil {
+		return nil, err
+	}
+	queue = pendingQueue(l, out)
+	if err := WriteQueue(l.QueuePath, queue); err != nil {
+		return nil, err
+	}
+	return queue, nil
+}
+
+// SplitFromPrefix starts the line diadoche appends to a spec that --on-fail
+// split cut off another one: "Split-from: 001_foo.md". It places the spec
+// at its original's position in the queue (see pendingQueue).
+const SplitFromPrefix = "Split-from:"
+
+var splitFromRe = regexp.MustCompile(`(?i)^split-from:\s*(.*)$`)
+
+// ParseSplitFrom returns the spec file named on specContent's first
+// Split-from line (the key is case-insensitive, backticks are dropped), or
+// "" when there is none.
+func ParseSplitFrom(specContent []byte) string {
+	for line := range strings.SplitSeq(string(specContent), "\n") {
+		if m := splitFromRe.FindStringSubmatch(strings.TrimSpace(line)); m != nil {
+			return strings.TrimSpace(strings.Trim(strings.TrimSpace(m[1]), "`"))
+		}
+	}
+	return ""
+}
+
+// AppendSplitFrom appends a "Split-from: <original>" line to the spec file
+// at path, unless it already has a Split-from line.
+func AppendSplitFrom(path, original string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if ParseSplitFrom(b) != "" {
+		return nil
+	}
+	var add strings.Builder
+	if len(b) > 0 && !strings.HasSuffix(string(b), "\n") {
+		add.WriteString("\n")
+	}
+	fmt.Fprintf(&add, "\n%s %s\n", SplitFromPrefix, original)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteString(add.String()); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // NoTestsMarker is the line that marks a task spec as needing no tests:

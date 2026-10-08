@@ -7,12 +7,14 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
 	"diadoche/internal/agents"
 	"diadoche/internal/config"
 	"diadoche/internal/gitutil"
+	"diadoche/internal/onfail"
 	"diadoche/internal/specs"
 )
 
@@ -320,6 +322,33 @@ func TestDryRunWithOnFailChainChangesNothing(t *testing.T) {
 		t.Errorf("dry run calls = %v, want only the iteration-1 prompts of each task (%s)", rec.agents, want)
 	}
 	if !strings.Contains(buf.String(), "--on-fail escalate,block (escalation model claude-opus-5-5); the dry run applies none") {
+		t.Errorf("log does not name the on-fail chain:\n%s", buf.String())
+	}
+}
+
+func TestDryRunWithSplitInChainCallsNoPreprocessor(t *testing.T) {
+	dir, layout := dryRunRepo(t)
+	filesBefore, gitBefore := treeSnapshot(t, dir), gitSnapshot(t, dir)
+	specsBefore, _ := specs.DiscoverTaskFiles(layout.SpecDir)
+
+	var buf bytes.Buffer
+	o := newDryRunOrchestrator(dir, layout, &promptRecorder{}, log.New(&buf, "", 0))
+	rec := o.Runner.(*promptRecorder)
+	o.Cfg.OnFail = []string{onfail.Escalate, onfail.Split, onfail.Block}
+	o.Cfg.EscalationModel = agents.ModelOverride{Value: "claude-opus-5-5", Source: agents.ModelSourceFlag}
+	if err := o.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	diffSnapshots(t, "files", filesBefore, treeSnapshot(t, dir))
+	diffSnapshots(t, "git", gitBefore, gitSnapshot(t, dir))
+	if specsAfter, _ := specs.DiscoverTaskFiles(layout.SpecDir); strings.Join(specsAfter, ",") != strings.Join(specsBefore, ",") {
+		t.Errorf("spec files %v -> %v; a dry run writes no spec", specsBefore, specsAfter)
+	}
+	if slices.Contains(rec.agents, "preprocessor") {
+		t.Errorf("dry run called the preprocessor: %v", rec.agents)
+	}
+	if !strings.Contains(buf.String(), "--on-fail escalate,split,block") || !strings.Contains(buf.String(), "applies none") {
 		t.Errorf("log does not name the on-fail chain:\n%s", buf.String())
 	}
 }

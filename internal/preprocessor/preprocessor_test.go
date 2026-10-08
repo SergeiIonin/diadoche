@@ -241,3 +241,54 @@ func TestRunGivesPreprocessorTheSharedPrefix(t *testing.T) {
 		t.Errorf("--append-system-prompt = %q, want the shared prefix %q", gotPrefix, want)
 	}
 }
+
+func TestBuildPromptRawModeUnchanged(t *testing.T) {
+	got := buildPrompt("raw/x.md", "do A and B", "/p/spec", []string{"001_a.md"})
+	want := "Raw task file (raw/x.md):\ndo A and B\n\n" +
+		"Existing task spec files already in /p/spec (do not reuse or collide with their numbers):\n- 001_a.md\n\n" +
+		"Split this raw task into one or more atomic task specs and write each as its own file " +
+		"directly in /p/spec (not in spec/raw), following the spec/NNN_<slug>.md naming convention."
+	if got != want {
+		t.Errorf("buildPrompt =\n%q\nwant\n%q", got, want)
+	}
+	got = buildPrompt("raw/x.md", "do A", "/p/spec", nil)
+	if !strings.Contains(got, "There are no existing task spec files in /p/spec yet; start numbering from 001.\n\n") {
+		t.Errorf("buildPrompt without existing files =\n%s", got)
+	}
+}
+
+func TestSplitPromptIncludesSpecAndEveryReview(t *testing.T) {
+	got := SplitPrompt(SplitRequest{
+		SpecFile: "001_big.md", SpecContent: "# Big task\nmany parts", SpecDir: "/p/spec", Iterations: 3,
+		Reviews: []Review{
+			{Name: "001_REVIEW_1.md", Content: "first: part A missing"},
+			{Name: "001_REVIEW_2.md", Content: "second: part B missing"},
+			{Name: "001_REVIEW_3.md", Content: "third: part C missing"},
+		},
+		Existing: []string{"001_big.md", "002_other.md"},
+	})
+	for _, want := range []string{"# Big task\nmany parts", "001_big.md", "/p/spec", "2–4", "3 iteration(s)",
+		"- 002_other.md", "WHOLE original spec", "Do not modify the original spec"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("split prompt lacks %q:\n%s", want, got)
+		}
+	}
+	last := -1
+	for _, r := range []string{"001_REVIEW_1.md", "first: part A missing", "001_REVIEW_2.md", "second: part B missing", "001_REVIEW_3.md", "third: part C missing"} {
+		i := strings.Index(got, r)
+		if i <= last {
+			t.Errorf("%q missing or out of order in:\n%s", r, got)
+		}
+		last = i
+	}
+}
+
+func TestNewSpecs(t *testing.T) {
+	got := NewSpecs([]string{"001_a.md", "002_b.md"}, []string{"001_a.md", "004_d.md", "002_b.md", "003_c.md"})
+	if strings.Join(got, ",") != "003_c.md,004_d.md" {
+		t.Errorf("NewSpecs = %v", got)
+	}
+	if got := NewSpecs([]string{"001_a.md"}, []string{"001_a.md"}); len(got) != 0 {
+		t.Errorf("NewSpecs with nothing new = %v", got)
+	}
+}

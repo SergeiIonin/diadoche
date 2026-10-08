@@ -3,8 +3,9 @@
 // cfg.Iter iterations, until the tester marks the task DONE in STATUS.md or
 // the iteration budget is exhausted. An exhausted task gets the --on-fail
 // policy chain (see onfail.go: an escalated iteration on a stronger model,
-// then BLOCKED by default); it is FAILED only with an empty chain, a chain
-// that runs out, or another cause (an agent error, a cost cap). Between
+// then BLOCKED by default; optionally split into smaller tasks by the
+// preprocessor, see split.go); it is FAILED only with an empty chain, a
+// chain that runs out, or another cause (an agent error, a cost cap). Between
 // worker and tester, the red-green check (see redgreen.go) makes sure
 // worker's tests fail on the task's base commit, i.e. actually test the
 // new code.
@@ -146,6 +147,10 @@ type Orchestrator struct {
 	// Run when the chain escalates.
 	escPlanner, escWorker *agents.Agent
 
+	// splitter is the preprocessor agent of --on-fail split; built by Run
+	// when the chain contains split.
+	splitter *agents.Agent
+
 	// simulate is for tests only: run the whole loop like a real run but
 	// without git, usage.jsonl, run-state.json or run artifacts — what
 	// --dry-run used to do. Real --dry-run is the read-only walk in
@@ -220,10 +225,18 @@ func (o *Orchestrator) Run(ctx context.Context) (err error) {
 			return err
 		}
 	}
+	if slices.Contains(o.Cfg.OnFail, onfail.Split) {
+		if err := o.loadSplitAgent(planner.Prefix); err != nil {
+			return err
+		}
+	}
 	if len(o.Cfg.OnFail) > 0 {
 		esc := ""
 		if o.escPlanner != nil {
 			esc = "; escalation model=" + o.escPlanner.ModelDescription()
+		}
+		if o.splitter != nil {
+			esc += "; split preprocessor model=" + o.splitter.ModelDescription()
 		}
 		o.Log.Printf("on-fail: %s%s", strings.Join(o.Cfg.OnFail, ","), esc)
 	}
@@ -514,6 +527,15 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 		}
 		taskEnd(status, reason)
 		return err
+	}
+	if len(onFail.split) > 0 {
+		// Not a failure: the split-off tasks carry on in its place.
+		err := o.splitTask(ctx, specFile, num, ws, onFail.applied, onFail.split)
+		taskEnd(specs.StatusBlocked, "split")
+		if err != nil {
+			return &fatalError{fmt.Errorf("task %s: preserve split changes: %w", specFile, err)}
+		}
+		return nil
 	}
 	if onFail.blocked {
 		err := o.blockTask(ctx, specFile, num, ws, onFail.applied)
@@ -883,9 +905,22 @@ type agentCall struct {
 	// escalate), which is logged as such.
 	escalated bool
 
+	// onFail names the --on-fail policy making the call outside any
+	// iteration (split's preprocessor), which is logged as such.
+	onFail string
+
 	workDir string
 	uw      *usage.Writer
 	tally   *iterationTally
+}
+
+// logPrefix is how a call is named in the log: "<spec> iter i/n: [agent]",
+// or "<spec> on-fail <policy>: [agent]" for a policy's own call.
+func (c agentCall) logPrefix(iters int, agent string) string {
+	if c.onFail != "" {
+		return fmt.Sprintf("%s on-fail %s: [%s]", c.specFile, c.onFail, agent)
+	}
+	return fmt.Sprintf("%s iter %d/%d: [%s]", c.specFile, c.iter, iters, agent)
 }
 
 // iterationTally sums the parsed usage of every agent turn in one
@@ -900,11 +935,15 @@ type iterationTally struct {
 // alone and together with the iteration's earlier turns — then records it
 // to usage.jsonl.
 func (o *Orchestrator) runAgent(ctx context.Context, c agentCall, a *agents.Agent, prompt string) (agents.RunResult, error) {
-	prefix := fmt.Sprintf("%s iter %d/%d: [%s]", c.specFile, c.iter, o.Cfg.Iter, a.Name)
+	prefix := c.logPrefix(o.Cfg.Iter, a.Name)
 	startFields := []runlog.Field{runlog.F("model", a.Model)}
 	if c.escalated {
 		prefix = fmt.Sprintf("%s iter %d (escalated): [%s]", c.specFile, c.iter, a.Name)
 		startFields = append(startFields, runlog.F("escalated", true))
+	}
+	if c.onFail != "" {
+		prefix = c.logPrefix(o.Cfg.Iter, a.Name)
+		startFields = append(startFields, runlog.F("on_fail", c.onFail))
 	}
 	o.Log.Printf("%s started (model=%s)", prefix, a.Model)
 	o.event(c.specFile, c.iter, a.Name, "agent_start", startFields...)

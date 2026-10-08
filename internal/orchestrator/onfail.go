@@ -24,9 +24,11 @@ import (
 // FAILED as before, and the resumable outcomes (a signal, a usage limit,
 // --max-cost-per-run) leave it pending. Policies only decide what happens;
 // processTask finalizes the outcome (DONE -> commit/merge and hooks,
-// BLOCKED -> blockTask, FAILED -> failTask), so the task's final.diff is
-// still written once, after the chain and before anything is committed or
-// parked.
+// BLOCKED -> blockTask, split -> splitTask, FAILED -> failTask), so the
+// task's final.diff is still written once, after the chain and before
+// anything is committed or parked. The split policy's own agent call (the
+// preprocessor's) is the one exception to "policies only decide": its new
+// spec files are written during the chain, see split.go.
 
 // Outcomes of one applied policy, as recorded in run.log.
 const (
@@ -35,19 +37,29 @@ const (
 	outcomeBlocked     = "blocked"
 	outcomeError       = "error"
 	outcomeInterrupted = "interrupted"
+	outcomeSplit       = "split"
+	outcomeNoop        = "no_op"
 )
 
-// failPolicy applies one --on-fail policy to a task. outcome is one of the
-// outcome* constants; detail is a short key=value note for run.log and the
-// BLOCKED report; a non-nil cause (outcome error or interrupted) ends the
-// chain and is handled by processTask like the same error from a normal
-// iteration.
-type failPolicy func(o *Orchestrator, ctx context.Context, in onFailInput) (outcome, detail string, cause error)
+// failPolicy applies one --on-fail policy to a task.
+type failPolicy func(o *Orchestrator, ctx context.Context, in onFailInput) policyResult
+
+// policyResult is what one policy did. outcome is one of the outcome*
+// constants; detail is a short key=value note for run.log and the BLOCKED
+// report; a non-nil cause (outcome error or interrupted) ends the chain and
+// is handled by processTask like the same error from a normal iteration.
+// split are the new specs of outcome split, in queue order.
+type policyResult struct {
+	outcome, detail string
+	cause           error
+	split           []string
+}
 
 // failPolicies are the implementations of onfail.Names. Adding a policy
 // means adding its name there and its implementation here.
 var failPolicies = map[string]failPolicy{
 	onfail.Escalate: escalatePolicy,
+	onfail.Split:    splitPolicy,
 	onfail.Block:    blockPolicy,
 }
 
@@ -65,10 +77,12 @@ type appliedPolicy struct {
 }
 
 // onFailResult is what the chain decided: done (an escalated iteration got
-// DONE), blocked (the block policy ran), or neither — the task FAILS, with
-// cause when a policy was cut short.
+// DONE), blocked (the block policy ran), split (the split policy cut the
+// task into these specs), or none of them — the task FAILS, with cause
+// when a policy was cut short.
 type onFailResult struct {
 	done, blocked bool
+	split         []string
 	cause         error
 	applied       []appliedPolicy
 }
@@ -94,8 +108,9 @@ func (o *Orchestrator) loadEscalationAgents(planner, worker *agents.Agent) error
 
 // applyOnFail applies o.Cfg.OnFail in order to a task whose iterations ran
 // out, recording every applied policy as an on_fail_policy event, until
-// one of them ends the task or fails; a chain that runs out leaves the task
-// to FAIL.
+// one of them ends the task or fails; a policy that did nothing (no_op, a
+// split that failed) hands the task on to the next. A chain that runs out
+// leaves the task to FAIL.
 func (o *Orchestrator) applyOnFail(ctx context.Context, in onFailInput) onFailResult {
 	o.Log.Printf("task %s: not DONE after %d iteration(s); applying --on-fail %s", in.specFile, o.Cfg.Iter, strings.Join(o.Cfg.OnFail, ","))
 	var res onFailResult
@@ -105,14 +120,14 @@ func (o *Orchestrator) applyOnFail(ctx context.Context, in onFailInput) onFailRe
 			return res
 		}
 		policy := failPolicies[name]
-		var outcome, detail string
-		var cause error
+		var r policyResult
 		if policy == nil {
 			// config.Parse rejects unknown names; a hand-built Config may not.
-			outcome, cause = outcomeError, fmt.Errorf("--on-fail: unknown policy %q", name)
+			r = policyResult{outcome: outcomeError, cause: fmt.Errorf("--on-fail: unknown policy %q", name)}
 		} else {
-			outcome, detail, cause = policy(o, ctx, in)
+			r = policy(o, ctx, in)
 		}
+		outcome, detail, cause := r.outcome, r.detail, r.cause
 		res.applied = append(res.applied, appliedPolicy{name: name, outcome: outcome, detail: detail})
 		fields := []runlog.Field{runlog.F("policy", name), runlog.F("step", i+1), runlog.F("outcome", outcome)}
 		if detail != "" {
@@ -127,6 +142,9 @@ func (o *Orchestrator) applyOnFail(ctx context.Context, in onFailInput) onFailRe
 		case outcome == outcomeBlocked:
 			res.blocked = true
 			return res
+		case outcome == outcomeSplit:
+			res.split = r.split
+			return res
 		case cause != nil:
 			res.cause = cause
 			return res
@@ -140,17 +158,17 @@ func (o *Orchestrator) applyOnFail(ctx context.Context, in onFailInput) onFailRe
 // model and tester on its own. It is a normal iteration in every other
 // respect: same inputs (the last review included), plan check, red-green
 // check, limit pauses, budgets and records.
-func escalatePolicy(o *Orchestrator, ctx context.Context, in onFailInput) (string, string, error) {
+func escalatePolicy(o *Orchestrator, ctx context.Context, in onFailInput) policyResult {
 	if o.escPlanner == nil || o.escWorker == nil {
 		if err := o.loadEscalationAgents(in.planner, in.worker); err != nil {
-			return outcomeError, "", err
+			return policyResult{outcome: outcomeError, cause: err}
 		}
 	}
 	iter := o.Cfg.Iter + 1
 	detail := fmt.Sprintf("model=%s iter=%d", o.escPlanner.Model, iter)
 	specContent, err := os.ReadFile(filepath.Join(o.Layout.SpecDir, in.specFile))
 	if err != nil {
-		return outcomeError, detail, fmt.Errorf("read spec file: %w", err)
+		return policyResult{outcome: outcomeError, detail: detail, cause: fmt.Errorf("read spec file: %w", err)}
 	}
 	o.setAgentState(iter, runstate.Agents[0], runstate.AgentPending)
 	done, err := o.runIteration(ctx, iterationInput{
@@ -163,13 +181,13 @@ func escalatePolicy(o *Orchestrator, ctx context.Context, in onFailInput) (strin
 		if err := specs.SetStatusReason(o.Layout, in.specFile, specs.StatusDone, reason); err != nil {
 			o.Log.Printf("task %s: couldn't record the escalation in STATUS.md: %v", in.specFile, err)
 		}
-		return outcomeDone, detail, nil
+		return policyResult{outcome: outcomeDone, detail: detail}
 	case err != nil && resumable(ctx, err):
-		return outcomeInterrupted, detail, err
+		return policyResult{outcome: outcomeInterrupted, detail: detail, cause: err}
 	case err != nil:
-		return outcomeError, detail, err
+		return policyResult{outcome: outcomeError, detail: detail, cause: err}
 	}
-	return outcomeNotDone, detail, nil
+	return policyResult{outcome: outcomeNotDone, detail: detail}
 }
 
 // resumable reports whether err leaves the task pending rather than
@@ -183,8 +201,8 @@ func resumable(ctx context.Context, err error) bool {
 
 // blockPolicy decides the task is BLOCKED; processTask carries it out
 // (see blockTask), after the task's final.diff is written.
-func blockPolicy(*Orchestrator, context.Context, onFailInput) (string, string, error) {
-	return outcomeBlocked, "", nil
+func blockPolicy(*Orchestrator, context.Context, onFailInput) policyResult {
+	return policyResult{outcome: outcomeBlocked}
 }
 
 // blockTask finalizes a task the --on-fail chain BLOCKED: STATUS.md says
@@ -262,10 +280,12 @@ func blockerOf(reason, fallback string) string {
 }
 
 // blockedChanges is where a BLOCKED task's changes are: its kept worktree
-// and branch, or (in place) the branch they were parked on; branch is ""
-// when there were none.
+// and branch, its branch renamed after its worktree was removed (retired,
+// --on-fail split with --worktree), or (in place) the branch they were
+// parked on; branch is "" when there were none.
 type blockedChanges struct {
 	branch, worktree, stat string
+	retired                bool
 	restorable             []string
 }
 
@@ -302,26 +322,7 @@ func (o *Orchestrator) blockedReport(specFile, num, reason string, applied []app
 		b.WriteString("Last review: none\n\n")
 	}
 
-	switch {
-	case !hasWorkspace:
-		b.WriteString("No changes were preserved (simulated run).\n\n")
-	case where.worktree != "":
-		fmt.Fprintf(&b, "The task's changes are committed on its branch `%s`; its worktree %s is kept.\n\n", where.branch, where.worktree)
-		if strings.TrimSpace(where.stat) != "" {
-			fmt.Fprintf(&b, "```\n%s```\n\n", where.stat)
-		}
-	case where.branch == "":
-		b.WriteString("The task made no code changes, so no branch was created.\n\n")
-	default:
-		fmt.Fprintf(&b, "Code changes were parked on branch `%s`; the working tree was reverted to the task's starting point.\n\n", where.branch)
-		fmt.Fprintf(&b, "```\n%s```\n\n", where.stat)
-		if len(where.restorable) > 0 && len(where.restorable) <= 20 {
-			fmt.Fprintf(&b, "To bring the changes back: `git checkout %s -- %s` (or `git merge %s`, which also replays deletions).\n\n",
-				where.branch, strings.Join(where.restorable, " "), where.branch)
-		} else {
-			fmt.Fprintf(&b, "To bring the changes back: `git merge %s`.\n\n", where.branch)
-		}
-	}
+	writeChanges(&b, where, hasWorkspace)
 
 	if len(deps) > 0 {
 		b.WriteString("Blocked along with it (they depend on it):\n")
@@ -337,4 +338,37 @@ func (o *Orchestrator) blockedReport(specFile, num, reason string, applied []app
 	}
 	b.WriteString(". Tasks blocked along with it need the same.\n")
 	return b.String()
+}
+
+// writeChanges is the "where are the task's changes" paragraph of a
+// BLOCKED report.
+func writeChanges(b *strings.Builder, where blockedChanges, hasWorkspace bool) {
+	switch {
+	case !hasWorkspace:
+		b.WriteString("No changes were preserved (simulated run).\n\n")
+		return
+	case where.worktree != "":
+		fmt.Fprintf(b, "The task's changes are committed on its branch `%s`; its worktree %s is kept.\n\n", where.branch, where.worktree)
+		if strings.TrimSpace(where.stat) != "" {
+			fmt.Fprintf(b, "```\n%s```\n\n", where.stat)
+		}
+		return
+	case where.retired && strings.TrimSpace(where.stat) == "":
+		fmt.Fprintf(b, "The task made no code changes; its branch was kept as `%s` anyway and its worktree was removed.\n\n", where.branch)
+		return
+	case where.retired:
+		fmt.Fprintf(b, "The task's changes were committed on its branch, renamed to `%s`; its worktree was removed and the main working tree was never touched.\n\n", where.branch)
+	case where.branch == "":
+		b.WriteString("The task made no code changes, so no branch was created.\n\n")
+		return
+	default:
+		fmt.Fprintf(b, "Code changes were parked on branch `%s`; the working tree was reverted to the task's starting point.\n\n", where.branch)
+	}
+	fmt.Fprintf(b, "```\n%s```\n\n", where.stat)
+	if len(where.restorable) > 0 && len(where.restorable) <= 20 {
+		fmt.Fprintf(b, "To bring the changes back: `git checkout %s -- %s` (or `git merge %s`, which also replays deletions).\n\n",
+			where.branch, strings.Join(where.restorable, " "), where.branch)
+	} else {
+		fmt.Fprintf(b, "To bring the changes back: `git merge %s`.\n\n", where.branch)
+	}
 }

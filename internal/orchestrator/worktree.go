@@ -195,26 +195,10 @@ func (o *Orchestrator) finishDoneWorktree(ctx context.Context, specFile string, 
 // renamed to diadoche/failed/<NNN>-<slug>. The main working tree is never
 // touched. The returned error means the worktree couldn't be cleaned up.
 func (o *Orchestrator) failWorktree(ctx context.Context, specFile, num string, ws *workspace, cause error) error {
-	if _, err := gitutil.CommitAllExcluding(ctx, ws.dir, "diadoche: parked FAILED "+specFile, ws.exclude...); err != nil {
-		return err
-	}
-	if err := gitutil.WorktreeRemove(ctx, o.Cfg.Dir, ws.dir); err != nil {
-		return err
-	}
-	branch := o.failedBranchName(ctx, specFile, num)
-	if err := gitutil.RenameBranch(ctx, o.Cfg.Dir, ws.branch, branch); err != nil {
-		return err
-	}
-	stat, err := gitutil.DiffStat(ctx, o.Cfg.Dir, ws.base, branch)
+	branch, stat, restorable, err := o.retireWorktree(ctx, specFile, num, ws, failedBranchPrefix, "diadoche: parked FAILED "+specFile)
 	if err != nil {
 		return err
 	}
-	restorable, err := gitutil.ChangedPathsBetween(ctx, o.Cfg.Dir, ws.base, branch)
-	if err != nil {
-		return err
-	}
-	o.Log.Printf("task %s: worktree removed, its branch renamed to %s", specFile, branch)
-	o.event(specFile, 0, "", "park", runlog.F("branch", branch))
 
 	failedPath := filepath.Join(o.Layout.SpecDir, num+"_FAILED.md")
 	if err := os.WriteFile(failedPath, []byte(o.failedReport(specFile, num, branch, stat, restorable, cause, true)), 0o644); err != nil {
@@ -223,6 +207,33 @@ func (o *Orchestrator) failWorktree(ctx context.Context, specFile, num string, w
 	ws.removeBaseFile()
 	o.commitBookkeeping(ctx, specFile, "diadoche: FAILED "+specFile)
 	return nil
+}
+
+// retireWorktree commits a task's changes on its branch with message,
+// removes its worktree and renames the branch to <prefix><NNN>-<slug> (see
+// uniqueBranchName). stat and restorable are the branch's diff --stat and
+// changed paths against the task's base. The main working tree is never
+// touched.
+func (o *Orchestrator) retireWorktree(ctx context.Context, specFile, num string, ws *workspace, prefix, message string) (branch, stat string, restorable []string, err error) {
+	if _, err := gitutil.CommitAllExcluding(ctx, ws.dir, message, ws.exclude...); err != nil {
+		return "", "", nil, err
+	}
+	if err := gitutil.WorktreeRemove(ctx, o.Cfg.Dir, ws.dir); err != nil {
+		return "", "", nil, err
+	}
+	branch = o.uniqueBranchName(ctx, prefix, specFile, num)
+	if err := gitutil.RenameBranch(ctx, o.Cfg.Dir, ws.branch, branch); err != nil {
+		return "", "", nil, err
+	}
+	if stat, err = gitutil.DiffStat(ctx, o.Cfg.Dir, ws.base, branch); err != nil {
+		return "", "", nil, err
+	}
+	if restorable, err = gitutil.ChangedPathsBetween(ctx, o.Cfg.Dir, ws.base, branch); err != nil {
+		return "", "", nil, err
+	}
+	o.Log.Printf("task %s: worktree removed, its branch renamed to %s", specFile, branch)
+	o.event(specFile, 0, "", "park", runlog.F("branch", branch))
+	return branch, stat, restorable, nil
 }
 
 // blockWorktree preserves a task BLOCKED by --on-fail block in worktree

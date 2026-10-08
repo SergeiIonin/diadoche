@@ -567,6 +567,13 @@ func TestParseOnFailDefaultAndValues(t *testing.T) {
 	if !slices.Equal(cfg.OnFail, []string{"block"}) {
 		t.Errorf("--on-fail block OnFail = %v", cfg.OnFail)
 	}
+	cfg, err = Parse([]string{"--on-fail", "escalate,split,block"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(cfg.OnFail, []string{"escalate", "split", "block"}) {
+		t.Errorf("--on-fail escalate,split,block OnFail = %v", cfg.OnFail)
+	}
 }
 
 func TestParseOnFailRejectsBadChains(t *testing.T) {
@@ -647,7 +654,8 @@ func TestParseHelpMentionsOnFail(t *testing.T) {
 		_, _ = Parse([]string{"--help"})
 	})
 	for _, want := range []string{"ON-FAIL POLICIES", "--on-fail", "--escalation-model", "DIADOCHE_ESCALATION_MODEL",
-		"escalate", "block", "Depends-on:", "NNN_BLOCKED.md", "diadoche/blocked/", "on_fail_policy"} {
+		"escalate", "block", "Depends-on:", "NNN_BLOCKED.md", "diadoche/blocked/", "on_fail_policy",
+		"split", "Split-from", "diadoche/split/", "no_op", "--on-fail escalate,split,block"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("help output missing %q", want)
 		}

@@ -3,6 +3,11 @@
 // under .claude/diadoche/spec. It is deliberately independent from the
 // main orchestrator loop — it only writes new spec files and exits; it never
 // starts work on the tasks it creates, to avoid racing the main loop.
+//
+// The same agent serves --on-fail split: the orchestrator loads it with
+// LoadAgent and makes that call itself, inside its own loop, with the
+// prompt SplitPrompt builds — a failing task's spec and every review of it,
+// to be cut into smaller tasks.
 package preprocessor
 
 import (
@@ -11,6 +16,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -42,11 +48,8 @@ func Run(ctx context.Context, cfg config.Config) error {
 		return fmt.Errorf("read raw task file: %w", err)
 	}
 
-	agent, err := agents.LoadOrDefault(layout.AgentsDir, "preprocessor")
+	agent, err := LoadAgent(layout, cfg.PreprocessorModel)
 	if err != nil {
-		return fmt.Errorf("load preprocessor agent: %w", err)
-	}
-	if err := agents.ResolveModel(agent, cfg.PreprocessorModel); err != nil {
 		return err
 	}
 	logger.Printf("model: preprocessor=%s", agent.ModelDescription())
@@ -109,6 +112,19 @@ func Run(ctx context.Context, cfg config.Config) error {
 	return nil
 }
 
+// LoadAgent loads the preprocessor agent (the project's own, or the
+// built-in default) on its model, overridden by override when set.
+func LoadAgent(layout specs.Layout, override agents.ModelOverride) (*agents.Agent, error) {
+	agent, err := agents.LoadOrDefault(layout.AgentsDir, "preprocessor")
+	if err != nil {
+		return nil, fmt.Errorf("load preprocessor agent: %w", err)
+	}
+	if err := agents.ResolveModel(agent, override); err != nil {
+		return nil, err
+	}
+	return agent, nil
+}
+
 // recordUsage appends one usage.jsonl line for the preprocessor's single
 // agent call, so its cost shows up alongside planner/worker/tester's in the
 // same log — best-effort and never fatal, same as the main loop's
@@ -150,16 +166,72 @@ func recordUsage(logger *log.Logger, layout specs.Layout, dryRun bool, taskPath,
 func buildPrompt(taskPath, rawContent, specDir string, existing []string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Raw task file (%s):\n%s\n\n", taskPath, rawContent)
-	if len(existing) > 0 {
-		fmt.Fprintf(&b, "Existing task spec files already in %s (do not reuse or collide with their numbers):\n", specDir)
-		for _, f := range existing {
-			fmt.Fprintf(&b, "- %s\n", f)
-		}
-		b.WriteString("\n")
-	} else {
-		fmt.Fprintf(&b, "There are no existing task spec files in %s yet; start numbering from 001.\n\n", specDir)
-	}
+	writeExisting(&b, specDir, existing)
 	fmt.Fprintf(&b, "Split this raw task into one or more atomic task specs and write each as its own file "+
 		"directly in %s (not in spec/raw), following the spec/NNN_<slug>.md naming convention.", specDir)
 	return b.String()
+}
+
+// writeExisting lists the task spec files already in specDir, whose
+// numbers the new ones must not reuse.
+func writeExisting(b *strings.Builder, specDir string, existing []string) {
+	if len(existing) > 0 {
+		fmt.Fprintf(b, "Existing task spec files already in %s (do not reuse or collide with their numbers):\n", specDir)
+		for _, f := range existing {
+			fmt.Fprintf(b, "- %s\n", f)
+		}
+		b.WriteString("\n")
+	} else {
+		fmt.Fprintf(b, "There are no existing task spec files in %s yet; start numbering from 001.\n\n", specDir)
+	}
+}
+
+// Review is one review of a task: its file name and content.
+type Review struct{ Name, Content string }
+
+// SplitRequest is what --on-fail split asks the preprocessor to cut up: a
+// task that did not reach DONE in Iterations iterations, with every review
+// of it (oldest first) and the task spec files already in SpecDir.
+type SplitRequest struct {
+	SpecFile, SpecContent, SpecDir string
+	Iterations                     int
+	Reviews                        []Review
+	Existing                       []string
+}
+
+// SplitPrompt builds the preprocessor prompt of --on-fail split: cut the
+// failing task into 2–4 smaller tasks that together cover its whole spec.
+func SplitPrompt(req SplitRequest) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Failing task spec (%s):\n%s\n\n", filepath.Join(req.SpecDir, req.SpecFile), req.SpecContent)
+	if len(req.Reviews) > 0 {
+		b.WriteString("Reviews of every iteration, oldest first:\n\n")
+		for _, r := range req.Reviews {
+			fmt.Fprintf(&b, "### %s\n%s\n\n", r.Name, strings.TrimRight(r.Content, "\n"))
+		}
+	} else {
+		b.WriteString("The task has no reviews.\n\n")
+	}
+	writeExisting(&b, req.SpecDir, req.Existing)
+	fmt.Fprintf(&b, "Split mode: the task %s did not reach DONE in %d iteration(s), most likely because it is too big. "+
+		"Cut it into 2–4 smaller, atomic, self-contained tasks that together cover the WHOLE original spec. "+
+		"Its code changes have been set aside, so the new tasks start from the code as it was before it. "+
+		"Use the reviews to see where it got stuck. "+
+		"Write each new task as its own file directly in %s, following the spec/NNN_<slug>.md naming convention, "+
+		"numbered after the highest existing number, in the order they should run, with Depends-on lines between them where needed. "+
+		"Do not modify the original spec, its plan or reviews, STATUS.md or QUEUE.md.",
+		req.SpecFile, req.Iterations, req.SpecDir)
+	return b.String()
+}
+
+// NewSpecs returns the files in after that are not in before, sorted.
+func NewSpecs(before, after []string) []string {
+	var out []string
+	for _, f := range after {
+		if !slices.Contains(before, f) {
+			out = append(out, f)
+		}
+	}
+	slices.Sort(out)
+	return out
 }

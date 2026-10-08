@@ -447,6 +447,27 @@ const helpOnFail = `ON-FAIL POLICIES
         it (escalation_start, escalated=true). If tester marks the task
         DONE, it is finished as usual (commit/merge, --on-task-done hooks)
         and the rest of the chain is skipped.
+    split
+        Calls the preprocessor agent (model: --preprocessor-model) with the
+        task's spec and every review of it (NNN_REVIEW_*.md, escalated round
+        included) and asks it to cut the task into 2–4 smaller, atomic,
+        self-contained tasks that together cover the whole spec. The new
+        specs are numbered after the highest existing number, get a line
+        "Split-from: <original spec>" and are QUEUED to run next, in place
+        of the original, ahead of everything queued behind it, in the order
+        the preprocessor numbered them. The original becomes
+        "BLOCKED: split into <specs> ..." — the chosen terminal status: it is
+        never re-queued or retried, and the rest of the chain is skipped;
+        tasks that depend on it are not blocked, the new tasks do its work.
+        Its changes are set aside so the new tasks start from a clean base:
+        parked on diadoche/split/<NNN>-<slug> (with --worktree the worktree
+        is removed and its branch renamed to that), and spec/NNN_BLOCKED.md
+        names the new specs and says where the changes are. The call is
+        logged (agent_start ... on_fail=split, iter-0-preprocessor.stdout)
+        and recorded in usage.jsonl like any agent call. If it fails, or
+        yields fewer than two new specs (or numbers them wrong), split is a
+        no-op (outcome=no_op): its files are removed and the next policy
+        runs, e.g. "escalate,split,block" still ends in block.
     block
         The task becomes "BLOCKED: <reason>" in STATUS.md, the reason naming
         the policies applied. With --worktree its changes are committed on
@@ -465,9 +486,9 @@ const helpOnFail = `ON-FAIL POLICIES
     depends on nothing, and nothing cascades to it.
 
     Every applied policy is a run.log event "on_fail_policy policy=<name>
-    step=<n> outcome=<done|not_done|blocked|error|interrupted>"; the final
-    status and reason are in STATUS.md. --dry-run applies no policy and
-    changes no status.
+    step=<n> outcome=<done|not_done|blocked|split|no_op|error|interrupted>";
+    the final status and reason are in STATUS.md. --dry-run applies no
+    policy, calls no agent for it, writes no spec and changes no status.
 
 `
 
@@ -482,7 +503,8 @@ FILES
         PAUSED, DONE, FAILED or BLOCKED. A BLOCKED or PAUSED row (and a
         task FAILED by its budget) carries its reason in the Status cell
         ("BLOCKED: <reason>": a merge conflict, the --on-fail policies that
-        were applied, or the blocked task it depends on); so does a DONE
+        were applied, the specs --on-fail split cut the task into, or the
+        blocked task it depends on); so does a DONE
         row whose --on-task-done hook failed ("DONE: on-task-done hook 1
         failed (exit 2)") or that an escalated round finished.
 
@@ -497,7 +519,9 @@ FILES
         <!-- diadoche: no-tests --> in the spec marks a task that needs no
         tests (see RED-GREEN CHECK). An optional line
         Depends-on: NNN[, NNN...] names the tasks it depends on: when one
-        of them is BLOCKED, so is this one (see ON-FAIL POLICIES).
+        of them is BLOCKED, so is this one (see ON-FAIL POLICIES). A line
+        Split-from: <spec>, written by diadoche on the specs --on-fail
+        split creates, queues the spec at that original spec's position.
 
     <project>/.claude/agents/<name>.md
         Optional per-project override of a built-in agent's prompt/model
@@ -522,10 +546,11 @@ FILES
         their diff --stat, the last review, and how to restore them.
 
     <project>/.claude/diadoche/spec/NNN_BLOCKED.md
-        Written when --on-fail block BLOCKED a task: the reason, the
-        policies applied and their outcomes, the last review, where the
-        changes are (worktree and branch, or the parked branch), the tasks
-        blocked along with it, and how to resume.
+        Written when --on-fail block or split BLOCKED a task: the reason,
+        the policies applied and their outcomes, the last review (for a
+        split: every review and the new specs), where the changes are
+        (worktree and branch, or the parked branch), the tasks blocked
+        along with it, and how to resume.
 
     <project>/.claude/diadoche/worktrees/<NNN>-<slug>/
         With --worktree, the git worktree a task runs in (branch
@@ -584,6 +609,9 @@ const helpExamples = `EXAMPLES
 
     Escalate a task that ran out of iterations to Opus, then block it:
         diadoche --dir /path/to/project --on-fail escalate,block --escalation-model claude-opus-5-5
+
+    Escalate an exhausted task, then cut it into smaller tasks, then block it:
+        diadoche --dir /path/to/project --on-fail escalate,split,block
 
     Fail exhausted tasks right away, as before --on-fail existed:
         diadoche --dir /path/to/project --on-fail ""

@@ -17,6 +17,10 @@ func TestParse(t *testing.T) {
 		{"block", []string{Block}},
 		{"escalate", []string{Escalate}},
 		{" escalate , block ", []string{Escalate, Block}},
+		{"split", []string{Split}},
+		{"split,block", []string{Split, Block}},
+		{"escalate,split,block", []string{Escalate, Split, Block}},
+		{"split,escalate", []string{Split, Escalate}},
 	}
 	for _, c := range cases {
 		got, err := Parse(c.in)
@@ -35,12 +39,14 @@ func TestParseErrors(t *testing.T) {
 		in       string
 		contains []string
 	}{
-		{"bogus", []string{`"bogus"`, "accepted: escalate, block"}},
+		{"bogus", []string{`"bogus"`, "accepted: escalate, split, block"}},
 		{"escalate,bogus", []string{`"bogus"`, "escalate", "block"}},
 		{"escalate,,block", []string{"empty"}},
 		{"escalate,escalate", []string{"more than once"}},
 		{"block,escalate", []string{"last"}},
 		{"block,block", []string{"more than once"}},
+		{"block,split", []string{"last"}},
+		{"split,split", []string{"more than once"}},
 	}
 	for _, c := range cases {
 		_, err := Parse(c.in)
@@ -56,15 +62,15 @@ func TestParseErrors(t *testing.T) {
 	}
 }
 
-func TestDefaultChainParsesToEveryName(t *testing.T) {
+func TestDefaultChainIsEscalateBlock(t *testing.T) {
 	got, err := Parse(DefaultChain)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(got, Names) {
-		t.Errorf("default chain %v, names %v", got, Names)
+	if !slices.Equal(got, []string{Escalate, Block}) {
+		t.Errorf("default chain %v, want escalate,block", got)
 	}
-	if !IsTerminal(Block) || IsTerminal(Escalate) {
+	if !IsTerminal(Block) || IsTerminal(Escalate) || IsTerminal(Split) {
 		t.Error("only block is terminal")
 	}
 }

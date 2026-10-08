@@ -323,12 +323,13 @@ func taskID(specFile, num string) string {
 	return num + "-" + slug
 }
 
-// failedBranchPrefix and blockedBranchPrefix prefix the branches a FAILED
-// task's changes and, with --worktree=false, a BLOCKED task's changes are
-// parked on.
+// failedBranchPrefix, blockedBranchPrefix and splitBranchPrefix prefix the
+// branches a FAILED task's changes, with --worktree=false a BLOCKED task's
+// changes, and a task split by --on-fail split's changes are parked on.
 const (
 	failedBranchPrefix  = "diadoche/failed/"
 	blockedBranchPrefix = "diadoche/blocked/"
+	splitBranchPrefix   = "diadoche/split/"
 )
 
 // failedBranchName returns diadoche/failed/<num>-<slug>, see

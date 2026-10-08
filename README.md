@@ -122,8 +122,9 @@ Flags:
   process group, once it runs longer than this (default `5m`).
 - `--on-fail <list>` — comma-separated, ordered policies applied once a
   task's `--ITER` iterations run out without DONE (default
-  `escalate,block`); `--on-fail ""` marks the task FAILED and parks its
-  changes, as before. See "Failure policy" below.
+  `escalate,block`; policies: `escalate`, `split`, `block`);
+  `--on-fail ""` marks the task FAILED and parks its changes, as before.
+  See "Failure policy" below.
 - `--escalation-model <name>` — model of planner and worker in the
   escalated iteration (else `DIADOCHE_ESCALATION_MODEL`, else
   `claude-fable-5-1`); validated at startup.
@@ -172,6 +173,21 @@ still leave it pending.
   budgets; its plan, review, artifacts and `usage.jsonl` lines are recorded
   as usual, and `run.log` marks it (`escalation_start`, `escalated=true`).
   DONE finishes the task normally (commit/merge, hooks) and ends the chain.
+- `split` — the preprocessor agent (on `--preprocessor-model`) gets the
+  task's spec and every review of it (`NNN_REVIEW_*.md`) and cuts it into
+  2–4 smaller, self-contained tasks that together cover the whole spec. The
+  new specs are numbered after the highest existing number, get a
+  `Split-from: <original spec>` line and are QUEUED to run next, in place
+  of the original and ahead of everything queued behind it. The original
+  becomes `BLOCKED: split into <specs> …` — terminal, never re-queued, and
+  its dependents are not blocked; its changes are parked on
+  `diadoche/split/<NNN>-<slug>` (with `--worktree` the worktree is removed
+  and its branch renamed to that), so the new tasks start from a clean
+  base, and `spec/NNN_BLOCKED.md` says where they are. The call is logged
+  and recorded in `usage.jsonl` like any agent call. If it fails or yields
+  fewer than two new specs, `split` is a no-op (`outcome=no_op`, its files
+  removed) and the next policy runs: `escalate,split,block` still ends in
+  `block`.
 - `block` — the task becomes `BLOCKED: <reason>` in `STATUS.md`, naming
   the policies applied. With `--worktree` its changes are committed on its
   branch and the worktree and branch are kept (like a merge conflict); with
@@ -186,7 +202,7 @@ depends on it (transitively) is BLOCKED too, with the reason
 `depends on <spec>, which is BLOCKED`; a spec without the line depends on
 nothing. Every applied policy is a `run.log` event
 `on_fail_policy policy=<name> step=<n> outcome=<...>`. `--dry-run` applies
-no policy.
+no policy, calls no agent for it and writes no spec.
 
 ## Preprocessor (`--preprocess`)
 

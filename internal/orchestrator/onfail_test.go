@@ -30,15 +30,30 @@ type escCall struct {
 // escalationRunner is a fake claude for the --on-fail tests. It works on
 // whichever task is IN_PROGRESS: planner writes a valid plan, worker
 // writes edit.txt (with a counter) in its work dir, tester writes the
-// review its prompt asks for. Tester marks the task DONE only when the
-// last worker call ran on approveModel, or when approve lists the spec.
+// review its prompt asks for (naming the review file). Tester marks the
+// task DONE only when the last worker call ran on approveModel, or when
+// approve lists the spec. The preprocessor (--on-fail split) writes
+// splitFiles into the spec directory, then fails with splitErr if set.
 type escalationRunner struct {
 	layout          specs.Layout
 	approveModel    string
 	approve         map[string]bool
 	calls           []escCall
 	lastWorkerModel string
+
+	splitFiles []splitFile
+	splitErr   error
+
+	// prompts are every prompt per agent; queueAtFirstCall and
+	// editAtFirstCall are QUEUE.md and the work dir's edit.txt at the
+	// first call made for each spec.
+	prompts          map[string][]string
+	queueAtFirstCall map[string][]string
+	editAtFirstCall  map[string]string
 }
+
+// splitFile is a spec file the fake preprocessor writes.
+type splitFile struct{ name, content string }
 
 var reviewPathRe = regexp.MustCompile(`(\d+_REVIEW_\d+\.md)`)
 
@@ -56,6 +71,16 @@ func (r *escalationRunner) Run(_ context.Context, dir string, a *agents.Agent, p
 	if spec == "" {
 		return agents.RunResult{}, fmt.Errorf("no task IN_PROGRESS")
 	}
+	if r.queueAtFirstCall == nil {
+		r.queueAtFirstCall, r.editAtFirstCall, r.prompts = map[string][]string{}, map[string]string{}, map[string][]string{}
+	}
+	if _, seen := r.queueAtFirstCall[spec]; !seen {
+		q, _ := specs.ReadQueue(r.layout.QueuePath)
+		r.queueAtFirstCall[spec] = q
+		b, _ := os.ReadFile(filepath.Join(dir, "edit.txt"))
+		r.editAtFirstCall[spec] = string(b)
+	}
+	r.prompts[a.Name] = append(r.prompts[a.Name], prompt)
 	r.calls = append(r.calls, escCall{agent: a.Name, model: a.Model, spec: spec})
 	num := specs.TaskNumber(spec)
 	result := agents.RunResult{Parsed: true, Stdout: a.Name + " on " + a.Model + "\n"}
@@ -70,12 +95,19 @@ func (r *escalationRunner) Run(_ context.Context, dir string, a *agents.Agent, p
 		if m == nil {
 			return result, fmt.Errorf("tester prompt names no review file")
 		}
-		if err = os.WriteFile(filepath.Join(r.layout.SpecDir, m[1]), []byte("review: not done yet\n"), 0o644); err != nil {
+		if err = os.WriteFile(filepath.Join(r.layout.SpecDir, m[1]), []byte("review "+m[1]+": not done yet\n"), 0o644); err != nil {
 			return result, err
 		}
 		if r.approve[spec] || (r.approveModel != "" && r.lastWorkerModel == r.approveModel) {
 			err = specs.SetStatus(r.layout, spec, specs.StatusDone)
 		}
+	case "preprocessor":
+		for _, f := range r.splitFiles {
+			if err := os.WriteFile(filepath.Join(r.layout.SpecDir, f.name), []byte(f.content), 0o644); err != nil {
+				return result, err
+			}
+		}
+		err = r.splitErr
 	}
 	return result, err
 }

@@ -1,7 +1,7 @@
 // Package onfail names diadoche's --on-fail policies: what happens to a
 // task whose --ITER iterations ran out without a DONE verdict. The policies
 // form an ordered chain, applied one after another until one of them ends
-// the task (DONE or BLOCKED); a chain that runs out leaves the task FAILED,
+// the task (DONE, BLOCKED, or split into smaller tasks); a chain that runs out leaves the task FAILED,
 // as an empty chain always does.
 //
 // The package only knows the names and parses the flag, so config and the
@@ -21,6 +21,11 @@ const (
 	// Escalate runs one more complete planner -> worker -> tester cycle,
 	// with planner and worker on the escalation model.
 	Escalate = "escalate"
+	// Split calls the preprocessor agent with the task's spec and every
+	// review of it to cut the task into 2–4 smaller tasks, queued in its
+	// place; the original becomes BLOCKED. A call that fails or yields
+	// fewer than two new specs hands the task on to the next policy.
+	Split = "split"
 	// Block marks the task BLOCKED, keeps its changes and blocks every task
 	// that declares a dependency on it. Terminal: nothing may follow it.
 	Block = "block"
@@ -28,7 +33,7 @@ const (
 
 // Names are the accepted policy names, in the order shown in errors and
 // help.
-var Names = []string{Escalate, Block}
+var Names = []string{Escalate, Split, Block}
 
 // DefaultChain is --on-fail's default value.
 const DefaultChain = Escalate + "," + Block

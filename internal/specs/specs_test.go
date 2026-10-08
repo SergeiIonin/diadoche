@@ -620,3 +620,175 @@ func TestBlockDependentsWithoutDependantsWritesNothing(t *testing.T) {
 		t.Error("STATUS.md was rewritten although nothing changed")
 	}
 }
+
+func TestParseSplitFrom(t *testing.T) {
+	cases := map[string]string{
+		"# T\n\nSplit-from: 001_x.md\n":                     "001_x.md",
+		"# T\n  split-FROM:   `001_x.md`  \n":               "001_x.md",
+		"# T\nSplit-from: 001_a.md\nSplit-from: 002_b.md\n": "001_a.md",
+		"# T\nno line here\n":                               "",
+		"":                                                  "",
+	}
+	for in, want := range cases {
+		if got := ParseSplitFrom([]byte(in)); got != want {
+			t.Errorf("ParseSplitFrom(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestAppendSplitFrom(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "004_a.md")
+	writeSpec(t, p, "# A")
+	if err := AppendSplitFrom(p, "001_x.md"); err != nil {
+		t.Fatal(err)
+	}
+	if err := AppendSplitFrom(p, "002_y.md"); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(p)
+	if string(b) != "# A\n\nSplit-from: 001_x.md\n" {
+		t.Errorf("content = %q", b)
+	}
+}
+
+func writeSpec(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// splitLayout has 001_x.md BLOCKED, 002/003 QUEUED, and 004–006 split
+// from 001_x.md, not in STATUS.md yet.
+func splitLayout(t *testing.T) Layout {
+	t.Helper()
+	l := NewLayout(t.TempDir())
+	if err := l.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"001_x.md", "002_two.md", "003_three.md"} {
+		writeSpec(t, filepath.Join(l.SpecDir, f), "# "+f+"\n")
+	}
+	for _, f := range []string{"004_a.md", "005_b.md", "006_c.md"} {
+		writeSpec(t, filepath.Join(l.SpecDir, f), "# "+f+"\n\nSplit-from: 001_x.md\n")
+	}
+	if err := WriteStatus(l.StatusPath, []Row{
+		{Num: "001", Spec: "001_x.md", Status: StatusBlocked, Reason: "split"},
+		{Num: "002", Spec: "002_two.md", Status: StatusQueued},
+		{Num: "003", Spec: "003_three.md", Status: StatusQueued},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return l
+}
+
+func TestSyncPlacesSplitSpecsAtParentPosition(t *testing.T) {
+	l := splitLayout(t)
+	_, queue, err := Sync(l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"004_a.md", "005_b.md", "006_c.md", "002_two.md", "003_three.md"}
+	if strings.Join(queue, ",") != strings.Join(want, ",") {
+		t.Errorf("queue = %v, want %v", queue, want)
+	}
+	if got, _ := PendingQueue(l); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("PendingQueue = %v, want %v", got, want)
+	}
+
+	// 005 split again, into 007 and 008: they take 005's place.
+	writeSpec(t, filepath.Join(l.SpecDir, "007_b1.md"), "# b1\n\nSplit-from: 005_b.md\n")
+	writeSpec(t, filepath.Join(l.SpecDir, "008_b2.md"), "# b2\n\nSplit-from: 005_b.md\n")
+	if err := SetStatusReason(l, "005_b.md", StatusBlocked, "split"); err != nil {
+		t.Fatal(err)
+	}
+	_, queue, err = Sync(l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = []string{"004_a.md", "007_b1.md", "008_b2.md", "006_c.md", "002_two.md", "003_three.md"}
+	if strings.Join(queue, ",") != strings.Join(want, ",") {
+		t.Errorf("nested queue = %v, want %v", queue, want)
+	}
+}
+
+func TestSyncSurvivesSplitFromCycle(t *testing.T) {
+	l := NewLayout(t.TempDir())
+	if err := l.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	writeSpec(t, filepath.Join(l.SpecDir, "001_a.md"), "Split-from: 002_b.md\n")
+	writeSpec(t, filepath.Join(l.SpecDir, "002_b.md"), "Split-from: 001_a.md\n")
+	writeSpec(t, filepath.Join(l.SpecDir, "003_c.md"), "Split-from: 003_c.md\n")
+	_, queue, err := Sync(l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(queue) != 3 {
+		t.Errorf("queue = %v, want all three specs", queue)
+	}
+}
+
+func TestApplySplit(t *testing.T) {
+	l := NewLayout(t.TempDir())
+	if err := l.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"001_x.md", "002_two.md", "003_three.md"} {
+		writeSpec(t, filepath.Join(l.SpecDir, f), "# "+f+"\n")
+	}
+	if err := WriteStatus(l.StatusPath, []Row{
+		{Num: "001", Spec: "001_x.md", Status: StatusInProgress},
+		{Num: "002", Spec: "002_two.md", Status: StatusQueued},
+		{Num: "003", Spec: "003_three.md", Status: StatusQueued},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteQueue(l.QueuePath, []string{"002_two.md", "003_three.md"}); err != nil {
+		t.Fatal(err)
+	}
+	parts := []string{"004_a.md", "005_b.md", "006_c.md"}
+	for _, f := range parts {
+		writeSpec(t, filepath.Join(l.SpecDir, f), "# "+f+"\n\nSplit-from: 001_x.md\n")
+	}
+
+	queue, err := ApplySplit(l, "001_x.md", "split into 004_a.md, 005_b.md, 006_c.md", parts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantQueue := "004_a.md,005_b.md,006_c.md,002_two.md,003_three.md"
+	if strings.Join(queue, ",") != wantQueue {
+		t.Errorf("queue = %v", queue)
+	}
+	rows, _ := ReadStatus(l.StatusPath)
+	var got []string
+	for _, r := range rows {
+		got = append(got, r.Spec+"="+r.Status)
+	}
+	wantRows := "001_x.md=BLOCKED,004_a.md=QUEUED,005_b.md=QUEUED,006_c.md=QUEUED,002_two.md=QUEUED,003_three.md=QUEUED"
+	if strings.Join(got, ",") != wantRows {
+		t.Errorf("STATUS.md rows = %v, want %s", got, wantRows)
+	}
+	if rows[0].Reason != "split into 004_a.md, 005_b.md, 006_c.md" {
+		t.Errorf("reason = %q", rows[0].Reason)
+	}
+	q, _ := ReadQueue(l.QueuePath)
+	if strings.Join(q, ",") != wantQueue {
+		t.Errorf("QUEUE.md = %v", q)
+	}
+
+	status1, _ := os.ReadFile(l.StatusPath)
+	queue1, _ := os.ReadFile(l.QueuePath)
+	if _, _, err := Sync(l); err != nil {
+		t.Fatal(err)
+	}
+	status2, _ := os.ReadFile(l.StatusPath)
+	queue2, _ := os.ReadFile(l.QueuePath)
+	if string(status1) != string(status2) || string(queue1) != string(queue2) {
+		t.Errorf("Sync changed what ApplySplit wrote:\n%s\n%s\nvs\n%s\n%s", status1, queue1, status2, queue2)
+	}
+
+	if _, err := ApplySplit(l, "009_missing.md", "x", nil); err == nil {
+		t.Error("ApplySplit of a spec missing from STATUS.md: no error")
+	}
+}
