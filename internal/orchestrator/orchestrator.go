@@ -35,8 +35,14 @@
 // Writing them is best effort: a failure is a warning, never the end of
 // the run.
 //
+// After a DONE task is merged (or committed in place), the --on-task-done
+// hooks run (see hooks.go): diadoche's one extension point for the moment a
+// task is genuinely finished. A failing hook is a warning, never a task or
+// run failure.
+//
 // --dry-run never changes state: it walks the queue read-only and prints
-// the prompts each agent would get (see dryrun.go).
+// the prompts each agent would get, and the hooks it would run (see
+// dryrun.go).
 package orchestrator
 
 import (
@@ -451,14 +457,24 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 			if ws != nil {
 				ws.removeBaseFile()
 			}
-			err = o.commitDone(ctx, specFile)
+			var landed string
+			landed, err = o.commitDone(ctx, specFile)
+			if ws != nil {
+				ws.mergeCommit = landed
+			}
 		}
 		// finishDoneWorktree turns a task whose merge failed BLOCKED.
 		status, serr := specs.GetStatus(o.Layout, specFile)
 		if serr != nil || status == "" {
 			status = specs.StatusDone
 		}
-		taskEnd(status, "")
+		reason := ""
+		if err == nil && serr == nil && status == specs.StatusDone && ws != nil && !o.offline() && len(o.Cfg.OnTaskDone) > 0 {
+			if o.runTaskDoneHooks(ctx, specFile, num, ws) {
+				reason = "on_task_done_failed"
+			}
+		}
+		taskEnd(status, reason)
 		return err
 	}
 	if cause == nil {
@@ -947,16 +963,22 @@ func lastCompletedIteration(specDir, num string, maxIter int) int {
 // task that just turned DONE, so completed work is captured as its own git
 // commit. A no-op in --dry-run mode, and a no-op if there's nothing to
 // commit (e.g. the task only involved discussion, no file changes).
-func (o *Orchestrator) commitDone(ctx context.Context, specFile string) error {
+// landed is HEAD afterwards: the commit the task's changes landed as.
+func (o *Orchestrator) commitDone(ctx context.Context, specFile string) (landed string, err error) {
 	if o.offline() {
 		o.Log.Printf("[dry-run] would commit: task %s done", specFile)
-		return nil
+		return "", nil
 	}
 	msg := fmt.Sprintf("diadoche: complete %s", specFile)
 	if err := gitutil.CommitAll(ctx, o.Cfg.Dir, msg); err != nil {
-		return fmt.Errorf("commit %s: %w", specFile, err)
+		return "", fmt.Errorf("commit %s: %w", specFile, err)
 	}
 	o.Log.Printf("task %s: committed", specFile)
 	o.event(specFile, 0, "", "commit")
-	return nil
+	landed, err = gitutil.BaseCommit(ctx, o.Cfg.Dir)
+	if err != nil {
+		o.Log.Printf("warning: task %s: couldn't read the commit it landed as: %v", specFile, err)
+		return "", nil
+	}
+	return landed, nil
 }

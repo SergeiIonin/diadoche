@@ -4,6 +4,6 @@ package agents
 
 import "os/exec"
 
-// configureProcessGroup is a no-op without Unix process groups: a
-// cancelled call kills only the claude process itself.
-func configureProcessGroup(*exec.Cmd) {}
+// ConfigureProcessGroup is a no-op without Unix process groups: a
+// cancelled call (or --on-task-done hook) kills only the process itself.
+func ConfigureProcessGroup(*exec.Cmd) {}

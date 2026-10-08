@@ -114,7 +114,39 @@ Flags:
 - `--shutdown-timeout` — on SIGINT/SIGTERM, wait this long for the running
   agent call to finish before killing it (default `2m`); a second signal
   exits immediately.
+- `--on-task-done <command>` — run a shell command after a task is DONE and
+  its changes are merged into (or, with `--worktree=false`, committed on)
+  the branch the run started on; repeatable, the commands run in the order
+  given. See "On-task-done hooks" below.
+- `--hook-timeout` — kill an `--on-task-done` command, together with its
+  process group, once it runs longer than this (default `5m`).
 - `-h` / `-help` / `--help` — print the full man-page-style help and exit.
+
+## On-task-done hooks (`--on-task-done`)
+
+`--on-task-done '<command>'` is the extension point for the moment a task
+is genuinely finished: notifications, docs, external bookkeeping. It runs
+only for a task that is DONE **and** merged — never for a FAILED, parked or
+BLOCKED task, or one whose merge failed; `--dry-run` only lists the
+commands it would run. Each command runs as `sh -c '<command>'` in the
+repository root (so `--on-task-done 'make docs && git add -A'` works), with
+these variables on top of diadoche's environment, always set:
+
+- `DIADOCHE_TASK_ID` — `<NNN>-<slug>`;
+- `DIADOCHE_TASK_TITLE` — the task's heading (its commit title);
+- `DIADOCHE_REPO_ROOT` — absolute path of the repository root;
+- `DIADOCHE_BASE_COMMIT` — the commit the task started from;
+- `DIADOCHE_MERGE_COMMIT` — the commit its changes landed as;
+- `DIADOCHE_DECISIONS_FILE` — absolute path of the task's `decisions.json`,
+  or empty when there is none.
+
+A non-zero exit or a timeout (`--hook-timeout`) is only a warning: it is
+logged, written to `run.log`, and the task's `STATUS.md` row stays DONE with
+a reason (`DONE: on-task-done hook 1 failed (exit 2)`); the run goes on.
+Each command's output is kept as `on-task-done-<N>.stdout`/`.stderr` in the
+task's run directory (at most 1 MiB each). Changes the hooks leave in the
+repository (outside `.claude/diadoche`) are committed as
+`diadoche: on-task-done for <NNN>-<slug>`; no changes, no commit.
 
 ## Preprocessor (`--preprocess`)
 

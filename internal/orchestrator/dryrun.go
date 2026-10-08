@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"strings"
 
 	"diadoche/internal/agents"
+	"diadoche/internal/config"
 	"diadoche/internal/specs"
 )
 
@@ -20,7 +22,8 @@ import (
 // It changes nothing: no STATUS.md, QUEUE.md or spec/ file is written (not
 // even the spec directory or its lock), no usage.jsonl, run-state.json or
 // run artifacts, and git is never touched. No status changes, no plan
-// validation, no failure counting.
+// validation, no failure counting. The --on-task-done hooks are only
+// listed per task, never run.
 func (o *Orchestrator) dryRun(ctx context.Context) error {
 	planner, worker, tester, err := o.loadAgents()
 	if err != nil {
@@ -39,6 +42,9 @@ func (o *Orchestrator) dryRun(ctx context.Context) error {
 	if o.Cfg.Worktree {
 		o.Log.Printf("dry-run: a real run would run each task in its own git worktree under %s; the dry run shows %s as the work dir",
 			o.relPath(filepath.Join(o.Layout.Root, worktreesDirName)), o.Cfg.Dir)
+	}
+	if len(o.Cfg.OnTaskDone) > 0 {
+		o.Log.Printf("dry-run: on-task-done hooks: %d, timeout %s each", len(o.Cfg.OnTaskDone), cmp.Or(o.Cfg.HookTimeout, config.DefaultHookTimeout))
 	}
 
 	for _, specFile := range queue {
@@ -73,6 +79,9 @@ func (o *Orchestrator) dryRun(ctx context.Context) error {
 			if _, err := o.Runner.Run(ctx, o.Cfg.Dir, c.agent, c.prompt); err != nil {
 				return fmt.Errorf("dry-run: %s for %s: %w", c.agent.Name, specFile, err)
 			}
+		}
+		for i, command := range o.Cfg.OnTaskDone {
+			o.Log.Printf("[dry-run] once %s is DONE and merged, would run on-task-done hook %d: %s", taskID(specFile, num), i+1, command)
 		}
 	}
 

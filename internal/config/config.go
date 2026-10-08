@@ -30,7 +30,31 @@ const (
 	// DefaultShutdownTimeout is how long the first SIGINT/SIGTERM waits for
 	// the agent call in flight before killing it (--shutdown-timeout).
 	DefaultShutdownTimeout = 2 * time.Minute
+
+	// DefaultHookTimeout is how long one --on-task-done command may run
+	// before it is killed together with its process group (--hook-timeout).
+	DefaultHookTimeout = 5 * time.Minute
 )
+
+// StringList is a repeatable string flag (flag.Value): every occurrence
+// appends its value, so the values keep the order they were given in.
+type StringList []string
+
+func (l *StringList) String() string {
+	if l == nil {
+		return ""
+	}
+	return strings.Join(*l, ", ")
+}
+
+// Set appends v unchanged; an empty or whitespace-only v is an error.
+func (l *StringList) Set(v string) error {
+	if strings.TrimSpace(v) == "" {
+		return errors.New("empty command")
+	}
+	*l = append(*l, v)
+	return nil
+}
 
 // ErrHelp is returned by Parse when the user asked for help (-h, -help or
 // --help). The help text has already been printed to stdout by the time
@@ -54,6 +78,7 @@ const helpSynopsis = `SYNOPSIS
              [--stable-system-prompt=<bool>] [--worktree=<bool>]
              [--red-green=<bool>] [--test-globs <list>]
              [--fresh] [--shutdown-timeout <duration>]
+             [--on-task-done <command>]... [--hook-timeout <duration>]
     diadoche --preprocess --task <path> [--dir <path>] [--claude-bin <path>]
              [--preprocessor-model <name>]
     diadoche --initialize <project-path>
@@ -71,8 +96,9 @@ const helpDescription = `DESCRIPTION
     of planner (writes an implementation plan) -> worker (implements it) ->
     tester (reviews it and, once the task is genuinely done, marks it DONE
     in spec/STATUS.md). Once the tester marks a task DONE, diadoche commits
-    the changes (and, with --worktree, merges them; see WORKTREES below)
-    and moves on to the next task; if --ITER rounds run out
+    the changes (and, with --worktree, merges them; see WORKTREES below),
+    runs the --on-task-done hooks (see ON-TASK-DONE HOOKS) and moves on to
+    the next task; if --ITER rounds run out
     without a DONE verdict, diadoche itself marks the task FAILED. Once the
     queue drains, diadoche checks spec/ for new task files once more before
     exiting, so tasks added concurrently (e.g. by --preprocess) are picked
@@ -356,6 +382,38 @@ const helpShutdown = `SIGNALS AND RESTART STATE
 
 `
 
+const helpHooks = `ON-TASK-DONE HOOKS
+    --on-task-done <command> (repeatable) runs a command once a task is
+    DONE and its changes are merged into the branch the run started on
+    (with --worktree) or committed to it (--worktree=false). A task that
+    FAILED, was parked or BLOCKED, or whose merge failed runs no hook, and
+    --dry-run only lists the commands. Several --on-task-done flags run
+    their commands one after another, in the order given.
+
+    Each command runs as "sh -c <command>" in the repository root, e.g.
+    --on-task-done 'make docs && git add -A', with these variables added to
+    diadoche's environment (all of them always set):
+        DIADOCHE_TASK_ID         the task id, <NNN>-<slug>
+        DIADOCHE_TASK_TITLE      the task's heading (its commit title)
+        DIADOCHE_REPO_ROOT       absolute path of the repository root
+        DIADOCHE_BASE_COMMIT     the commit the task started from
+        DIADOCHE_MERGE_COMMIT    the commit its changes landed as on the
+                                 run's branch
+        DIADOCHE_DECISIONS_FILE  absolute path of the task's decisions.json
+                                 (worker's ## Decisions), empty when there
+                                 is none
+    A command still running after --hook-timeout (default 5m) is killed
+    together with its process group. A non-zero exit or a timeout is only a
+    warning: it is logged, written to run.log, and the task's STATUS.md row
+    stays DONE with a reason ("DONE: on-task-done hook 1 failed (exit 2)");
+    the run goes on. The output of the N-th command is kept as
+    on-task-done-<N>.stdout and .stderr in the task's run directory.
+    Changes the commands leave in the repository (outside .claude/diadoche)
+    are committed as "diadoche: on-task-done for <NNN>-<slug>"; nothing
+    changed, no commit.
+
+`
+
 const helpFlagsHeader = `FLAGS
 
 `
@@ -366,7 +424,8 @@ FILES
         Source of truth for every task's status: QUEUED, IN_PROGRESS,
         PAUSED, DONE, FAILED or BLOCKED. A BLOCKED or PAUSED row (and a
         task FAILED by its budget) carries its reason in the Status cell
-        ("BLOCKED: <reason>").
+        ("BLOCKED: <reason>"); so does a DONE row whose --on-task-done hook
+        failed ("DONE: on-task-done hook 1 failed (exit 2)").
 
     <project>/.claude/diadoche/spec/QUEUE.md
         This run's work queue, rebuilt from STATUS.md on every sync. A
@@ -419,8 +478,11 @@ FILES
         A task's artifacts: iter-<N>-IMPL_PLAN.md and iter-<N>-REVIEW.md
         (copies of each iteration's plan and review), iter-<N>-<agent>.stdout
         and .stderr (raw output of each agent call; a retry after a limit
-        pause adds -2, -3...), and final.diff (the task's changes against
-        its base commit, written whatever its outcome).
+        pause adds -2, -3...), final.diff (the task's changes against
+        its base commit, written whatever its outcome), decisions.json (a
+        DONE task's ## Decisions, as JSON) and on-task-done-<N>.stdout and
+        .stderr (output of the N-th --on-task-done hook, capped at 1 MiB
+        each).
 
     <project>/.claude/diadoche/run-state.json
         Where the run is (see SIGNALS AND RESTART STATE): run_id, task
@@ -452,6 +514,9 @@ const helpExamples = `EXAMPLES
     Save cost by running worker on a cheaper model:
         diadoche --dir /path/to/project --worker-model claude-sonnet-5-5
         DIADOCHE_WORKER_MODEL=claude-sonnet-5-5 diadoche --dir /path/to/project
+
+    Regenerate the docs after every finished task (committed separately):
+        diadoche --dir /path/to/project --on-task-done 'make docs'
 
     Keep going across claude usage-limit windows (restarts diadoche when
     the window reopens; see diadoche-restarter --help):
@@ -551,6 +616,14 @@ type Config struct {
 	// agent call in flight to finish before killing it; a second signal
 	// doesn't wait. 0 kills it at once. See DefaultShutdownTimeout.
 	ShutdownTimeout time.Duration
+
+	// OnTaskDone are the --on-task-done shell commands, in the order given,
+	// run after a task is DONE and merged; nil when none.
+	OnTaskDone []string
+
+	// HookTimeout kills an --on-task-done command (and its process group)
+	// that runs longer than this; see DefaultHookTimeout.
+	HookTimeout time.Duration
 }
 
 // TaskPath resolves --task relative to --dir, unless it's already absolute.
@@ -592,6 +665,9 @@ func Parse(args []string) (*Config, error) {
 	maxCostPerTask := fs.Float64("max-cost-per-task", 0, "fail the task once the total recorded cost of the task in usage.jsonl, previous runs included, exceeds this many USD; checked after each agent call (0 = no limit)")
 	fresh := fs.Bool("fresh", false, "ignore the saved .claude/diadoche/run-state.json and start from the head of the queue (the file is rewritten from scratch)")
 	shutdownTimeout := fs.Duration("shutdown-timeout", DefaultShutdownTimeout, "on SIGINT/SIGTERM, wait this long for the running agent call to finish before killing it; a second signal exits immediately")
+	var onTaskDone StringList
+	fs.Var(&onTaskDone, "on-task-done", "run this shell command (sh -c) in the repository root after a task is DONE and merged; repeatable, run in the order given; a failure is only a warning")
+	hookTimeout := fs.Duration("hook-timeout", DefaultHookTimeout, "kill an --on-task-done command (and its process group) that runs longer than this")
 	maxCostPerRun := fs.Float64("max-cost-per-run", 0, "stop the run after the current agent call once this run's recorded cost exceeds this many USD; the current task stays pending and diadoche exits non-zero (0 = no limit)")
 
 	if err := fs.Parse(args); err != nil {
@@ -651,6 +727,9 @@ func Parse(args []string) (*Config, error) {
 	if *shutdownTimeout < 0 {
 		return nil, fmt.Errorf("--shutdown-timeout must be >= 0, got %s", *shutdownTimeout)
 	}
+	if *hookTimeout <= 0 {
+		return nil, fmt.Errorf("--hook-timeout must be > 0, got %s", *hookTimeout)
+	}
 
 	globs := splitCSV(*testGlobs)
 	if err := redgreen.ValidateGlobs(globs); err != nil {
@@ -699,6 +778,8 @@ func Parse(args []string) (*Config, error) {
 		TestGlobs:          globs,
 		Fresh:              *fresh,
 		ShutdownTimeout:    *shutdownTimeout,
+		OnTaskDone:         []string(onTaskDone),
+		HookTimeout:        *hookTimeout,
 	}, nil
 }
 
@@ -741,6 +822,7 @@ func printHelp(fs *flag.FlagSet, w io.Writer) {
 	fmt.Fprint(w, helpCallBudget)
 	fmt.Fprint(w, helpUsageLimits)
 	fmt.Fprint(w, helpShutdown)
+	fmt.Fprint(w, helpHooks)
 	fmt.Fprint(w, helpFlagsHeader)
 	fs.SetOutput(w)
 	fs.PrintDefaults()

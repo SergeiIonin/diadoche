@@ -6,9 +6,11 @@
 //	.claude/diadoche/runs/<run-id>/<NNN>-<slug>/iter-<N>-<agent>.stdout|.stderr
 //	.claude/diadoche/runs/<run-id>/<NNN>-<slug>/final.diff
 //	.claude/diadoche/runs/<run-id>/<NNN>-<slug>/decisions.json
+//	.claude/diadoche/runs/<run-id>/<NNN>-<slug>/on-task-done-<N>.stdout|.stderr
 //
 // decisions.json is written by the orchestrator for DONE tasks only (see
-// package decisions).
+// package decisions); on-task-done-<N>.stdout/.stderr hold the output of
+// the N-th --on-task-done hook, run for DONE, merged tasks only.
 //
 // <run-id> is the run's start time as 20060102-150405, with a -2, -3...
 // suffix when that directory already exists. run.log holds one line per

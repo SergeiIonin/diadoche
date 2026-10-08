@@ -258,3 +258,32 @@ func TestPromptsIncludeReviewFeedbackOnlyWhenGiven(t *testing.T) {
 		t.Errorf("worker prompt lacks the review:\n%s", p)
 	}
 }
+
+func TestDryRunListsOnTaskDoneHooksWithoutRunningThem(t *testing.T) {
+	dir, layout := dryRunRepo(t)
+	marker := filepath.Join(t.TempDir(), "ran")
+	filesBefore, gitBefore := treeSnapshot(t, dir), gitSnapshot(t, dir)
+
+	var buf bytes.Buffer
+	logger := log.New(&buf, "", 0)
+	o := newDryRunOrchestrator(dir, layout, agents.DryRunRunner{Log: logger}, logger)
+	o.Cfg.OnTaskDone = []string{"touch " + marker, "echo second"}
+	if err := o.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	for _, want := range []string{
+		"once 001-a is DONE and merged, would run on-task-done hook 1: touch " + marker,
+		"once 001-a is DONE and merged, would run on-task-done hook 2: echo second",
+		"once 002-b is DONE and merged, would run on-task-done hook 1: touch " + marker,
+	} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("dry-run log lacks %q:\n%s", want, buf.String())
+		}
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Errorf("--dry-run ran a hook (stat err = %v)", err)
+	}
+	diffSnapshots(t, "files", filesBefore, treeSnapshot(t, dir))
+	diffSnapshots(t, "git", gitBefore, gitSnapshot(t, dir))
+}

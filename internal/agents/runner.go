@@ -157,7 +157,7 @@ func (r CLIRunner) Run(ctx context.Context, workDir string, a *Agent, prompt str
 
 	cmd := exec.CommandContext(callCtx, bin, args...)
 	cmd.Dir = workDir
-	configureProcessGroup(cmd)
+	ConfigureProcessGroup(cmd)
 	// A grandchild that outlives a killed claude may still hold its
 	// stdout/stderr pipes open; don't let that block Wait.
 	cmd.WaitDelay = callWaitDelay

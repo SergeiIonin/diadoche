@@ -477,3 +477,62 @@ func TestParseHelpMentionsRestartState(t *testing.T) {
 		}
 	}
 }
+
+func TestParseOnTaskDoneRepeatableInOrder(t *testing.T) {
+	cfg, err := Parse(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.OnTaskDone) != 0 {
+		t.Errorf("OnTaskDone = %q, want none by default", cfg.OnTaskDone)
+	}
+	cfg, err = Parse([]string{"--on-task-done", "echo a", "--on-task-done", "make docs && git add -A"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"echo a", "make docs && git add -A"}
+	if len(cfg.OnTaskDone) != len(want) || cfg.OnTaskDone[0] != want[0] || cfg.OnTaskDone[1] != want[1] {
+		t.Errorf("OnTaskDone = %q, want %q", cfg.OnTaskDone, want)
+	}
+}
+
+func TestParseOnTaskDoneRejectsEmpty(t *testing.T) {
+	if _, err := Parse([]string{"--on-task-done", " "}); err == nil {
+		t.Error("an empty --on-task-done command should be a startup error")
+	}
+}
+
+func TestParseHookTimeout(t *testing.T) {
+	cfg, err := Parse(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.HookTimeout != DefaultHookTimeout || DefaultHookTimeout != 5*time.Minute {
+		t.Errorf("HookTimeout = %s, want the 5m default", cfg.HookTimeout)
+	}
+	cfg, err = Parse([]string{"--hook-timeout", "30s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.HookTimeout != 30*time.Second {
+		t.Errorf("HookTimeout = %s, want 30s", cfg.HookTimeout)
+	}
+	for _, bad := range []string{"0", "-1s"} {
+		if _, err := Parse([]string{"--hook-timeout", bad}); err == nil {
+			t.Errorf("--hook-timeout %s should be a startup error", bad)
+		}
+	}
+}
+
+func TestParseHelpMentionsOnTaskDoneHooks(t *testing.T) {
+	out := captureStdout(t, func() {
+		_, _ = Parse([]string{"--help"})
+	})
+	for _, want := range []string{"--on-task-done", "--hook-timeout", "ON-TASK-DONE HOOKS", "DIADOCHE_TASK_ID",
+		"DIADOCHE_TASK_TITLE", "DIADOCHE_REPO_ROOT", "DIADOCHE_BASE_COMMIT", "DIADOCHE_MERGE_COMMIT",
+		"DIADOCHE_DECISIONS_FILE", "on-task-done-<N>.stdout"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("help output missing %q", want)
+		}
+	}
+}

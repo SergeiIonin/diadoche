@@ -56,6 +56,11 @@ type workspace struct {
 	// started under --allow-dirty. They belong to someone else, so parking
 	// leaves them alone.
 	preexisting map[string]bool
+
+	// mergeCommit is the commit a DONE task's changes landed as on the
+	// run's branch (the merge or fast-forward tip, or the in-place commit).
+	// Set by finishDoneWorktree/commitDone, read by the on-task-done hooks.
+	mergeCommit string
 }
 
 func (w *workspace) removeBaseFile() { _ = os.Remove(w.baseFile) }

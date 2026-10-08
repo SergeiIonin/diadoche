@@ -172,6 +172,12 @@ func (o *Orchestrator) finishDoneWorktree(ctx context.Context, specFile string, 
 		o.Log.Printf("task %s: no code changes to merge", specFile)
 		o.event(specFile, 0, "", "merge", runlog.F("branch", ws.branch), runlog.F("how", "none"))
 	}
+	// Read before commitBookkeeping adds its own commit on top.
+	if head, err := gitutil.BaseCommit(ctx, o.Cfg.Dir); err != nil {
+		o.Log.Printf("warning: task %s: couldn't read the merge commit: %v", specFile, err)
+	} else {
+		ws.mergeCommit = head
+	}
 
 	if err := gitutil.WorktreeRemove(ctx, o.Cfg.Dir, ws.dir); err != nil {
 		return &fatalError{fmt.Errorf("task %s: remove worktree: %w", specFile, err)}
