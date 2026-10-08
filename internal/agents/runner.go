@@ -81,7 +81,14 @@ type Runner interface {
 // CLIRunner shells out to the claude CLI, one independent process per call:
 //
 //	claude --dangerously-skip-permissions --model <model> \
-//	    --append-system-prompt <role prompt> --output-format json -p <task prompt>
+//	    [--exclude-dynamic-system-prompt-sections] \
+//	    --append-system-prompt <shared prefix> \
+//	    --output-format json -p <role prompt + task prompt>
+//
+// The system prompt holds only the run's shared prefix, so it is identical
+// for every role and the API's prompt cache can serve it to the next agent
+// (see Assemble and docs/prompt-caching.md); everything role- or
+// task-specific goes to -p.
 //
 // --output-format json is what makes usage/cost accounting (RunResult.Usage,
 // TotalCostUSD) possible, and carries the agent's text answer in the result
@@ -89,6 +96,15 @@ type Runner interface {
 // captured as-is for error messages and as a fallback output.
 type CLIRunner struct {
 	Bin string // defaults to "claude"
+
+	// ExcludeDynamicSystemPromptSections passes claude's
+	// --exclude-dynamic-system-prompt-sections, which moves per-machine
+	// sections (cwd, env info, memory paths, git status) out of the system
+	// prompt and into the first user message — without it those sections
+	// can differ between calls and spoil the cached prefix. Set from
+	// --stable-system-prompt, which exists to turn it back off for a
+	// claude CLI too old to know the flag.
+	ExcludeDynamicSystemPromptSections bool
 
 	// MaxCallDuration, when positive, kills the claude process if a single
 	// call runs longer than this (--max-call-minutes) — a runaway call
@@ -104,14 +120,19 @@ func (r CLIRunner) Run(ctx context.Context, workDir string, a *Agent, prompt str
 		bin = "claude"
 	}
 
+	p := Assemble(a, prompt)
+
 	args := []string{"--dangerously-skip-permissions"}
 	if a.Model != "" {
 		args = append(args, "--model", a.Model)
 	}
-	if a.SystemPrompt != "" {
-		args = append(args, "--append-system-prompt", a.SystemPrompt)
+	if r.ExcludeDynamicSystemPromptSections {
+		args = append(args, "--exclude-dynamic-system-prompt-sections")
 	}
-	args = append(args, "--output-format", "json", "-p", prompt)
+	if p.System != "" {
+		args = append(args, "--append-system-prompt", p.System)
+	}
+	args = append(args, "--output-format", "json", "-p", p.User)
 
 	callCtx := ctx
 	if r.MaxCallDuration > 0 {
@@ -245,6 +266,10 @@ func (r DryRunRunner) Run(_ context.Context, workDir string, a *Agent, prompt st
 	if logger == nil {
 		logger = log.New(os.Stdout, "", log.LstdFlags)
 	}
-	logger.Printf("[dry-run] agent=%s model=%s dir=%s\n----- prompt -----\n%s\n------------------", a.Name, a.Model, workDir, prompt)
+	p := Assemble(a, prompt)
+	logger.Printf("[dry-run] agent=%s model=%s dir=%s\n"+
+		"----- system prompt (shared prefix) -----\n%s\n"+
+		"----- prompt -----\n%s\n------------------",
+		a.Name, a.Model, workDir, p.System, p.User)
 	return RunResult{}, nil
 }

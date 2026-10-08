@@ -37,6 +37,10 @@ type Layout struct {
 	QueuePath  string // <root>/spec/QUEUE.md
 	AgentsDir  string // <project>/.claude/agents
 	SkillsDir  string // <project>/.claude/skills
+
+	// PrefixPath is the optional per-project override of the shared
+	// prompt prefix every agent of a run is given: <root>/prefix.md.
+	PrefixPath string
 }
 
 func NewLayout(projectDir string) Layout {
@@ -49,6 +53,7 @@ func NewLayout(projectDir string) Layout {
 		QueuePath:  filepath.Join(specDir, "QUEUE.md"),
 		AgentsDir:  filepath.Join(projectDir, ".claude", "agents"),
 		SkillsDir:  filepath.Join(projectDir, ".claude", "skills"),
+		PrefixPath: filepath.Join(root, "prefix.md"),
 	}
 }
 

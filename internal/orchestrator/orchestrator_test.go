@@ -1622,3 +1622,123 @@ func TestRunAgentLogsHeartbeatWhileAgentRuns(t *testing.T) {
 		t.Fatalf("heartbeat logged after the agent finished; got:\n%s", out)
 	}
 }
+
+// prefixRecordingRunner captures, for every agent call, the system prompt
+// that call would actually be invoked with (the shared prefix) alongside
+// the per-call user prompt. The worker writes a file so each iteration
+// produces a non-empty diff, and the tester marks the task DONE only once
+// doneOnCall tester calls have happened — enough to drive several
+// iterations of one task plus a second task.
+type prefixRecordingRunner struct {
+	layout      specs.Layout
+	testerCalls int
+	doneOnCall  int
+
+	systems []string
+	prompts []string
+	names   []string
+}
+
+func (r *prefixRecordingRunner) Run(_ context.Context, workDir string, a *agents.Agent, prompt string) (agents.RunResult, error) {
+	r.systems = append(r.systems, agents.Assemble(a, prompt).System)
+	r.prompts = append(r.prompts, prompt)
+	r.names = append(r.names, a.Name)
+
+	switch a.Name {
+	case "planner":
+		plan := []byte(validPlanFixture)
+		for _, num := range []string{"001", "002"} {
+			if err := os.WriteFile(filepath.Join(r.layout.SpecDir, num+"_IMPL_PLAN.md"), plan, 0o644); err != nil {
+				return agents.RunResult{}, err
+			}
+		}
+	case "worker":
+		name := fmt.Sprintf("worker_output_%d.txt", len(r.names))
+		if err := os.WriteFile(filepath.Join(workDir, name), []byte("done\n"), 0o644); err != nil {
+			return agents.RunResult{}, err
+		}
+	case "tester":
+		r.testerCalls++
+		if r.testerCalls < r.doneOnCall {
+			return agents.RunResult{}, nil
+		}
+		rows, err := specs.ReadStatus(r.layout.StatusPath)
+		if err != nil {
+			return agents.RunResult{}, err
+		}
+		for i := range rows {
+			if rows[i].Status == specs.StatusInProgress {
+				rows[i].Status = specs.StatusDone
+			}
+		}
+		if err := specs.WriteStatus(r.layout.StatusPath, rows); err != nil {
+			return agents.RunResult{}, err
+		}
+	}
+	return agents.RunResult{}, nil
+}
+
+// TestAllAgentCallsShareOnePrefixAcrossTasksAndIterations is the prompt-cache
+// invariant: whatever the task, the role and the iteration, every claude call
+// of a run gets the exact same system prompt, so the API can serve it from
+// the cache instead of charging for it again.
+func TestAllAgentCallsShareOnePrefixAcrossTasksAndIterations(t *testing.T) {
+	requireGit(t)
+	dir := t.TempDir()
+	setTestGitEnv(t)
+
+	layout := specs.NewLayout(dir)
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	writeAgentFixtures(t, layout.AgentsDir)
+	for _, spec := range []string{"001_a.md", "002_b.md"} {
+		if err := os.WriteFile(filepath.Join(layout.SpecDir, spec), []byte("# "+spec+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A skill folder in scope, so the skills note is part of the prefix.
+	if err := os.MkdirAll(filepath.Join(layout.SkillsDir, "go"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// doneOnCall=2: the first task needs two iterations, the second then
+	// finishes on its first tester call.
+	runner := &prefixRecordingRunner{layout: layout, doneOnCall: 2}
+	o := &Orchestrator{
+		Cfg:    config.Config{Dir: dir, Iter: 2, MaxDiffBytes: config.DefaultMaxDiffBytes},
+		Layout: layout,
+		Runner: runner,
+		Log:    log.New(io.Discard, "", 0),
+	}
+	if err := o.Run(context.Background()); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	if len(runner.systems) < 6 {
+		t.Fatalf("got %d agent calls (%v), want at least 6 — two tasks over two iterations",
+			len(runner.systems), runner.names)
+	}
+	if runner.systems[0] == "" {
+		t.Fatal("agent calls got an empty system prompt; the shared prefix never reached them")
+	}
+	for i, got := range runner.systems {
+		if got != runner.systems[0] {
+			t.Fatalf("call %d (%s) got a different system prompt than call 0 (%s)",
+				i, runner.names[i], runner.names[0])
+		}
+	}
+	for _, want := range []string{"Relevant skills", "go"} {
+		if !strings.Contains(runner.systems[0], want) {
+			t.Errorf("shared prefix missing %q; got:\n%s", want, runner.systems[0])
+		}
+	}
+	// The skills note lives in the cached prefix now, so it must no longer
+	// be repeated in each per-call prompt.
+	for i, prompt := range runner.prompts {
+		if strings.Contains(prompt, "Relevant skills") {
+			t.Errorf("call %d (%s) still repeats the skills note in its per-call prompt",
+				i, runner.names[i])
+		}
+	}
+}

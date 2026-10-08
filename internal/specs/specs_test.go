@@ -194,3 +194,11 @@ func TestSyncOrdersQueueAscendingByNumber(t *testing.T) {
 		}
 	}
 }
+
+func TestNewLayoutPrefixPath(t *testing.T) {
+	dir := t.TempDir()
+	want := filepath.Join(dir, ".claude", "diadoche", "prefix.md")
+	if got := NewLayout(dir).PrefixPath; got != want {
+		t.Errorf("PrefixPath = %q, want %q", got, want)
+	}
+}

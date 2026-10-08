@@ -82,7 +82,7 @@ func TestParseHelpFlagPrintsManPageAndReturnsErrHelp(t *testing.T) {
 			if cfg != nil {
 				t.Fatalf("cfg = %+v, want nil", cfg)
 			}
-			for _, want := range []string{"SYNOPSIS", "DESCRIPTION", "MODES", "--initialize", "--preprocess", "--tester-diff-limit", "EXAMPLES"} {
+			for _, want := range []string{"SYNOPSIS", "DESCRIPTION", "MODES", "--initialize", "--preprocess", "--tester-diff-limit", "stable-system-prompt", "docs/prompt-caching.md", "prefix.md", "EXAMPLES"} {
 				if !strings.Contains(out, want) {
 					t.Errorf("help output missing %q; got:\n%s", want, out)
 				}
@@ -327,5 +327,23 @@ func TestParseCallBudgetFlagsRejectNegative(t *testing.T) {
 	}
 	if _, err := Parse([]string{"--max-call-cost", "-1"}); err == nil {
 		t.Fatal("expected an error for a negative --max-call-cost")
+	}
+}
+
+func TestParseStableSystemPromptDefaultsOnAndCanBeDisabled(t *testing.T) {
+	cfg, err := Parse(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.StableSystemPrompt {
+		t.Error("StableSystemPrompt = false, want true by default")
+	}
+
+	cfg, err = Parse([]string{"--stable-system-prompt=false"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.StableSystemPrompt {
+		t.Error("StableSystemPrompt = true, want false when explicitly disabled")
 	}
 }

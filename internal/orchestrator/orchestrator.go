@@ -56,7 +56,11 @@ func New(cfg config.Config) *Orchestrator {
 	if cfg.DryRun {
 		runner = agents.DryRunRunner{Log: logger}
 	} else {
-		runner = agents.CLIRunner{Bin: cfg.ClaudeBin, MaxCallDuration: time.Duration(cfg.MaxCallMinutes) * time.Minute}
+		runner = agents.CLIRunner{
+			Bin:                                cfg.ClaudeBin,
+			MaxCallDuration:                    time.Duration(cfg.MaxCallMinutes) * time.Minute,
+			ExcludeDynamicSystemPromptSections: cfg.StableSystemPrompt,
+		}
 	}
 	return &Orchestrator{
 		Cfg:    cfg,
@@ -108,6 +112,18 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	}
 	o.Log.Printf("models: planner=%s worker=%s tester=%s", planner.ModelDescription(), worker.ModelDescription(), tester.ModelDescription())
 
+	// One prefix for the whole run, resolved once and shared byte for byte
+	// by all three agents: that identity is what lets the API's prompt
+	// cache serve the common context to the next agent instead of charging
+	// for it again (see docs/prompt-caching.md).
+	basePrefix, prefixSource, err := agents.LoadPrefixOrDefault(o.Layout.Root)
+	if err != nil {
+		return fmt.Errorf("load prompt prefix: %w", err)
+	}
+	prefix := agents.BuildPrefix(basePrefix, matchedSkills)
+	planner.Prefix, worker.Prefix, tester.Prefix = prefix, prefix, prefix
+	o.Log.Printf("prompt prefix: %d bytes (source: %s)", len(prefix), prefixSource)
+
 	// Usage accounting writes real claude-CLI JSON output to disk; skip it
 	// entirely in --dry-run, where there's no real usage to record and no
 	// guarantee the project even has a .claude/diadoche directory worth
@@ -138,7 +154,7 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 				break
 			}
 			processedAny = true
-			if err := o.processTask(ctx, next, planner, worker, tester, matchedSkills, uw); err != nil {
+			if err := o.processTask(ctx, next, planner, worker, tester, uw); err != nil {
 				o.Log.Printf("task %s: error: %v", next, err)
 				var fatal *fatalError
 				if errors.As(err, &fatal) {
@@ -185,7 +201,7 @@ func (o *Orchestrator) syncQueueLocked() error {
 	return err
 }
 
-func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner, worker, tester *agents.Agent, skillNames []string, uw *usage.Writer) error {
+func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner, worker, tester *agents.Agent, uw *usage.Writer) error {
 	o.Log.Printf("=== task %s ===", specFile)
 	num := specs.TaskNumber(specFile)
 
@@ -202,7 +218,7 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 		return err
 	}
 
-	done, cause := o.runIterations(ctx, specFile, num, ws, planner, worker, tester, skillNames, uw)
+	done, cause := o.runIterations(ctx, specFile, num, ws, planner, worker, tester, uw)
 	if cause != nil && usagelimit.Mentions(cause.Error()) {
 		// Not a failure: the account's usage window ran out. Nothing is
 		// parked and the task stays IN_PROGRESS, so the next run (e.g. by
@@ -231,16 +247,11 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 // task. done reports whether tester marked the task DONE; a non-nil err is
 // why the task was cut short (an agent error, --max-call-cost, ...). Both
 // false and nil means the iteration budget ran out.
-func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, ws *workspace, planner, worker, tester *agents.Agent, skillNames []string, uw *usage.Writer) (done bool, err error) {
+func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, ws *workspace, planner, worker, tester *agents.Agent, uw *usage.Writer) (done bool, err error) {
 	specPath := filepath.Join(o.Layout.SpecDir, specFile)
 	specContent, err := os.ReadFile(specPath)
 	if err != nil {
 		return false, fmt.Errorf("read spec file: %w", err)
-	}
-
-	skillsNote := ""
-	if len(skillNames) > 0 {
-		skillsNote = fmt.Sprintf("\n\nRelevant skills available under .claude/skills: %s. Use them where applicable.", strings.Join(skillNames, ", "))
 	}
 
 	implPlanFile := fmt.Sprintf("%s_IMPL_PLAN.md", num)
@@ -292,7 +303,7 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 			if priorReview != "" {
 				plannerPrompt += fmt.Sprintf("\nFeedback from the previous review, address every point:\n%s\n", priorReview)
 			}
-			plannerPrompt += fmt.Sprintf("\nWrite (or update) the implementation plan to %s.%s", implPlanPath, skillsNote)
+			plannerPrompt += fmt.Sprintf("\nWrite (or update) the implementation plan to %s.", implPlanPath)
 
 			result, err := o.runAgent(ctx, call, planner, plannerPrompt)
 			if err != nil {
@@ -335,7 +346,7 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 		if priorReview != "" {
 			workerPrompt += fmt.Sprintf("\nFeedback from the previous review, address every point:\n%s\n", priorReview)
 		}
-		workerPrompt += "\nImplement the plan in this repository." + skillsNote
+		workerPrompt += "\nImplement the plan in this repository."
 
 		workerResult, err := o.runAgent(ctx, call, worker, workerPrompt)
 		if err != nil {
@@ -374,7 +385,6 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 				"Write your findings to %s. If, and only if, the task is fully and correctly done, "+
 				"update the row for %q in %s to status DONE.",
 			specFile, specContent, implPlanFile, plan, testCommand, diffNote, diffForTester, guidance, reviewPath, specFile, o.Layout.StatusPath)
-		testerPrompt += skillsNote
 
 		testerResult, err := o.runAgent(ctx, call, tester, testerPrompt)
 		if err != nil {

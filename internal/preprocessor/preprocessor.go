@@ -51,11 +51,27 @@ func Run(ctx context.Context, cfg config.Config) error {
 	}
 	logger.Printf("model: preprocessor=%s", agent.ModelDescription())
 
+	// The same shared prompt prefix the main loop's agents get, so a
+	// --preprocess run and a following regular run can share the cached
+	// system prompt. No skills note: --preprocess doesn't resolve skills
+	// (it is its own run and never implements anything), and the prefix
+	// must stay identical across calls, not vary per invocation.
+	basePrefix, prefixSource, err := agents.LoadPrefixOrDefault(layout.Root)
+	if err != nil {
+		return fmt.Errorf("load prompt prefix: %w", err)
+	}
+	agent.Prefix = agents.BuildPrefix(basePrefix, nil)
+	logger.Printf("prompt prefix: %d bytes (source: %s)", len(agent.Prefix), prefixSource)
+
 	var runner agents.Runner
 	if cfg.DryRun {
 		runner = agents.DryRunRunner{Log: logger}
 	} else {
-		runner = agents.CLIRunner{Bin: cfg.ClaudeBin, MaxCallDuration: time.Duration(cfg.MaxCallMinutes) * time.Minute}
+		runner = agents.CLIRunner{
+			Bin:                                cfg.ClaudeBin,
+			MaxCallDuration:                    time.Duration(cfg.MaxCallMinutes) * time.Minute,
+			ExcludeDynamicSystemPromptSections: cfg.StableSystemPrompt,
+		}
 	}
 
 	// Held for the whole agent turn: the agent may write several files over

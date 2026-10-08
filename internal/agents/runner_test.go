@@ -316,3 +316,89 @@ func TestRunResultSummaryReportsNonZeroExitCode(t *testing.T) {
 		t.Errorf("Summary() = %q, want no exit code on a successful call", ok)
 	}
 }
+
+// recordArgsStub writes a fake claude that dumps its argv into argsFile,
+// NUL-separated (prompts are multi-line, so one-per-line would not survive
+// the round trip), and then prints a well-formed JSON result — so a test
+// can assert exactly how CLIRunner invoked the CLI.
+func recordArgsStub(t *testing.T) (stub, argsFile string) {
+	t.Helper()
+	argsFile = filepath.Join(t.TempDir(), "args.txt")
+	t.Setenv("DIADOCHE_TEST_ARGS_FILE", argsFile)
+	stub = fakeClaude(t, `printf '%s\000' "$@" > "$DIADOCHE_TEST_ARGS_FILE"
+cat "`+writeJSONResponse(t, fullClaudeJSON)+`"
+`)
+	return stub, argsFile
+}
+
+func recordedArgs(t *testing.T, argsFile string) []string {
+	t.Helper()
+	recorded, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("stub did not record its args: %v", err)
+	}
+	return strings.Split(strings.TrimSuffix(string(recorded), "\x00"), "\x00")
+}
+
+// valueAfter returns the argument following flag, or "" if it isn't there.
+func valueAfter(args []string, flag string) string {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == flag {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+func TestCLIRunnerSendsPrefixAsSystemPromptAndRoleInUserPrompt(t *testing.T) {
+	stub, argsFile := recordArgsStub(t)
+	r := CLIRunner{Bin: stub}
+	a := &Agent{Name: "worker", Model: "claude-opus-5", Prefix: "shared prefix", SystemPrompt: "be a worker"}
+	if _, err := r.Run(context.Background(), t.TempDir(), a, "do the thing"); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	args := recordedArgs(t, argsFile)
+	if got := valueAfter(args, "--append-system-prompt"); got != "shared prefix" {
+		t.Errorf("--append-system-prompt = %q, want the shared prefix only", got)
+	}
+	userPrompt := valueAfter(args, "-p")
+	if !strings.HasPrefix(userPrompt, "be a worker") {
+		t.Errorf("-p = %q, want it to start with the role instructions", userPrompt)
+	}
+	if !strings.Contains(userPrompt, "do the thing") {
+		t.Errorf("-p = %q, want it to carry the task data", userPrompt)
+	}
+}
+
+func TestCLIRunnerExcludeDynamicSystemPromptSectionsFlag(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		enabled bool
+	}{{"enabled", true}, {"disabled", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			stub, argsFile := recordArgsStub(t)
+			r := CLIRunner{Bin: stub, ExcludeDynamicSystemPromptSections: tc.enabled}
+			a := &Agent{Name: "worker", Prefix: "shared prefix"}
+			if _, err := r.Run(context.Background(), t.TempDir(), a, "do the thing"); err != nil {
+				t.Fatalf("Run failed: %v", err)
+			}
+			got := containsArg(recordedArgs(t, argsFile), "--exclude-dynamic-system-prompt-sections")
+			if got != tc.enabled {
+				t.Errorf("--exclude-dynamic-system-prompt-sections passed = %v, want %v", got, tc.enabled)
+			}
+		})
+	}
+}
+
+func TestCLIRunnerOmitsAppendSystemPromptWhenPrefixEmpty(t *testing.T) {
+	stub, argsFile := recordArgsStub(t)
+	r := CLIRunner{Bin: stub}
+	a := &Agent{Name: "worker", SystemPrompt: "be a worker"}
+	if _, err := r.Run(context.Background(), t.TempDir(), a, "do the thing"); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if args := recordedArgs(t, argsFile); containsArg(args, "--append-system-prompt") {
+		t.Errorf("--append-system-prompt must be omitted without a prefix; args: %v", args)
+	}
+}

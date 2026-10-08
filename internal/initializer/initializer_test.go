@@ -30,6 +30,18 @@ func TestRunScaffoldsFreshProject(t *testing.T) {
 	if _, err := os.Stat(layout.SkillsDir); err != nil {
 		t.Errorf("expected skills dir to exist: %v", err)
 	}
+	gotPrefix, err := os.ReadFile(layout.PrefixPath)
+	if err != nil {
+		t.Errorf("expected %s to exist: %v", layout.PrefixPath, err)
+	} else {
+		wantPrefix, err := agents.DefaultPrefixFile()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(gotPrefix) != string(wantPrefix) {
+			t.Errorf("%s content = %q, want the built-in prefix", layout.PrefixPath, gotPrefix)
+		}
+	}
 	for _, name := range agents.DefaultNames {
 		path := filepath.Join(layout.AgentsDir, name+".md")
 		got, err := os.ReadFile(path)
@@ -96,5 +108,31 @@ func TestRunUsesExistingClaudeDir(t *testing.T) {
 	layout := specs.NewLayout(dir)
 	if _, err := os.Stat(layout.StatusPath); err != nil {
 		t.Errorf("expected scaffolding inside the pre-existing .claude dir: %v", err)
+	}
+}
+
+func TestRunDoesNotOverwriteExistingPrefixFile(t *testing.T) {
+	dir := t.TempDir()
+	logger := log.New(io.Discard, "", 0)
+
+	layout := specs.NewLayout(dir)
+	if err := os.MkdirAll(layout.Root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	customized := "our own shared prompt prefix"
+	if err := os.WriteFile(layout.PrefixPath, []byte(customized), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Run(dir, logger); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	got, err := os.ReadFile(layout.PrefixPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != customized {
+		t.Fatalf("Run overwrote a customized prefix file: got %q, want %q", got, customized)
 	}
 }

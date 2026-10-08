@@ -2,6 +2,12 @@
 // and runs them as independent "claude --dangerously-skip-permissions"
 // subprocesses. Editing an agent's model or prompt only touches these
 // markdown files, never the diadoche binary.
+//
+// What goes where in a call: --append-system-prompt carries the run's
+// shared prompt prefix (Agent.Prefix), identical for every role so the
+// prompt cache can be reused between consecutive turns, and -p carries the
+// role instructions (Agent.SystemPrompt) followed by the turn's data. See
+// Assemble and docs/prompt-caching.md.
 package agents
 
 import (
@@ -43,10 +49,21 @@ func DefaultPromptFile(name string) ([]byte, error) {
 //	---
 //	<system prompt body>
 type Agent struct {
-	Name         string
-	Model        string
-	Description  string
+	Name        string
+	Model       string
+	Description string
+
+	// SystemPrompt is the role instructions: the markdown body of the
+	// agent definition file. Despite the name — kept for compatibility —
+	// it is not sent as a system prompt but at the start of the user turn,
+	// right after Prefix; only Prefix goes to --append-system-prompt.
 	SystemPrompt string
+
+	// Prefix is the run's shared prompt prefix, byte-for-byte identical
+	// for every agent of the run, sent as --append-system-prompt. It is
+	// set by the orchestrator/preprocessor after loading (see
+	// LoadPrefixOrDefault and BuildPrefix), never parsed from frontmatter.
+	Prefix string
 
 	// ModelSource records where Model ended up coming from, for the
 	// startup log. Set by LoadOrDefault and then possibly overwritten by

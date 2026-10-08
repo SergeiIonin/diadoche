@@ -17,10 +17,10 @@ import (
 	"diadoche/internal/specs"
 )
 
-// Run scaffolds projectDir/.claude: agent prompt files (copied from the
-// built-in defaults, so they can be edited in place), the diadoche spec
-// directory (with an empty STATUS.md) plus its raw/ subfolder for
-// --preprocess input, and an empty skills directory.
+// Run scaffolds projectDir/.claude: agent prompt files and the shared
+// prompt prefix (copied from the built-in defaults, so they can be edited
+// in place), the diadoche spec directory (with an empty STATUS.md) plus its
+// raw/ subfolder for --preprocess input, and an empty skills directory.
 func Run(projectDir string, logger *log.Logger) error {
 	layout := specs.NewLayout(projectDir)
 
@@ -60,6 +60,24 @@ func Run(projectDir string, logger *log.Logger) error {
 			return fmt.Errorf("write %s: %w", dst, err)
 		}
 		logger.Printf("wrote %s", dst)
+	}
+
+	// The shared prompt prefix all agents get as their system prompt,
+	// copied out so a project can customize it the same way as the agent
+	// prompts (see agents.LoadPrefixOrDefault).
+	if _, err := os.Stat(layout.PrefixPath); err == nil {
+		logger.Printf("skipped %s (already exists)", layout.PrefixPath)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat %s: %w", layout.PrefixPath, err)
+	} else {
+		content, err := agents.DefaultPrefixFile()
+		if err != nil {
+			return fmt.Errorf("load built-in prompt prefix: %w", err)
+		}
+		if err := os.WriteFile(layout.PrefixPath, content, 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", layout.PrefixPath, err)
+		}
+		logger.Printf("wrote %s", layout.PrefixPath)
 	}
 
 	return nil

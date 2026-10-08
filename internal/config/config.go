@@ -44,6 +44,7 @@ const helpSynopsis = `SYNOPSIS
              [--planner-model <name>] [--worker-model <name>]
              [--tester-model <name>] [--max-call-minutes <n>]
              [--max-call-cost <usd>] [--allow-dirty]
+             [--stable-system-prompt=<bool>]
     diadoche --preprocess --task <path> [--dir <path>] [--claude-bin <path>]
              [--preprocessor-model <name>]
     diadoche --initialize <project-path>
@@ -121,6 +122,20 @@ const helpDescription = `DESCRIPTION
     stays IN_PROGRESS and diadoche exits, so diadoche-restarter can resume
     it later with its changes in place.
 
+    PROMPT CACHING: every agent of a run is given the same shared prompt
+    prefix — byte for byte — as its system prompt (claude's
+    --append-system-prompt), with the role instructions and the task data
+    following in the user turn, in that order. Consecutive turns therefore
+    hit the API's prompt cache instead of paying for the common context
+    again. The prefix text is built into the binary; drop a
+    <project>/.claude/diadoche/prefix.md to override it, and keep anything
+    that varies between calls (times, iteration numbers, task ids) out of
+    it. --stable-system-prompt (on by default) additionally passes claude's
+    --exclude-dynamic-system-prompt-sections, which moves per-machine
+    sections out of the system prompt; turn it off for a claude CLI that
+    doesn't know that flag. See docs/prompt-caching.md for what cannot be
+    unified and why.
+
     Before a task starts from scratch, diadoche refuses to run if the
     working tree already has uncommitted changes outside .claude/diadoche/
     and .claude/agents/ (they would otherwise be parked with the task's
@@ -145,8 +160,9 @@ const helpModes = `MODES
     --initialize <project-path>
         Scaffolds .claude/ inside <project-path>: an empty
         .claude/diadoche/spec/STATUS.md, spec/raw/ (input for
-        --preprocess), .claude/skills/, and a copy of each built-in agent
-        prompt under .claude/agents/*.md so they're easy to customize.
+        --preprocess), .claude/skills/, a copy of each built-in agent
+        prompt under .claude/agents/*.md and the built-in shared prompt
+        prefix as .claude/diadoche/prefix.md, so they're easy to customize.
         Never overwrites a file that's already there, so it's safe to run
         again later (e.g. after upgrading diadoche). Does only this, then
         exits immediately — every other flag is ignored.
@@ -211,6 +227,11 @@ FILES
     <project>/.claude/agents/<name>.md
         Optional per-project override of a built-in agent's prompt/model
         (name is one of planner, worker, tester, preprocessor).
+
+    <project>/.claude/diadoche/prefix.md
+        Optional override of the shared prompt prefix all agents get as
+        their system prompt. Must not contain anything that varies between
+        calls, or the prompt cache never hits.
 
     <project>/.claude/skills/<name>/...
         Optional skill folders; matched against --langs/--frameworks and
@@ -301,6 +322,14 @@ type Config struct {
 	// more expensive than expected. 0 = no limit (default).
 	MaxCallCostUSD float64
 
+	// StableSystemPrompt passes claude's
+	// --exclude-dynamic-system-prompt-sections, so per-machine sections
+	// (cwd, env info, memory paths, git status) move out of the system
+	// prompt and the shared prefix stays identical between calls and
+	// machines. On by default; --stable-system-prompt=false turns it off
+	// for a claude CLI that doesn't have that flag.
+	StableSystemPrompt bool
+
 	// AllowDirty lets a task start even though the working tree already
 	// has uncommitted changes outside diadoche's own directories. Those
 	// files are then left alone when a FAILED task is parked.
@@ -338,6 +367,7 @@ func Parse(args []string) (*Config, error) {
 	preprocessorModel := fs.String("preprocessor-model", "", "override the preprocessor agent's model (else $DIADOCHE_PREPROCESSOR_MODEL, else .claude/agents/preprocessor.md, else built-in default)")
 	maxCallMinutes := fs.Int("max-call-minutes", 0, "kill a single agent call if it runs longer than this many minutes (0 = no limit)")
 	allowDirty := fs.Bool("allow-dirty", false, "start a task even if the working tree already has uncommitted changes; those files are never parked when the task FAILS")
+	stableSystemPrompt := fs.Bool("stable-system-prompt", true, "pass claude --exclude-dynamic-system-prompt-sections, keeping the shared prompt prefix identical between calls; set to false for a claude CLI without that flag")
 	maxCallCost := fs.Float64("max-call-cost", 0, "fail the task if a single agent call's cost in USD exceeds this — checked after the call returns, so it cannot preempt the spend (0 = no limit)")
 
 	if err := fs.Parse(args); err != nil {
@@ -407,22 +437,23 @@ func Parse(args []string) (*Config, error) {
 	}
 
 	return &Config{
-		Dir:               *dir,
-		Iter:              *iter,
-		Langs:             splitCSV(*langs),
-		Frameworks:        splitCSV(*frameworks),
-		DryRun:            *dryRun,
-		ClaudeBin:         *claudeBin,
-		Preprocess:        *preprocess,
-		Task:              *task,
-		MaxDiffBytes:      diffLimit,
-		PlannerModel:      plannerOverride,
-		WorkerModel:       workerOverride,
-		TesterModel:       testerOverride,
-		PreprocessorModel: preprocessorOverride,
-		MaxCallMinutes:    *maxCallMinutes,
-		MaxCallCostUSD:    *maxCallCost,
-		AllowDirty:        *allowDirty,
+		Dir:                *dir,
+		Iter:               *iter,
+		Langs:              splitCSV(*langs),
+		Frameworks:         splitCSV(*frameworks),
+		DryRun:             *dryRun,
+		ClaudeBin:          *claudeBin,
+		Preprocess:         *preprocess,
+		Task:               *task,
+		MaxDiffBytes:       diffLimit,
+		PlannerModel:       plannerOverride,
+		WorkerModel:        workerOverride,
+		TesterModel:        testerOverride,
+		PreprocessorModel:  preprocessorOverride,
+		MaxCallMinutes:     *maxCallMinutes,
+		MaxCallCostUSD:     *maxCallCost,
+		AllowDirty:         *allowDirty,
+		StableSystemPrompt: *stableSystemPrompt,
 	}, nil
 }
 

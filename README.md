@@ -25,7 +25,8 @@ This creates `.claude` in that project if it doesn't exist yet (or reuses
 it if it does) and writes everything diadoche needs inside it: an empty
 `.claude/diadoche/spec/STATUS.md`, `.claude/diadoche/spec/raw/` (for
 `--preprocess` input), `.claude/skills/`, and a copy of each built-in agent
-prompt under `.claude/agents/*.md` so they're easy to customize. It never
+prompt under `.claude/agents/*.md`, and the built-in shared prompt prefix as
+`.claude/diadoche/prefix.md`, so they're easy to customize. It never
 overwrites a file that's already there, so re-running it later (e.g. after
 upgrading diadoche) is safe. `--initialize` does only this, then exits —
 no queue sync, no agent invocation.
@@ -76,6 +77,12 @@ Flags:
 - `--allow-dirty` — start a task even if the working tree already has
   uncommitted changes; those files are never parked if the task fails. See
   "FAILED tasks" below.
+- `--stable-system-prompt` — pass `claude`
+  `--exclude-dynamic-system-prompt-sections`, so per-machine sections (cwd,
+  env info, memory paths, git status) stay out of the system prompt and the
+  shared prompt prefix is identical between calls (default `true`). Set
+  `--stable-system-prompt=false` for a `claude` CLI without that flag. See
+  "Prompt caching" below.
 - `-h` / `-help` / `--help` — print the full man-page-style help and exit.
 
 ## Preprocessor (`--preprocess`)
@@ -277,6 +284,26 @@ agent and by task, and the cache-read share of all input tokens — that is
 `cache_read_input_tokens` over `input_tokens + cache_creation_input_tokens
 + cache_read_input_tokens` (output tokens excluded), the one number that
 says whether prompt caching is working.
+
+## Prompt caching
+
+All agents of a run get the same shared prompt prefix — byte for byte — as
+their system prompt (`claude --append-system-prompt`), with their role
+instructions and the call's data following in the user turn, in that order.
+The API's prompt cache only matches a request prefix exactly and only within
+one model, so that identity is what lets planner → worker → tester read the
+common context from the cache instead of paying for it again.
+
+The prefix text is built into the binary; `--initialize` also writes it to
+`.claude/diadoche/prefix.md`, where a project can override it. Keep anything
+that varies between calls out of it (timestamps, iteration numbers, task
+ids), or the cache misses every time.
+
+With the default models, tester runs on `claude-sonnet-5-5` while
+planner/worker run on `claude-opus-5-5`, and a cache entry is per model —
+point all three at one model to have them share it. See
+[docs/prompt-caching.md](docs/prompt-caching.md) for the full list of what
+is unified, what cannot be, and how to check `cache_read` on a real run.
 
 ## Restarting after usage limits (`diadoche-restarter`)
 

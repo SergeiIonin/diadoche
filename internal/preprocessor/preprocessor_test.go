@@ -198,3 +198,46 @@ func captureStdout(t *testing.T, fn func()) string {
 	r.Close()
 	return out
 }
+
+func TestRunGivesPreprocessorTheSharedPrefix(t *testing.T) {
+	dir := t.TempDir()
+	layout := specs.NewLayout(dir)
+	writeAgentFixture(t, layout.AgentsDir, "preprocessor", "claude-opus-5")
+	if err := os.WriteFile(filepath.Join(dir, "raw.md"), []byte("do several things"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A fake claude recording its argv NUL-separated (prompts are
+	// multi-line), so the test sees exactly what --append-system-prompt
+	// carried.
+	argsFile := filepath.Join(dir, "args.txt")
+	t.Setenv("DIADOCHE_TEST_ARGS_FILE", argsFile)
+	stub := filepath.Join(dir, "fake-claude.sh")
+	script := "#!/bin/sh\nprintf '%s\\000' \"$@\" > \"$DIADOCHE_TEST_ARGS_FILE\"\n" +
+		"echo '{\"total_cost_usd\":0.01,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}'\n"
+	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Config{Dir: dir, Task: "raw.md", ClaudeBin: stub}
+	if err := Run(context.Background(), cfg); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	recorded, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("stub did not record its args: %v", err)
+	}
+	args := strings.Split(strings.TrimSuffix(string(recorded), "\x00"), "\x00")
+
+	var gotPrefix string
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--append-system-prompt" {
+			gotPrefix = args[i+1]
+		}
+	}
+	// No skills note: --preprocess is its own run and resolves no skills.
+	if want := agents.BuildPrefix(agents.DefaultPrefix(), nil); gotPrefix != want {
+		t.Errorf("--append-system-prompt = %q, want the shared prefix %q", gotPrefix, want)
+	}
+}
