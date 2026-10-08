@@ -1,0 +1,6 @@
+- 013_on_task_done_hook.md
+- 014_built_in_adr_step.md
+- 015_planner_tester_use_adrs.md
+- 016_on_fail_policy_escalate_block.md
+- 017_on_fail_policy_split.md
+- 018_questions_md_and_needs_human.md
