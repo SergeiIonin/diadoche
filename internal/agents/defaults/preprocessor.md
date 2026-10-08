@@ -16,3 +16,4 @@ Rules:
 - Do NOT touch `spec/STATUS.md`, `spec/QUEUE.md`, or the raw file in `spec/raw/` itself.
 - Do NOT start doing the tasks, and do not write or change project code — only write the tasks into new files.
 - Write each task as detailed and concrete as the user normally writes `NNN_<slug>.md` (use the existing task files, if any, as a style reference).
+- When a task can only be done once another task is finished (it builds on that task's result), put a line `Depends-on: NNN[, NNN...]` (the task numbers it depends on, e.g. `Depends-on: 004, 007`) on its own line in its spec. A task that depends on nothing gets no such line. If a task it depends on ends BLOCKED, diadoche blocks this task too instead of attempting it, so declare only real dependencies.

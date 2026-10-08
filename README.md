@@ -120,6 +120,13 @@ Flags:
   given. See "On-task-done hooks" below.
 - `--hook-timeout` — kill an `--on-task-done` command, together with its
   process group, once it runs longer than this (default `5m`).
+- `--on-fail <list>` — comma-separated, ordered policies applied once a
+  task's `--ITER` iterations run out without DONE (default
+  `escalate,block`); `--on-fail ""` marks the task FAILED and parks its
+  changes, as before. See "Failure policy" below.
+- `--escalation-model <name>` — model of planner and worker in the
+  escalated iteration (else `DIADOCHE_ESCALATION_MODEL`, else
+  `claude-fable-5-1`); validated at startup.
 - `-h` / `-help` / `--help` — print the full man-page-style help and exit.
 
 ## On-task-done hooks (`--on-task-done`)
@@ -147,6 +154,39 @@ Each command's output is kept as `on-task-done-<N>.stdout`/`.stderr` in the
 task's run directory (at most 1 MiB each). Changes the hooks leave in the
 repository (outside `.claude/diadoche`) are committed as
 `diadoche: on-task-done for <NNN>-<slug>`; no changes, no commit.
+
+## Failure policy (`--on-fail`)
+
+A task whose `--ITER` iterations run out without a DONE verdict gets the
+`--on-fail` chain: its policies are applied in order until one ends the
+task. A chain that runs out leaves the task FAILED; `--on-fail ""` is the
+old behaviour (FAILED, changes parked, `NNN_FAILED.md`). Anything else that
+cuts a task short (an agent error, `--max-call-cost`, `--max-cost-per-task`)
+still fails it at once, and a usage limit, a signal or `--max-cost-per-run`
+still leave it pending.
+
+- `escalate` — one more complete planner → worker → tester iteration,
+  numbered `--ITER`+1, with planner and worker on `--escalation-model`
+  (tester keeps its model). It gets the last review like any iteration and
+  goes through the same plan check, red-green check, limit pauses and
+  budgets; its plan, review, artifacts and `usage.jsonl` lines are recorded
+  as usual, and `run.log` marks it (`escalation_start`, `escalated=true`).
+  DONE finishes the task normally (commit/merge, hooks) and ends the chain.
+- `block` — the task becomes `BLOCKED: <reason>` in `STATUS.md`, naming
+  the policies applied. With `--worktree` its changes are committed on its
+  branch and the worktree and branch are kept (like a merge conflict); with
+  `--worktree=false` they are parked on `diadoche/blocked/<NNN>-<slug>`.
+  `spec/NNN_BLOCKED.md` explains what was tried and where the changes are.
+  BLOCKED tasks are never re-queued (also not by `diadoche-restarter`); set
+  the row back to `QUEUED` to retry one.
+
+A task spec may declare dependencies on a line of its own,
+`Depends-on: 003, 007`. When a task is BLOCKED, every pending task that
+depends on it (transitively) is BLOCKED too, with the reason
+`depends on <spec>, which is BLOCKED`; a spec without the line depends on
+nothing. Every applied policy is a `run.log` event
+`on_fail_policy policy=<name> step=<n> outcome=<...>`. `--dry-run` applies
+no policy.
 
 ## Preprocessor (`--preprocess`)
 

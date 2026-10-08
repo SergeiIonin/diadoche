@@ -1,7 +1,8 @@
 // Package restarter keeps diadoche running across claude usage-limit
 // windows: it runs diadoche as a child process, watches its output for the
 // claude CLI's "you've hit your limit" error, and when that shows up kills
-// diadoche, drops every row from STATUS.md that isn't DONE, BLOCKED or a
+// diadoche, drops every row from STATUS.md that isn't DONE, BLOCKED (for
+// any reason: merge conflict, --on-fail block, blocked dependency) or a
 // parked FAILED (so the next run re-queues those tasks instead of seeing
 // them as FAILED), sleeps until the window reopens and starts diadoche
 // again. A PAUSED row (a task diadoche itself is waiting out a limit on)
@@ -243,9 +244,10 @@ func sleepUntil(ctx context.Context, wake time.Time, now func() time.Time, poll 
 // QUEUED, and resumes each one from the plan/reviews already on disk. A
 // FAILED task whose changes diadoche already parked (it has a
 // spec/<NNN>_FAILED.md) genuinely failed, so it's kept as is. So is a
-// BLOCKED task (with its reason): it waits for a human to resolve its
-// merge, and re-queuing it would rerun the task while its worktree and
-// branch are still there.
+// BLOCKED task (with its reason), whatever blocked it — a failed merge,
+// diadoche's --on-fail block policy, or a task it depends on being BLOCKED:
+// it waits for a human, and re-queuing it would rerun the task while its
+// worktree and branch (or parked branch) are still there.
 func ResetStatus(l specs.Layout) ([]string, error) {
 	lock, err := speclock.Acquire(l.SpecDir, lockTimeout)
 	if err != nil {

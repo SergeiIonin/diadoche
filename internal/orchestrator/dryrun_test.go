@@ -287,3 +287,39 @@ func TestDryRunListsOnTaskDoneHooksWithoutRunningThem(t *testing.T) {
 	diffSnapshots(t, "files", filesBefore, treeSnapshot(t, dir))
 	diffSnapshots(t, "git", gitBefore, gitSnapshot(t, dir))
 }
+
+// With an --on-fail chain, --dry-run still applies no policy and changes
+// no status; it only names the chain a real run would apply.
+func TestDryRunWithOnFailChainChangesNothing(t *testing.T) {
+	dir, layout := dryRunRepo(t)
+	filesBefore, gitBefore := treeSnapshot(t, dir), gitSnapshot(t, dir)
+
+	var buf bytes.Buffer
+	logger := log.New(&buf, "", 0)
+	rec := &promptRecorder{}
+	o := newDryRunOrchestrator(dir, layout, rec, logger)
+	o.Cfg.OnFail = []string{"escalate", "block"}
+	o.Cfg.EscalationModel = agents.ModelOverride{Value: "claude-opus-5-5", Source: agents.ModelSourceFlag}
+	if err := o.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	diffSnapshots(t, "files", filesBefore, treeSnapshot(t, dir))
+	diffSnapshots(t, "git", gitBefore, gitSnapshot(t, dir))
+	for _, spec := range []string{"001_a.md", "002_b.md"} {
+		if st, err := specs.GetStatus(layout, spec); err != nil || st != specs.StatusQueued {
+			t.Errorf("%s status = %q, %v; want QUEUED", spec, st, err)
+		}
+	}
+	for _, f := range []string{"001_BLOCKED.md", "002_BLOCKED.md", "001_FAILED.md"} {
+		if fileExists(filepath.Join(layout.SpecDir, f)) {
+			t.Errorf("dry run wrote %s", f)
+		}
+	}
+	if want := "planner,worker,tester,planner,worker,tester"; strings.Join(rec.agents, ",") != want {
+		t.Errorf("dry run calls = %v, want only the iteration-1 prompts of each task (%s)", rec.agents, want)
+	}
+	if !strings.Contains(buf.String(), "--on-fail escalate,block (escalation model claude-opus-5-5); the dry run applies none") {
+		t.Errorf("log does not name the on-fail chain:\n%s", buf.String())
+	}
+}

@@ -10,6 +10,7 @@ import (
 
 	"diadoche/internal/agents"
 	"diadoche/internal/config"
+	"diadoche/internal/onfail"
 	"diadoche/internal/specs"
 )
 
@@ -23,7 +24,8 @@ import (
 // even the spec directory or its lock), no usage.jsonl, run-state.json or
 // run artifacts, and git is never touched. No status changes, no plan
 // validation, no failure counting. The --on-task-done hooks are only
-// listed per task, never run.
+// listed per task, never run, and the --on-fail chain is only named: no
+// policy is applied and no status changes.
 func (o *Orchestrator) dryRun(ctx context.Context) error {
 	planner, worker, tester, err := o.loadAgents()
 	if err != nil {
@@ -42,6 +44,10 @@ func (o *Orchestrator) dryRun(ctx context.Context) error {
 	if o.Cfg.Worktree {
 		o.Log.Printf("dry-run: a real run would run each task in its own git worktree under %s; the dry run shows %s as the work dir",
 			o.relPath(filepath.Join(o.Layout.Root, worktreesDirName)), o.Cfg.Dir)
+	}
+	if len(o.Cfg.OnFail) > 0 {
+		o.Log.Printf("dry-run: a task not DONE after --ITER would get --on-fail %s (escalation model %s); the dry run applies none",
+			strings.Join(o.Cfg.OnFail, ","), cmp.Or(o.Cfg.EscalationModel.Value, onfail.DefaultEscalationModel))
 	}
 	if len(o.Cfg.OnTaskDone) > 0 {
 		o.Log.Printf("dry-run: on-task-done hooks: %d, timeout %s each", len(o.Cfg.OnTaskDone), cmp.Or(o.Cfg.HookTimeout, config.DefaultHookTimeout))

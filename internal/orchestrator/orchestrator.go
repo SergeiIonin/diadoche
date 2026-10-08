@@ -1,9 +1,13 @@
 // Package orchestrator runs diadoche's main loop: sync the spec queue,
 // then for each queued task run planner -> worker -> tester for up to
 // cfg.Iter iterations, until the tester marks the task DONE in STATUS.md or
-// the iteration budget is exhausted (FAILED). Between worker and tester,
-// the red-green check (see redgreen.go) makes sure worker's tests fail on
-// the task's base commit, i.e. actually test the new code.
+// the iteration budget is exhausted. An exhausted task gets the --on-fail
+// policy chain (see onfail.go: an escalated iteration on a stronger model,
+// then BLOCKED by default); it is FAILED only with an empty chain, a chain
+// that runs out, or another cause (an agent error, a cost cap). Between
+// worker and tester, the red-green check (see redgreen.go) makes sure
+// worker's tests fail on the task's base commit, i.e. actually test the
+// new code.
 //
 // With cfg.Worktree each task runs in its own git worktree and branch
 // (see worktree.go), merged into the current branch once DONE; without it
@@ -53,6 +57,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -60,6 +65,7 @@ import (
 	"diadoche/internal/config"
 	"diadoche/internal/gitutil"
 	"diadoche/internal/implplan"
+	"diadoche/internal/onfail"
 	"diadoche/internal/runlog"
 	"diadoche/internal/runstate"
 	"diadoche/internal/skills"
@@ -135,6 +141,11 @@ type Orchestrator struct {
 	// ADR step read it (see DecisionsPath).
 	decisions map[string]string
 
+	// escPlanner and escWorker are planner and worker on the escalation
+	// model, for the escalated iteration of --on-fail escalate; built by
+	// Run when the chain escalates.
+	escPlanner, escWorker *agents.Agent
+
 	// simulate is for tests only: run the whole loop like a real run but
 	// without git, usage.jsonl, run-state.json or run artifacts — what
 	// --dry-run used to do. Real --dry-run is the read-only walk in
@@ -204,6 +215,18 @@ func (o *Orchestrator) Run(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
+	if slices.Contains(o.Cfg.OnFail, onfail.Escalate) {
+		if err := o.loadEscalationAgents(planner, worker); err != nil {
+			return err
+		}
+	}
+	if len(o.Cfg.OnFail) > 0 {
+		esc := ""
+		if o.escPlanner != nil {
+			esc = "; escalation model=" + o.escPlanner.ModelDescription()
+		}
+		o.Log.Printf("on-fail: %s%s", strings.Join(o.Cfg.OnFail, ","), esc)
+	}
 
 	// Usage accounting writes real claude-CLI JSON output to disk; skip it
 	// entirely in --dry-run, where there's no real usage to record and no
@@ -259,6 +282,13 @@ func (o *Orchestrator) Run(ctx context.Context) (err error) {
 			}
 			if next == "" {
 				break
+			}
+			// A task that stopped being pending after QUEUE.md was built
+			// (e.g. BLOCKED because a task it depends on was) is skipped.
+			if status, err := specs.GetStatus(o.Layout, next); err == nil &&
+				(status == specs.StatusDone || status == specs.StatusFailed || status == specs.StatusBlocked) {
+				o.Log.Printf("skipping %s: it is %s", next, status)
+				continue
 			}
 			// --max-cost-per-run crossed by the previous task's last call:
 			// stop before starting another. The popped task stays QUEUED in
@@ -403,6 +433,14 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 	o.event(specFile, 0, "", "status", runlog.F("status", specs.StatusInProgress))
 
 	done, cause := o.runIterations(ctx, specFile, num, ws, resume, planner, worker, tester, uw)
+	// Iterations exhausted: the --on-fail chain decides (see onfail.go).
+	// Every outcome of its escalated iteration is then handled below like
+	// the same outcome of a normal one.
+	var onFail onFailResult
+	if !done && cause == nil && len(o.Cfg.OnFail) > 0 && !o.Cfg.DryRun {
+		onFail = o.applyOnFail(ctx, onFailInput{specFile: specFile, num: num, ws: ws, planner: planner, worker: worker, tester: tester, uw: uw})
+		done, cause = onFail.done, onFail.cause
+	}
 	o.writeFinalDiff(ctx, specFile, num, ws)
 	taskEnd := func(status, reason string) {
 		fields := []runlog.Field{runlog.F("status", status)}
@@ -477,6 +515,14 @@ func (o *Orchestrator) processTask(ctx context.Context, specFile string, planner
 		taskEnd(status, reason)
 		return err
 	}
+	if onFail.blocked {
+		err := o.blockTask(ctx, specFile, num, ws, onFail.applied)
+		taskEnd(specs.StatusBlocked, "on_fail")
+		if err != nil {
+			return &fatalError{fmt.Errorf("task %s: preserve BLOCKED changes: %w", specFile, err)}
+		}
+		return nil
+	}
 	if cause == nil {
 		o.Log.Printf("task %s: FAILED after %d iteration(s)", specFile, o.Cfg.Iter)
 	}
@@ -506,9 +552,6 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 		return false, fmt.Errorf("read spec file: %w", err)
 	}
 
-	implPlanFile := fmt.Sprintf("%s_IMPL_PLAN.md", num)
-	implPlanPath := filepath.Join(o.Layout.SpecDir, implPlanFile)
-
 	// Resume point after a crash: skip iterations whose review already
 	// exists on disk (planner/worker/tester already ran for them before the
 	// process died) instead of always restarting this task from iteration 1
@@ -534,219 +577,276 @@ func (o *Orchestrator) runIterations(ctx context.Context, specFile, num string, 
 		if o.stopRequested() {
 			return false, ErrInterrupted
 		}
-		o.Log.Printf("--- %s iteration %d/%d ---", specFile, iter, o.Cfg.Iter)
-		call := agentCall{specFile: specFile, num: num, iter: iter, workDir: o.Cfg.Dir, uw: uw, tally: &iterationTally{}}
-		if ws != nil {
-			call.workDir = ws.dir
-		}
-
-		reviewFile := fmt.Sprintf("%s_REVIEW_%d.md", num, iter)
-		reviewPath := filepath.Join(o.Layout.SpecDir, reviewFile)
-
-		var priorReview string
-		if iter > 1 {
-			prevReviewPath := filepath.Join(o.Layout.SpecDir, fmt.Sprintf("%s_REVIEW_%d.md", num, iter-1))
-			if b, err := os.ReadFile(prevReviewPath); err == nil {
-				priorReview = string(b)
-			}
-		}
-
-		// At the exact resume point, an existing plan from before the crash
-		// is reused as-is rather than regenerated — the task's own request.
-		// Every iteration beyond that still asks planner to update the plan
-		// against that iteration's fresh review, as usual. A plan missing
-		// the required Files/Test Command sections (e.g. left over from
-		// before this validation existed) is never reused — planner runs
-		// again so the contract is enforced even across a restart.
-		//
-		// Resumed from run-state.json, the plan is reused when planner had
-		// finished (worker or tester is next), and worker is skipped too
-		// when tester is next; a planner cut off mid-call runs again, as
-		// its plan file may be a partial write.
-		reusingPlan, skipWorker := false, false
-		if iter == startIter {
-			planOK := false
-			if b, err := os.ReadFile(implPlanPath); err == nil {
-				plan := strings.TrimSpace(string(b))
-				planOK = plan != "" && implplan.HasRequiredSections(plan)
-			}
-			switch startAgent {
-			case "planner":
-			case "worker", "tester":
-				if planOK {
-					reusingPlan, skipWorker = true, startAgent == "tester"
-					o.Log.Printf("%s: reusing existing %s from before the restart", specFile, implPlanFile)
-				} else {
-					o.Log.Printf("warning: %s: %s says %s is next, but %s is missing the required sections; starting the iteration with planner", specFile, runstate.FileName, startAgent, implPlanFile)
-				}
-			default:
-				if planOK {
-					reusingPlan = true
-					o.Log.Printf("%s: reusing existing %s from before the restart", specFile, implPlanFile)
-				}
-			}
-		}
-		first := "planner"
-		switch {
-		case skipWorker:
-			first = "tester"
-		case reusingPlan:
-			first = "worker"
-		}
-		o.setAgentState(iter, first, runstate.AgentPending)
-
-		if !reusingPlan {
-			result, err := o.runStep(ctx, call, planner, plannerPrompt(specFile, specContent, priorReview, implPlanPath))
-			o.copyArtifact(specFile, num, fmt.Sprintf("iter-%d-IMPL_PLAN.md", iter), implPlanPath)
-			if err := o.checkBudgets(specFile, uw); err != nil {
-				return false, err
-			}
-			if err != nil {
-				return false, fmt.Errorf("planner: %w", err)
-			}
-			if err := o.checkCallCost("planner", result); err != nil {
-				return false, err
-			}
-
-			planBytes, _ := os.ReadFile(implPlanPath)
-			if !implplan.HasRequiredSections(string(planBytes)) {
-				note := fmt.Sprintf(
-					"Implementation plan rejected: %s must contain both a \"## %s\" section and a "+
-						"\"## %s\" section, using exactly these headings.\n\n"+
-						"\"## %s\" must list at least one file, one per bullet, in the format\n"+
-						"    %s\n"+
-						"with the path first (backticks optional) — only the path is parsed, so it must be "+
-						"exact and relative to the repository root — and the list must be exhaustive, since "+
-						"worker works strictly from it without exploring the repository. Prose such as "+
-						"\"(none yet)\" or \"TBD\" does not count as a file.\n\n"+
-						"\"## %s\" holds the concrete command(s) that run this project's tests and linter.\n\n"+
-						"Rewrite the plan with both sections filled in.",
-					implPlanFile, implplan.FilesHeading, implplan.TestCommandHeading,
-					implplan.FilesHeading, implplan.FilesBulletFormat, implplan.TestCommandHeading)
-				if err := os.WriteFile(reviewPath, []byte(note), 0o644); err != nil {
-					return false, fmt.Errorf("write plan-contract review: %w", err)
-				}
-				o.Log.Printf("%s iteration %d: %s is missing or empty in the required Files/Test Command sections (Files must list at least one file); retrying planner next iteration", specFile, iter, implPlanFile)
-				o.copyArtifact(specFile, num, fmt.Sprintf("iter-%d-REVIEW.md", iter), reviewPath)
-				o.event(specFile, iter, "", "plan_rejected", runlog.F("review", reviewFile))
-				continue
-			}
-			if o.stopRequested() {
-				return false, ErrInterrupted
-			}
-		} else {
-			o.copyArtifact(specFile, num, fmt.Sprintf("iter-%d-IMPL_PLAN.md", iter), implPlanPath)
-		}
-
-		implPlanBytes, err := os.ReadFile(implPlanPath)
-		if err != nil {
-			return false, fmt.Errorf("read impl plan: %w", err)
-		}
-		plan := string(implPlanBytes)
-
-		// workerOutput is this iteration's worker answer, for its
-		// ## Decisions section; workerRan is false when a resumed run
-		// skipped worker, whose answer is then not available.
-		var workerOutput string
-		workerRan := false
-		if !skipWorker {
-			workerResult, err := o.runStep(ctx, call, worker, workerPrompt(specFile, specContent, implPlanFile, plan, priorReview))
-			if err := o.checkBudgets(specFile, uw); err != nil {
-				return false, err
-			}
-			if err != nil {
-				return false, fmt.Errorf("worker: %w", err)
-			}
-			if err := o.checkCallCost("worker", workerResult); err != nil {
-				return false, err
-			}
-			workerOutput, workerRan = workerResult.Output, true
-			if o.stopRequested() {
-				return false, ErrInterrupted
-			}
-		}
-
-		testCommand := implplan.TestCommand(plan)
-
-		diffForTester := "[dry-run] diff computation skipped"
-		diffNote := ""
-		guidance := normalDiffGuidance
-		if !o.offline() {
-			td, err := o.buildTesterDiff(ctx, ws, plan)
-			if err != nil {
-				return false, err
-			}
-			if td.Empty {
-				o.Log.Printf("%s iteration %d: empty diff after worker, skipping tester (iteration unsuccessful)", specFile, iter)
-				o.event(specFile, iter, "", "empty_diff")
-				continue
-			}
-			diffForTester, diffNote = td.Body, td.Note
-			if td.Oversized {
-				guidance = fmt.Sprintf(oversizedDiffGuidance, ws.base)
-			}
-		}
-
-		// The red-green tester note becomes its own paragraph after the
-		// diff guidance; without one the prompt is unchanged.
-		if o.Cfg.RedGreen && !o.offline() {
-			rg, err := o.redGreenCheck(ctx, specFile, specContent, ws, plan)
-			if err != nil {
-				return false, fmt.Errorf("red-green check: %w", err)
-			}
-			if rg.fail {
-				if err := os.WriteFile(reviewPath, []byte(rg.review), 0o644); err != nil {
-					return false, fmt.Errorf("write red-green review: %w", err)
-				}
-				o.Log.Printf("%s iteration %d: red-green check failed, skipping tester (iteration unsuccessful)", specFile, iter)
-				o.copyArtifact(specFile, num, fmt.Sprintf("iter-%d-REVIEW.md", iter), reviewPath)
-				o.event(specFile, iter, "", "redgreen_failed", runlog.F("review", reviewFile))
-				continue
-			}
-			if rg.testerNote != "" {
-				guidance += "\n\n" + rg.testerNote
-			}
-		}
-
-		prompt := testerPrompt(testerPromptInput{
-			specFile: specFile, specContent: specContent, implPlanFile: implPlanFile, plan: plan,
-			testCommand: testCommand, diffNote: diffNote, diff: diffForTester, guidance: guidance,
-			reviewPath: reviewPath, statusPath: o.Layout.StatusPath,
+		done, err := o.runIteration(ctx, iterationInput{
+			specFile: specFile, num: num, specContent: specContent, ws: ws, iter: iter,
+			resumePoint: iter == startIter, startAgent: startAgent,
+			planner: planner, worker: worker, tester: tester, uw: uw,
 		})
-		testerResult, err := o.runStep(ctx, call, tester, prompt)
-		if err != nil {
-			return false, fmt.Errorf("tester: %w", err)
+		if done || err != nil {
+			return done, err
 		}
+	}
 
-		status, err := specs.GetStatus(o.Layout, specFile)
-		if err != nil {
-			return false, err
+	// A resume point past --ITER (a run stopped during the escalated
+	// iteration of --on-fail escalate) runs no iteration here: the budget
+	// is spent, so the --on-fail chain starts over, and the escalated
+	// iteration is rerun from its planner.
+	return false, nil
+}
+
+// iterationInput is one planner/worker/tester round of a task: what
+// runIteration needs to run iteration iter.
+type iterationInput struct {
+	specFile, num string
+	specContent   []byte
+	ws            *workspace
+	iter          int
+
+	// resumePoint is set for the first iteration a (possibly resumed) run
+	// starts with: an existing plan may then be reused, and startAgent
+	// (from run-state.json, "" when unknown) says which agent is next.
+	resumePoint bool
+	startAgent  string
+
+	// escalated marks the extra iteration of --on-fail escalate, numbered
+	// --ITER+1, with planner and worker on the escalation model.
+	escalated bool
+
+	planner, worker, tester *agents.Agent
+	uw                      *usage.Writer
+}
+
+// runIteration runs one planner -> worker -> tester round (see
+// runIterations): done reports tester's DONE verdict, a non-nil err why the
+// task was cut short; both false and nil is an unsuccessful iteration (a
+// rejected plan, an empty diff, a failed red-green check or a NOT_DONE
+// verdict).
+func (o *Orchestrator) runIteration(ctx context.Context, in iterationInput) (done bool, err error) {
+	specFile, num, specContent, ws, iter, uw := in.specFile, in.num, in.specContent, in.ws, in.iter, in.uw
+	planner, worker, tester, startAgent := in.planner, in.worker, in.tester, in.startAgent
+	implPlanFile := fmt.Sprintf("%s_IMPL_PLAN.md", num)
+	implPlanPath := filepath.Join(o.Layout.SpecDir, implPlanFile)
+
+	if in.escalated {
+		o.Log.Printf("--- %s escalated iteration %d (after %d; planner/worker on %s) ---", specFile, iter, o.Cfg.Iter, planner.Model)
+		o.event(specFile, iter, "", "escalation_start", runlog.F("model", planner.Model), runlog.F("after", o.Cfg.Iter))
+	} else {
+		o.Log.Printf("--- %s iteration %d/%d ---", specFile, iter, o.Cfg.Iter)
+	}
+	call := agentCall{specFile: specFile, num: num, iter: iter, escalated: in.escalated, workDir: o.Cfg.Dir, uw: uw, tally: &iterationTally{}}
+	if ws != nil {
+		call.workDir = ws.dir
+	}
+
+	reviewFile := fmt.Sprintf("%s_REVIEW_%d.md", num, iter)
+	reviewPath := filepath.Join(o.Layout.SpecDir, reviewFile)
+
+	var priorReview string
+	if iter > 1 {
+		prevReviewPath := filepath.Join(o.Layout.SpecDir, fmt.Sprintf("%s_REVIEW_%d.md", num, iter-1))
+		if b, err := os.ReadFile(prevReviewPath); err == nil {
+			priorReview = string(b)
 		}
-		o.copyArtifact(specFile, num, fmt.Sprintf("iter-%d-REVIEW.md", iter), reviewPath)
-		verdict := "NOT_DONE"
-		if status == specs.StatusDone {
-			verdict = specs.StatusDone
+	}
+
+	// At the exact resume point, an existing plan from before the crash
+	// is reused as-is rather than regenerated — the task's own request.
+	// Every iteration beyond that still asks planner to update the plan
+	// against that iteration's fresh review, as usual. A plan missing
+	// the required Files/Test Command sections (e.g. left over from
+	// before this validation existed) is never reused — planner runs
+	// again so the contract is enforced even across a restart.
+	//
+	// Resumed from run-state.json, the plan is reused when planner had
+	// finished (worker or tester is next), and worker is skipped too
+	// when tester is next; a planner cut off mid-call runs again, as
+	// its plan file may be a partial write.
+	reusingPlan, skipWorker := false, false
+	if in.resumePoint {
+		planOK := false
+		if b, err := os.ReadFile(implPlanPath); err == nil {
+			plan := strings.TrimSpace(string(b))
+			planOK = plan != "" && implplan.HasRequiredSections(plan)
 		}
-		o.event(specFile, iter, "tester", "verdict", runlog.F("verdict", verdict), runlog.F("review", reviewFile))
-		if status == specs.StatusDone {
-			o.event(specFile, iter, "tester", "status", runlog.F("status", specs.StatusDone), runlog.F("by", "tester"))
-			o.recordDecisions(specFile, num, iter, workerOutput, workerRan)
-			// A task that just reached DONE is never failed for cost after
-			// the fact — that would throw away completed work for no
-			// benefit, since there's no further spend left to prevent this
-			// iteration was the last call regardless.
-			return true, nil
+		switch startAgent {
+		case "planner":
+		case "worker", "tester":
+			if planOK {
+				reusingPlan, skipWorker = true, startAgent == "tester"
+				o.Log.Printf("%s: reusing existing %s from before the restart", specFile, implPlanFile)
+			} else {
+				o.Log.Printf("warning: %s: %s says %s is next, but %s is missing the required sections; starting the iteration with planner", specFile, runstate.FileName, startAgent, implPlanFile)
+			}
+		default:
+			if planOK {
+				reusingPlan = true
+				o.Log.Printf("%s: reusing existing %s from before the restart", specFile, implPlanFile)
+			}
 		}
+	}
+	first := "planner"
+	switch {
+	case skipWorker:
+		first = "tester"
+	case reusingPlan:
+		first = "worker"
+	}
+	o.setAgentState(iter, first, runstate.AgentPending)
+
+	if !reusingPlan {
+		result, err := o.runStep(ctx, call, planner, plannerPrompt(specFile, specContent, priorReview, implPlanPath))
+		o.copyArtifact(specFile, num, fmt.Sprintf("iter-%d-IMPL_PLAN.md", iter), implPlanPath)
 		if err := o.checkBudgets(specFile, uw); err != nil {
 			return false, err
 		}
-		if err := o.checkCallCost("tester", testerResult); err != nil {
+		if err != nil {
+			return false, fmt.Errorf("planner: %w", err)
+		}
+		if err := o.checkCallCost("planner", result); err != nil {
 			return false, err
 		}
-		// A stop requested meanwhile is honoured at the top of the next
-		// iteration; after the last one the budget is spent anyway.
+
+		planBytes, _ := os.ReadFile(implPlanPath)
+		if !implplan.HasRequiredSections(string(planBytes)) {
+			note := fmt.Sprintf(
+				"Implementation plan rejected: %s must contain both a \"## %s\" section and a "+
+					"\"## %s\" section, using exactly these headings.\n\n"+
+					"\"## %s\" must list at least one file, one per bullet, in the format\n"+
+					"    %s\n"+
+					"with the path first (backticks optional) — only the path is parsed, so it must be "+
+					"exact and relative to the repository root — and the list must be exhaustive, since "+
+					"worker works strictly from it without exploring the repository. Prose such as "+
+					"\"(none yet)\" or \"TBD\" does not count as a file.\n\n"+
+					"\"## %s\" holds the concrete command(s) that run this project's tests and linter.\n\n"+
+					"Rewrite the plan with both sections filled in.",
+				implPlanFile, implplan.FilesHeading, implplan.TestCommandHeading,
+				implplan.FilesHeading, implplan.FilesBulletFormat, implplan.TestCommandHeading)
+			if err := os.WriteFile(reviewPath, []byte(note), 0o644); err != nil {
+				return false, fmt.Errorf("write plan-contract review: %w", err)
+			}
+			o.Log.Printf("%s iteration %d: %s is missing or empty in the required Files/Test Command sections (Files must list at least one file); retrying planner next iteration", specFile, iter, implPlanFile)
+			o.copyArtifact(specFile, num, fmt.Sprintf("iter-%d-REVIEW.md", iter), reviewPath)
+			o.event(specFile, iter, "", "plan_rejected", runlog.F("review", reviewFile))
+			return false, nil
+		}
+		if o.stopRequested() {
+			return false, ErrInterrupted
+		}
+	} else {
+		o.copyArtifact(specFile, num, fmt.Sprintf("iter-%d-IMPL_PLAN.md", iter), implPlanPath)
 	}
 
+	implPlanBytes, err := os.ReadFile(implPlanPath)
+	if err != nil {
+		return false, fmt.Errorf("read impl plan: %w", err)
+	}
+	plan := string(implPlanBytes)
+
+	// workerOutput is this iteration's worker answer, for its
+	// ## Decisions section; workerRan is false when a resumed run
+	// skipped worker, whose answer is then not available.
+	var workerOutput string
+	workerRan := false
+	if !skipWorker {
+		workerResult, err := o.runStep(ctx, call, worker, workerPrompt(specFile, specContent, implPlanFile, plan, priorReview))
+		if err := o.checkBudgets(specFile, uw); err != nil {
+			return false, err
+		}
+		if err != nil {
+			return false, fmt.Errorf("worker: %w", err)
+		}
+		if err := o.checkCallCost("worker", workerResult); err != nil {
+			return false, err
+		}
+		workerOutput, workerRan = workerResult.Output, true
+		if o.stopRequested() {
+			return false, ErrInterrupted
+		}
+	}
+
+	testCommand := implplan.TestCommand(plan)
+
+	diffForTester := "[dry-run] diff computation skipped"
+	diffNote := ""
+	guidance := normalDiffGuidance
+	if !o.offline() {
+		td, err := o.buildTesterDiff(ctx, ws, plan)
+		if err != nil {
+			return false, err
+		}
+		if td.Empty {
+			o.Log.Printf("%s iteration %d: empty diff after worker, skipping tester (iteration unsuccessful)", specFile, iter)
+			o.event(specFile, iter, "", "empty_diff")
+			return false, nil
+		}
+		diffForTester, diffNote = td.Body, td.Note
+		if td.Oversized {
+			guidance = fmt.Sprintf(oversizedDiffGuidance, ws.base)
+		}
+	}
+
+	// The red-green tester note becomes its own paragraph after the
+	// diff guidance; without one the prompt is unchanged.
+	if o.Cfg.RedGreen && !o.offline() {
+		rg, err := o.redGreenCheck(ctx, specFile, specContent, ws, plan)
+		if err != nil {
+			return false, fmt.Errorf("red-green check: %w", err)
+		}
+		if rg.fail {
+			if err := os.WriteFile(reviewPath, []byte(rg.review), 0o644); err != nil {
+				return false, fmt.Errorf("write red-green review: %w", err)
+			}
+			o.Log.Printf("%s iteration %d: red-green check failed, skipping tester (iteration unsuccessful)", specFile, iter)
+			o.copyArtifact(specFile, num, fmt.Sprintf("iter-%d-REVIEW.md", iter), reviewPath)
+			o.event(specFile, iter, "", "redgreen_failed", runlog.F("review", reviewFile))
+			return false, nil
+		}
+		if rg.testerNote != "" {
+			guidance += "\n\n" + rg.testerNote
+		}
+	}
+
+	prompt := testerPrompt(testerPromptInput{
+		specFile: specFile, specContent: specContent, implPlanFile: implPlanFile, plan: plan,
+		testCommand: testCommand, diffNote: diffNote, diff: diffForTester, guidance: guidance,
+		reviewPath: reviewPath, statusPath: o.Layout.StatusPath,
+	})
+	testerResult, err := o.runStep(ctx, call, tester, prompt)
+	if err != nil {
+		return false, fmt.Errorf("tester: %w", err)
+	}
+
+	status, err := specs.GetStatus(o.Layout, specFile)
+	if err != nil {
+		return false, err
+	}
+	o.copyArtifact(specFile, num, fmt.Sprintf("iter-%d-REVIEW.md", iter), reviewPath)
+	verdict := "NOT_DONE"
+	if status == specs.StatusDone {
+		verdict = specs.StatusDone
+	}
+	verdictFields := []runlog.Field{runlog.F("verdict", verdict), runlog.F("review", reviewFile)}
+	if in.escalated {
+		verdictFields = append(verdictFields, runlog.F("escalated", true))
+	}
+	o.event(specFile, iter, "tester", "verdict", verdictFields...)
+	if status == specs.StatusDone {
+		o.event(specFile, iter, "tester", "status", runlog.F("status", specs.StatusDone), runlog.F("by", "tester"))
+		o.recordDecisions(specFile, num, iter, workerOutput, workerRan)
+		// A task that just reached DONE is never failed for cost after
+		// the fact — that would throw away completed work for no
+		// benefit, since there's no further spend left to prevent this
+		// iteration was the last call regardless.
+		return true, nil
+	}
+	if err := o.checkBudgets(specFile, uw); err != nil {
+		return false, err
+	}
+	if err := o.checkCallCost("tester", testerResult); err != nil {
+		return false, err
+	}
+	// A stop requested meanwhile is honoured at the top of the next
+	// iteration; after the last one the budget is spent anyway.
 	return false, nil
 }
 
@@ -778,9 +878,14 @@ type agentCall struct {
 	specFile string
 	num      string
 	iter     int
-	workDir  string
-	uw       *usage.Writer
-	tally    *iterationTally
+
+	// escalated marks a call of the escalated iteration (--on-fail
+	// escalate), which is logged as such.
+	escalated bool
+
+	workDir string
+	uw      *usage.Writer
+	tally   *iterationTally
 }
 
 // iterationTally sums the parsed usage of every agent turn in one
@@ -796,8 +901,13 @@ type iterationTally struct {
 // to usage.jsonl.
 func (o *Orchestrator) runAgent(ctx context.Context, c agentCall, a *agents.Agent, prompt string) (agents.RunResult, error) {
 	prefix := fmt.Sprintf("%s iter %d/%d: [%s]", c.specFile, c.iter, o.Cfg.Iter, a.Name)
+	startFields := []runlog.Field{runlog.F("model", a.Model)}
+	if c.escalated {
+		prefix = fmt.Sprintf("%s iter %d (escalated): [%s]", c.specFile, c.iter, a.Name)
+		startFields = append(startFields, runlog.F("escalated", true))
+	}
 	o.Log.Printf("%s started (model=%s)", prefix, a.Model)
-	o.event(c.specFile, c.iter, a.Name, "agent_start", runlog.F("model", a.Model))
+	o.event(c.specFile, c.iter, a.Name, "agent_start", startFields...)
 
 	stopHeartbeat := o.startHeartbeat(prefix)
 	result, err := o.Runner.Run(ctx, c.workDir, a, prompt)

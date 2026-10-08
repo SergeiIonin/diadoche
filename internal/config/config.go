@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"diadoche/internal/agents"
+	"diadoche/internal/onfail"
 	"diadoche/internal/redgreen"
 )
 
@@ -79,6 +80,7 @@ const helpSynopsis = `SYNOPSIS
              [--red-green=<bool>] [--test-globs <list>]
              [--fresh] [--shutdown-timeout <duration>]
              [--on-task-done <command>]... [--hook-timeout <duration>]
+             [--on-fail <list>] [--escalation-model <name>]
     diadoche --preprocess --task <path> [--dir <path>] [--claude-bin <path>]
              [--preprocessor-model <name>]
     diadoche --initialize <project-path>
@@ -99,7 +101,9 @@ const helpDescription = `DESCRIPTION
     the changes (and, with --worktree, merges them; see WORKTREES below),
     runs the --on-task-done hooks (see ON-TASK-DONE HOOKS) and moves on to
     the next task; if --ITER rounds run out
-    without a DONE verdict, diadoche itself marks the task FAILED. Once the
+    without a DONE verdict, diadoche applies the --on-fail policies (by
+    default: one escalated round on a stronger model, then BLOCKED; see
+    ON-FAIL POLICIES), and with --on-fail "" marks the task FAILED. Once the
     queue drains, diadoche checks spec/ for new task files once more before
     exiting, so tasks added concurrently (e.g. by --preprocess) are picked
     up without a manual restart.
@@ -294,6 +298,11 @@ const helpModels = `MODEL SELECTION
     flag value, an env var set to the empty string, or a blank model:
     field), is a startup error, before any claude process runs.
 
+    The escalation model of --on-fail escalate (planner and worker of the
+    escalated round) is resolved the same way: --escalation-model, else
+    DIADOCHE_ESCALATION_MODEL, else claude-fable-5-1. It is validated at
+    startup like every other model, whether or not the chain escalates.
+
 `
 
 const helpCallBudget = `PER-CALL BUDGET
@@ -414,6 +423,54 @@ const helpHooks = `ON-TASK-DONE HOOKS
 
 `
 
+const helpOnFail = `ON-FAIL POLICIES
+    --on-fail <list> is a comma-separated, ordered list of policies applied
+    one after another to a task whose --ITER iterations ran out without a
+    DONE verdict (default "escalate,block"). Each policy either ends the
+    task or hands it to the next one; a chain that runs out without ending
+    it leaves the task FAILED. --on-fail "" is the behaviour from before
+    policies existed: the task becomes FAILED and its changes are parked
+    (spec/NNN_FAILED.md). A task cut short by anything else (an agent
+    error, --max-call-cost, --max-cost-per-task) is FAILED at once, and a
+    usage limit, a signal or --max-cost-per-run leave it pending as always.
+    An unknown policy name, a policy given twice or a policy after block is
+    a startup error.
+
+    escalate
+        Runs one more complete planner -> worker -> tester round, numbered
+        --ITER+1 (NNN_REVIEW_<ITER+1>.md, iter-<ITER+1>-* artifacts,
+        usage.jsonl iteration ITER+1), with planner and worker on
+        --escalation-model (else DIADOCHE_ESCALATION_MODEL, else
+        claude-fable-5-1); tester keeps its own model. The round gets the
+        same inputs as any other (the last review included) and the same
+        plan check, red-green check, limit pauses and budgets; run.log marks
+        it (escalation_start, escalated=true). If tester marks the task
+        DONE, it is finished as usual (commit/merge, --on-task-done hooks)
+        and the rest of the chain is skipped.
+    block
+        The task becomes "BLOCKED: <reason>" in STATUS.md, the reason naming
+        the policies applied. With --worktree its changes are committed on
+        its branch diadoche/<NNN>-<slug> and the worktree and branch are
+        kept, like a merge conflict; with --worktree=false they are parked
+        on diadoche/blocked/<NNN>-<slug> (no NNN_FAILED.md). spec/
+        NNN_BLOCKED.md explains what was tried and where the changes are.
+        Every pending task whose spec has a "Depends-on: NNN" line naming a
+        BLOCKED task becomes BLOCKED too ("depends on <spec>, which is
+        BLOCKED"), transitively. BLOCKED tasks are never re-queued; set the
+        row back to QUEUED in STATUS.md to retry one.
+
+    A task spec may declare its dependencies on a line of its own:
+        Depends-on: 003, 007
+    (task numbers, comma- or space-separated). A spec without such a line
+    depends on nothing, and nothing cascades to it.
+
+    Every applied policy is a run.log event "on_fail_policy policy=<name>
+    step=<n> outcome=<done|not_done|blocked|error|interrupted>"; the final
+    status and reason are in STATUS.md. --dry-run applies no policy and
+    changes no status.
+
+`
+
 const helpFlagsHeader = `FLAGS
 
 `
@@ -424,8 +481,10 @@ FILES
         Source of truth for every task's status: QUEUED, IN_PROGRESS,
         PAUSED, DONE, FAILED or BLOCKED. A BLOCKED or PAUSED row (and a
         task FAILED by its budget) carries its reason in the Status cell
-        ("BLOCKED: <reason>"); so does a DONE row whose --on-task-done hook
-        failed ("DONE: on-task-done hook 1 failed (exit 2)").
+        ("BLOCKED: <reason>": a merge conflict, the --on-fail policies that
+        were applied, or the blocked task it depends on); so does a DONE
+        row whose --on-task-done hook failed ("DONE: on-task-done hook 1
+        failed (exit 2)") or that an escalated round finished.
 
     <project>/.claude/diadoche/spec/QUEUE.md
         This run's work queue, rebuilt from STATUS.md on every sync. A
@@ -436,7 +495,9 @@ FILES
         A task spec. diadoche also writes NNN_IMPL_PLAN.md and
         NNN_REVIEW_<M>.md alongside it as the task progresses. A line
         <!-- diadoche: no-tests --> in the spec marks a task that needs no
-        tests (see RED-GREEN CHECK).
+        tests (see RED-GREEN CHECK). An optional line
+        Depends-on: NNN[, NNN...] names the tasks it depends on: when one
+        of them is BLOCKED, so is this one (see ON-FAIL POLICIES).
 
     <project>/.claude/agents/<name>.md
         Optional per-project override of a built-in agent's prompt/model
@@ -459,6 +520,12 @@ FILES
     <project>/.claude/diadoche/spec/NNN_FAILED.md
         Written when a task FAILED: the branch its changes were parked on,
         their diff --stat, the last review, and how to restore them.
+
+    <project>/.claude/diadoche/spec/NNN_BLOCKED.md
+        Written when --on-fail block BLOCKED a task: the reason, the
+        policies applied and their outcomes, the last review, where the
+        changes are (worktree and branch, or the parked branch), the tasks
+        blocked along with it, and how to resume.
 
     <project>/.claude/diadoche/worktrees/<NNN>-<slug>/
         With --worktree, the git worktree a task runs in (branch
@@ -514,6 +581,12 @@ const helpExamples = `EXAMPLES
     Save cost by running worker on a cheaper model:
         diadoche --dir /path/to/project --worker-model claude-sonnet-5-5
         DIADOCHE_WORKER_MODEL=claude-sonnet-5-5 diadoche --dir /path/to/project
+
+    Escalate a task that ran out of iterations to Opus, then block it:
+        diadoche --dir /path/to/project --on-fail escalate,block --escalation-model claude-opus-5-5
+
+    Fail exhausted tasks right away, as before --on-fail existed:
+        diadoche --dir /path/to/project --on-fail ""
 
     Regenerate the docs after every finished task (committed separately):
         diadoche --dir /path/to/project --on-task-done 'make docs'
@@ -624,6 +697,19 @@ type Config struct {
 	// HookTimeout kills an --on-task-done command (and its process group)
 	// that runs longer than this; see DefaultHookTimeout.
 	HookTimeout time.Duration
+
+	// OnFail is the ordered --on-fail policy chain (see package onfail)
+	// applied to a task whose --ITER iterations ran out. nil, the zero
+	// value, means the task goes FAILED and is parked, as before policies
+	// existed; Parse defaults it to escalate,block.
+	OnFail []string
+
+	// EscalationModel is the model planner and worker of an escalated
+	// round run on: --escalation-model, else DIADOCHE_ESCALATION_MODEL,
+	// else onfail.DefaultEscalationModel (Source agents.ModelSourceDefault).
+	// Always set and validated by Parse; the zero value (a Config built by
+	// hand) means the default.
+	EscalationModel agents.ModelOverride
 }
 
 // TaskPath resolves --task relative to --dir, unless it's already absolute.
@@ -668,6 +754,8 @@ func Parse(args []string) (*Config, error) {
 	var onTaskDone StringList
 	fs.Var(&onTaskDone, "on-task-done", "run this shell command (sh -c) in the repository root after a task is DONE and merged; repeatable, run in the order given; a failure is only a warning")
 	hookTimeout := fs.Duration("hook-timeout", DefaultHookTimeout, "kill an --on-task-done command (and its process group) that runs longer than this")
+	onFailFlag := fs.String("on-fail", onfail.DefaultChain, "comma-separated, ordered policies applied when a task's --ITER iterations run out without DONE: "+strings.Join(onfail.Names, ", ")+"; \"\" marks the task FAILED and parks its changes")
+	escalationModel := fs.String("escalation-model", "", "model of planner and worker in the escalated round of --on-fail escalate (else $DIADOCHE_ESCALATION_MODEL, else "+onfail.DefaultEscalationModel+")")
 	maxCostPerRun := fs.Float64("max-cost-per-run", 0, "stop the run after the current agent call once this run's recorded cost exceeds this many USD; the current task stays pending and diadoche exits non-zero (0 = no limit)")
 
 	if err := fs.Parse(args); err != nil {
@@ -753,6 +841,15 @@ func Parse(args []string) (*Config, error) {
 		return nil, err
 	}
 
+	onFail, err := onfail.Parse(*onFailFlag)
+	if err != nil {
+		return nil, err
+	}
+	escalation, err := resolveEscalationModel(passed, *escalationModel)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Config{
 		Dir:                *dir,
 		Iter:               *iter,
@@ -780,7 +877,35 @@ func Parse(args []string) (*Config, error) {
 		ShutdownTimeout:    *shutdownTimeout,
 		OnTaskDone:         []string(onTaskDone),
 		HookTimeout:        *hookTimeout,
+		OnFail:             onFail,
+		EscalationModel:    escalation,
 	}, nil
+}
+
+// escalationModelEnv is the environment variable of --escalation-model.
+const escalationModelEnv = "DIADOCHE_ESCALATION_MODEL"
+
+// resolveEscalationModel resolves --escalation-model with the usual flag >
+// environment variable > default priority and validates the result against
+// agents.KnownModels: an unknown name is a startup error whether or not the
+// chain escalates.
+func resolveEscalationModel(passed map[string]bool, flagVal string) (agents.ModelOverride, error) {
+	ov, err := resolveModelOverride(passed, "escalation-model", flagVal, escalationModelEnv)
+	if err != nil {
+		return agents.ModelOverride{}, err
+	}
+	if !ov.IsSet() {
+		return agents.ModelOverride{Value: onfail.DefaultEscalationModel, Source: agents.ModelSourceDefault}, nil
+	}
+	if !agents.KnownModels[ov.Value] {
+		name := "--escalation-model"
+		if ov.Source == agents.ModelSourceEnv {
+			name = escalationModelEnv
+		}
+		return agents.ModelOverride{}, fmt.Errorf("%s: unknown model %q (source: %s; known models: %s)",
+			name, ov.Value, ov.Source, strings.Join(agents.KnownModelNames(), ", "))
+	}
+	return ov, nil
 }
 
 // resolveModelOverride implements the flag > environment variable priority
@@ -823,6 +948,7 @@ func printHelp(fs *flag.FlagSet, w io.Writer) {
 	fmt.Fprint(w, helpUsageLimits)
 	fmt.Fprint(w, helpShutdown)
 	fmt.Fprint(w, helpHooks)
+	fmt.Fprint(w, helpOnFail)
 	fmt.Fprint(w, helpFlagsHeader)
 	fs.SetOutput(w)
 	fs.PrintDefaults()

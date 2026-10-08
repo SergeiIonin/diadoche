@@ -4,8 +4,10 @@
 //
 // A task's status is QUEUED, IN_PROGRESS, PAUSED (waiting out a claude
 // usage or rate limit, see Row.Reason for when it resumes), DONE, FAILED or
-// BLOCKED (DONE by tester, but its worktree branch couldn't be merged; it
-// waits for a human). Only QUEUED, IN_PROGRESS and PAUSED tasks are pending.
+// BLOCKED (waits for a human: DONE by tester, but its worktree branch
+// couldn't be merged; not DONE after the --on-fail chain ended in block; or
+// it depends on a BLOCKED task, see ParseDependsOn and BlockDependents).
+// Only QUEUED, IN_PROGRESS and PAUSED tasks are pending.
 package specs
 
 import (
@@ -105,9 +107,9 @@ func (l Layout) Ensure() error {
 var taskFileRe = regexp.MustCompile(`^(\d+)[_-](.+)\.md$`)
 
 // generatedRe matches slugs produced by diadoche itself, which are not
-// user-authored task specs: NNN_IMPL_PLAN.md, NNN_REVIEW_<M>.md and
-// NNN_FAILED.md.
-var generatedRe = regexp.MustCompile(`(?i)^(IMPL_PLAN|REVIEW_\d+|FAILED)$`)
+// user-authored task specs: NNN_IMPL_PLAN.md, NNN_REVIEW_<M>.md,
+// NNN_FAILED.md and NNN_BLOCKED.md.
+var generatedRe = regexp.MustCompile(`(?i)^(IMPL_PLAN|REVIEW_\d+|FAILED|BLOCKED)$`)
 
 // DiscoverTaskFiles lists user-authored task spec filenames in specDir,
 // excluding STATUS.md, QUEUE.md and diadoche-generated files.
@@ -425,4 +427,114 @@ func HasNoTestsMarker(specContent []byte) bool {
 		}
 	}
 	return false
+}
+
+// DependsOnPrefix starts the optional line of a task spec naming the tasks
+// it depends on: "Depends-on: 003, 007". A task depending on a BLOCKED task
+// is BLOCKED too (see BlockDependents); a spec without the line depends on
+// nothing.
+const DependsOnPrefix = "Depends-on:"
+
+var dependsOnRe = regexp.MustCompile(`(?i)^depends-on:\s*(.*)$`)
+
+// ParseDependsOn returns the task numbers named on specContent's
+// Depends-on lines (the key is case-insensitive; several lines add up), in
+// order and without duplicates. Numbers are comma- or space-separated; a
+// spec file name such as 003_foo.md counts as its number, and anything else
+// that isn't a plain number is ignored. nil means no dependencies.
+func ParseDependsOn(specContent []byte) []string {
+	var out []string
+	for line := range strings.SplitSeq(string(specContent), "\n") {
+		m := dependsOnRe.FindStringSubmatch(strings.TrimSpace(line))
+		if m == nil {
+			continue
+		}
+		for tok := range strings.FieldsFuncSeq(m[1], func(r rune) bool { return r == ',' || r == ' ' || r == '\t' }) {
+			num := TaskNumber(strings.Trim(tok, "`"))
+			if num == "" || strings.Trim(num, "0123456789") != "" {
+				continue
+			}
+			dup := false
+			for _, seen := range out {
+				dup = dup || sameTaskNumber(seen, num)
+			}
+			if !dup {
+				out = append(out, num)
+			}
+		}
+	}
+	return out
+}
+
+// sameTaskNumber compares task numbers numerically when both are integers
+// (so "7" and "007" are the same task), else as strings.
+func sameTaskNumber(a, b string) bool {
+	x, errA := strconv.Atoi(a)
+	y, errB := strconv.Atoi(b)
+	if errA == nil && errB == nil {
+		return x == y
+	}
+	return a == b
+}
+
+// BlockDependents marks BLOCKED every pending (QUEUED, IN_PROGRESS or
+// PAUSED) task whose spec declares, via a Depends-on line, a dependency on
+// blockedSpec — and, transitively, every pending task depending on one of
+// those. Each newly blocked row's reason names its direct blocker. DONE,
+// FAILED and BLOCKED rows are left alone, as is a row whose spec file can't
+// be read. STATUS.md is written once, and only if something changed; the
+// newly blocked rows are returned in STATUS.md order.
+func BlockDependents(l Layout, blockedSpec string) ([]Row, error) {
+	rows, err := ReadStatus(l.StatusPath)
+	if err != nil {
+		return nil, err
+	}
+	deps := make([][]string, len(rows))
+	for i, r := range rows {
+		if r.Status != StatusQueued && r.Status != StatusInProgress && r.Status != StatusPaused {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(l.SpecDir, r.Spec))
+		if err != nil {
+			continue
+		}
+		deps[i] = ParseDependsOn(b)
+	}
+
+	type blocker struct{ num, spec string }
+	frontier := []blocker{{TaskNumber(blockedSpec), blockedSpec}}
+	changed := map[int]bool{}
+	for len(frontier) > 0 {
+		var next []blocker
+		for _, b := range frontier {
+			for i := range rows {
+				if changed[i] || rows[i].Spec == blockedSpec || len(deps[i]) == 0 {
+					continue
+				}
+				for _, d := range deps[i] {
+					if sameTaskNumber(d, b.num) {
+						rows[i].Status = StatusBlocked
+						rows[i].Reason = fmt.Sprintf("depends on %s, which is BLOCKED", b.spec)
+						changed[i] = true
+						next = append(next, blocker{TaskNumber(rows[i].Spec), rows[i].Spec})
+						break
+					}
+				}
+			}
+		}
+		frontier = next
+	}
+	if len(changed) == 0 {
+		return nil, nil
+	}
+	if err := WriteStatus(l.StatusPath, rows); err != nil {
+		return nil, err
+	}
+	var out []Row
+	for i, r := range rows {
+		if changed[i] {
+			out = append(out, r)
+		}
+	}
+	return out, nil
 }

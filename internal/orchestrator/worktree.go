@@ -225,6 +225,18 @@ func (o *Orchestrator) failWorktree(ctx context.Context, specFile, num string, w
 	return nil
 }
 
+// blockWorktree preserves a task BLOCKED by --on-fail block in worktree
+// mode the way a merge conflict does: its changes are committed on its
+// branch, and the worktree and branch are kept for a human (and for the
+// next run, should the task be re-queued). stat is the branch's diff --stat
+// against the task's base. Nothing is merged.
+func (o *Orchestrator) blockWorktree(ctx context.Context, specFile string, ws *workspace) (stat string, err error) {
+	if _, err := gitutil.CommitAllExcluding(ctx, ws.dir, "diadoche: BLOCKED "+specFile, ws.exclude...); err != nil {
+		return "", fmt.Errorf("commit %s on %s: %w", specFile, ws.branch, err)
+	}
+	return gitutil.DiffStat(ctx, o.Cfg.Dir, ws.base, ws.branch)
+}
+
 // commitBookkeeping commits diadoche's own files (.claude/diadoche) in the
 // main working tree. The task's code is already safe on its branch, so a
 // commit that can't be made (e.g. .claude/diadoche is gitignored) is only

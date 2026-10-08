@@ -37,7 +37,9 @@ DESCRIPTION
 
       1. stops diadoche (and any claude call it has in flight) right away,
          before it fails the rest of the queue against an exhausted account;
-      2. removes every task from spec/STATUS.md except DONE, BLOCKED and
+      2. removes every task from spec/STATUS.md except DONE, BLOCKED (a
+         merge conflict, diadoche's --on-fail block, or a BLOCKED task it
+         depends on) and
          parked FAILED ones (those with a spec/<NNN>_FAILED.md), so the next
          run re-queues them instead of treating them as FAILED — diadoche
          then resumes each one from the plan/reviews already on disk (and,

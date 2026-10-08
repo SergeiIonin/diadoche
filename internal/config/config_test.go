@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -531,6 +532,122 @@ func TestParseHelpMentionsOnTaskDoneHooks(t *testing.T) {
 	for _, want := range []string{"--on-task-done", "--hook-timeout", "ON-TASK-DONE HOOKS", "DIADOCHE_TASK_ID",
 		"DIADOCHE_TASK_TITLE", "DIADOCHE_REPO_ROOT", "DIADOCHE_BASE_COMMIT", "DIADOCHE_MERGE_COMMIT",
 		"DIADOCHE_DECISIONS_FILE", "on-task-done-<N>.stdout"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("help output missing %q", want)
+		}
+	}
+}
+
+func TestParseOnFailDefaultAndValues(t *testing.T) {
+	t.Setenv("DIADOCHE_ESCALATION_MODEL", "")
+	os.Unsetenv("DIADOCHE_ESCALATION_MODEL")
+	cfg, err := Parse(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(cfg.OnFail, []string{"escalate", "block"}) {
+		t.Errorf("default OnFail = %v, want [escalate block]", cfg.OnFail)
+	}
+	want := agents.ModelOverride{Value: "claude-fable-5-1", Source: agents.ModelSourceDefault}
+	if cfg.EscalationModel != want {
+		t.Errorf("default EscalationModel = %+v, want %+v", cfg.EscalationModel, want)
+	}
+
+	cfg, err = Parse([]string{"--on-fail", ""})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.OnFail != nil {
+		t.Errorf(`--on-fail "" OnFail = %v, want nil`, cfg.OnFail)
+	}
+	cfg, err = Parse([]string{"--on-fail", "block"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(cfg.OnFail, []string{"block"}) {
+		t.Errorf("--on-fail block OnFail = %v", cfg.OnFail)
+	}
+}
+
+func TestParseOnFailRejectsBadChains(t *testing.T) {
+	_, err := Parse([]string{"--on-fail", "bogus"})
+	if err == nil {
+		t.Fatal("--on-fail bogus should be a startup error")
+	}
+	for _, want := range []string{"bogus", "escalate", "block"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+	for _, bad := range []string{"block,escalate", "escalate,escalate", "escalate,"} {
+		if _, err := Parse([]string{"--on-fail", bad}); err == nil {
+			t.Errorf("--on-fail %q should be a startup error", bad)
+		}
+	}
+}
+
+func TestParseEscalationModel(t *testing.T) {
+	t.Setenv("DIADOCHE_ESCALATION_MODEL", "")
+	os.Unsetenv("DIADOCHE_ESCALATION_MODEL")
+	cfg, err := Parse([]string{"--escalation-model", "claude-opus-5-5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (agents.ModelOverride{Value: "claude-opus-5-5", Source: agents.ModelSourceFlag}); cfg.EscalationModel != want {
+		t.Errorf("EscalationModel = %+v, want %+v", cfg.EscalationModel, want)
+	}
+
+	_, err = Parse([]string{"--escalation-model", "nope"})
+	if err == nil {
+		t.Fatal("--escalation-model nope should be a startup error")
+	}
+	for _, want := range append([]string{"nope", "--escalation-model"}, agents.KnownModelNames()...) {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+	if _, err := Parse([]string{"--escalation-model", ""}); err == nil {
+		t.Error("an empty --escalation-model should be a startup error")
+	}
+}
+
+func TestParseEscalationModelEnv(t *testing.T) {
+	t.Setenv("DIADOCHE_ESCALATION_MODEL", "claude-sonnet-5-5")
+	cfg, err := Parse(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (agents.ModelOverride{Value: "claude-sonnet-5-5", Source: agents.ModelSourceEnv}); cfg.EscalationModel != want {
+		t.Errorf("env EscalationModel = %+v, want %+v", cfg.EscalationModel, want)
+	}
+
+	cfg, err = Parse([]string{"--escalation-model", "claude-opus-5-5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.EscalationModel.Value != "claude-opus-5-5" || cfg.EscalationModel.Source != agents.ModelSourceFlag {
+		t.Errorf("flag should win over env, got %+v", cfg.EscalationModel)
+	}
+
+	t.Setenv("DIADOCHE_ESCALATION_MODEL", "")
+	if _, err := Parse(nil); err == nil {
+		t.Error("DIADOCHE_ESCALATION_MODEL set but empty should be a startup error")
+	}
+
+	t.Setenv("DIADOCHE_ESCALATION_MODEL", "nope")
+	_, err = Parse(nil)
+	if err == nil || !strings.Contains(err.Error(), "DIADOCHE_ESCALATION_MODEL") || !strings.Contains(err.Error(), "nope") ||
+		!strings.Contains(err.Error(), "claude-fable-5-1") {
+		t.Errorf("unknown env escalation model: error = %v", err)
+	}
+}
+
+func TestParseHelpMentionsOnFail(t *testing.T) {
+	out := captureStdout(t, func() {
+		_, _ = Parse([]string{"--help"})
+	})
+	for _, want := range []string{"ON-FAIL POLICIES", "--on-fail", "--escalation-model", "DIADOCHE_ESCALATION_MODEL",
+		"escalate", "block", "Depends-on:", "NNN_BLOCKED.md", "diadoche/blocked/", "on_fail_policy"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("help output missing %q", want)
 		}

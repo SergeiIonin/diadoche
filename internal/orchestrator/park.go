@@ -131,9 +131,11 @@ func (o *Orchestrator) prepareWorkspace(ctx context.Context, specFile, num strin
 }
 
 // hasPriorProgress reports whether task num already ran before (its plan
-// or a review is on disk) and hasn't been parked since.
+// or a review is on disk) and hasn't been parked since: a FAILED task, or a
+// BLOCKED one re-queued by hand, starts over from a clean tree.
 func (o *Orchestrator) hasPriorProgress(num string) bool {
-	if fileExists(filepath.Join(o.Layout.SpecDir, num+"_FAILED.md")) {
+	if fileExists(filepath.Join(o.Layout.SpecDir, num+"_FAILED.md")) ||
+		fileExists(filepath.Join(o.Layout.SpecDir, num+"_BLOCKED.md")) {
 		return false
 	}
 	if fileExists(filepath.Join(o.Layout.SpecDir, num+"_IMPL_PLAN.md")) {
@@ -184,60 +186,9 @@ func (o *Orchestrator) failTask(ctx context.Context, specFile, num string, ws *w
 // spec/<num>_FAILED.md records where the changes went, and the task's
 // bookkeeping is committed to the current branch as "diadoche: FAILED".
 func (o *Orchestrator) park(ctx context.Context, specFile, num string, ws *workspace, cause error) error {
-	changed, err := gitutil.ChangedPathsExcluding(ctx, o.Cfg.Dir, ws.base, ws.exclude...)
+	branch, stat, restorable, err := o.parkChanges(ctx, specFile, num, ws, failedBranchPrefix, "diadoche: parked FAILED "+specFile)
 	if err != nil {
 		return err
-	}
-	// HEAD normally still is ws.base: diadoche commits only DONE tasks.
-	// If something else committed meanwhile (the worker itself, or a
-	// commit made while diadoche was down), only what's still uncommitted
-	// is the task's to park, and the tree is reverted to HEAD, never
-	// behind it.
-	head, err := gitutil.BaseCommit(ctx, o.Cfg.Dir)
-	if err != nil {
-		return err
-	}
-	uncommitted := map[string]bool{}
-	if head != ws.base {
-		sinceHead, err := gitutil.ChangedPathsExcluding(ctx, o.Cfg.Dir, head, ws.exclude...)
-		if err != nil {
-			return err
-		}
-		for _, p := range sinceHead {
-			uncommitted[p] = true
-		}
-	}
-	var paths []string
-	for _, p := range changed {
-		if !ws.preexisting[p] && (head == ws.base || uncommitted[p]) {
-			paths = append(paths, p)
-		}
-	}
-
-	var branch, stat string
-	var restorable []string // parked files a checkout can bring back (not deletions)
-	if len(paths) > 0 {
-		branch = o.failedBranchName(ctx, specFile, num)
-		commit, err := gitutil.ParkPaths(ctx, o.Cfg.Dir, ws.base, branch, "diadoche: parked FAILED "+specFile, paths)
-		if err != nil {
-			return err
-		}
-		if stat, err = gitutil.DiffStat(ctx, o.Cfg.Dir, ws.base, commit); err != nil {
-			return err
-		}
-		for _, p := range paths {
-			if fileExists(filepath.Join(o.Cfg.Dir, filepath.FromSlash(p))) {
-				restorable = append(restorable, p)
-			}
-		}
-		if err := gitutil.RestorePaths(ctx, o.Cfg.Dir, head, paths); err != nil {
-			return fmt.Errorf("revert parked files (they're safe on branch %s): %w", branch, err)
-		}
-		o.Log.Printf("task %s: parked %d changed file(s) on branch %s", specFile, len(paths), branch)
-		o.event(specFile, 0, "", "park", runlog.F("branch", branch), runlog.F("files", len(paths)))
-	} else {
-		o.Log.Printf("task %s: no code changes to park, no branch created", specFile)
-		o.event(specFile, 0, "", "park", runlog.F("branch", "none"))
 	}
 
 	failedPath := filepath.Join(o.Layout.SpecDir, num+"_FAILED.md")
@@ -253,6 +204,69 @@ func (o *Orchestrator) park(ctx context.Context, specFile, num string, ws *works
 		o.Log.Printf("task %s: couldn't commit its bookkeeping files: %v", specFile, err)
 	}
 	return nil
+}
+
+// parkChanges commits every path changed since ws.base (except diadoche's
+// own directories and ws.preexisting) on top of ws.base to a new
+// <branchPrefix><NNN>-<slug> branch, with message, then reverts them in the
+// working tree; HEAD and the current branch stay where they are. branch is
+// "" when there was nothing to park; restorable are the parked files a
+// checkout can bring back (not deletions).
+func (o *Orchestrator) parkChanges(ctx context.Context, specFile, num string, ws *workspace, branchPrefix, message string) (branch, stat string, restorable []string, err error) {
+	changed, err := gitutil.ChangedPathsExcluding(ctx, o.Cfg.Dir, ws.base, ws.exclude...)
+	if err != nil {
+		return "", "", nil, err
+	}
+	// HEAD normally still is ws.base: diadoche commits only DONE tasks.
+	// If something else committed meanwhile (the worker itself, or a
+	// commit made while diadoche was down), only what's still uncommitted
+	// is the task's to park, and the tree is reverted to HEAD, never
+	// behind it.
+	head, err := gitutil.BaseCommit(ctx, o.Cfg.Dir)
+	if err != nil {
+		return "", "", nil, err
+	}
+	uncommitted := map[string]bool{}
+	if head != ws.base {
+		sinceHead, err := gitutil.ChangedPathsExcluding(ctx, o.Cfg.Dir, head, ws.exclude...)
+		if err != nil {
+			return "", "", nil, err
+		}
+		for _, p := range sinceHead {
+			uncommitted[p] = true
+		}
+	}
+	var paths []string
+	for _, p := range changed {
+		if !ws.preexisting[p] && (head == ws.base || uncommitted[p]) {
+			paths = append(paths, p)
+		}
+	}
+
+	if len(paths) > 0 {
+		branch = o.uniqueBranchName(ctx, branchPrefix, specFile, num)
+		commit, err := gitutil.ParkPaths(ctx, o.Cfg.Dir, ws.base, branch, message, paths)
+		if err != nil {
+			return "", "", nil, err
+		}
+		if stat, err = gitutil.DiffStat(ctx, o.Cfg.Dir, ws.base, commit); err != nil {
+			return "", "", nil, err
+		}
+		for _, p := range paths {
+			if fileExists(filepath.Join(o.Cfg.Dir, filepath.FromSlash(p))) {
+				restorable = append(restorable, p)
+			}
+		}
+		if err := gitutil.RestorePaths(ctx, o.Cfg.Dir, head, paths); err != nil {
+			return "", "", nil, fmt.Errorf("revert parked files (they're safe on branch %s): %w", branch, err)
+		}
+		o.Log.Printf("task %s: parked %d changed file(s) on branch %s", specFile, len(paths), branch)
+		o.event(specFile, 0, "", "park", runlog.F("branch", branch), runlog.F("files", len(paths)))
+	} else {
+		o.Log.Printf("task %s: no code changes to park, no branch created", specFile)
+		o.event(specFile, 0, "", "park", runlog.F("branch", "none"))
+	}
+	return branch, stat, restorable, nil
 }
 
 // failedReport renders spec/<num>_FAILED.md. inWorktree says the task ran
@@ -309,11 +323,25 @@ func taskID(specFile, num string) string {
 	return num + "-" + slug
 }
 
-// failedBranchName returns diadoche/failed/<num>-<slug>, with a -2, -3...
-// suffix if a branch of that name already exists (a task that FAILED
-// again after being retried), so earlier parked work is never overwritten.
+// failedBranchPrefix and blockedBranchPrefix prefix the branches a FAILED
+// task's changes and, with --worktree=false, a BLOCKED task's changes are
+// parked on.
+const (
+	failedBranchPrefix  = "diadoche/failed/"
+	blockedBranchPrefix = "diadoche/blocked/"
+)
+
+// failedBranchName returns diadoche/failed/<num>-<slug>, see
+// uniqueBranchName.
 func (o *Orchestrator) failedBranchName(ctx context.Context, specFile, num string) string {
-	name := "diadoche/failed/" + taskID(specFile, num)
+	return o.uniqueBranchName(ctx, failedBranchPrefix, specFile, num)
+}
+
+// uniqueBranchName returns <prefix><num>-<slug>, with a -2, -3... suffix if
+// a branch of that name already exists (a task that FAILED again after
+// being retried), so earlier parked work is never overwritten.
+func (o *Orchestrator) uniqueBranchName(ctx context.Context, prefix, specFile, num string) string {
+	name := prefix + taskID(specFile, num)
 	candidate := name
 	for n := 2; gitutil.BranchExists(ctx, o.Cfg.Dir, candidate); n++ {
 		candidate = fmt.Sprintf("%s-%d", name, n)

@@ -493,3 +493,130 @@ func TestPendingQueueOnMissingSpecDir(t *testing.T) {
 		t.Fatalf("%s was created (stat err = %v)", l.Root, err)
 	}
 }
+
+func TestDiscoverTaskFilesIgnoresBlockedReport(t *testing.T) {
+	dir := t.TempDir()
+	for _, f := range []string{"001_example.md", "001_BLOCKED.md", "001_FAILED.md"} {
+		if err := os.WriteFile(filepath.Join(dir, f), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := DiscoverTaskFiles(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "001_example.md" {
+		t.Errorf("DiscoverTaskFiles = %v, want only 001_example.md", got)
+	}
+}
+
+func TestParseDependsOn(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"# T\n\nDepends-on: 001\n", []string{"001"}},
+		{"Depends-on: 001, 3\n", []string{"001", "3"}},
+		{"  depends-ON:   007 008\n", []string{"007", "008"}},
+		{"Depends-on: 016_foo.md, `017`\n", []string{"016", "017"}},
+		{"Depends-on: none, 002, x7\n", []string{"002"}},
+		{"Depends-on: 1\nDepends-on: 001, 2\n", []string{"1", "2"}},
+		{"# T\nno such line\nThis depends-on: 001 inline\n", nil},
+		{"", nil},
+	}
+	for _, c := range cases {
+		got := ParseDependsOn([]byte(c.in))
+		if strings.Join(got, ",") != strings.Join(c.want, ",") || (got == nil) != (c.want == nil) {
+			t.Errorf("ParseDependsOn(%q) = %#v, want %#v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestBlockDependentsCascades(t *testing.T) {
+	l := NewLayout(t.TempDir())
+	if err := l.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	specs := map[string]string{
+		"001_a.md": "# A\n",
+		"002_b.md": "# B\nDepends-on: 001\n",
+		"003_c.md": "# C\nDepends-on: 2\n",
+		"004_d.md": "# D\n",
+		"005_e.md": "# E\nDepends-on: 001\n",
+		"006_f.md": "# F\nDepends-on: 004\n",
+	}
+	for f, body := range specs {
+		if err := os.WriteFile(filepath.Join(l.SpecDir, f), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows := []Row{
+		{Num: "001", Spec: "001_a.md", Status: StatusBlocked, Reason: "on-fail"},
+		{Num: "002", Spec: "002_b.md", Status: StatusQueued},
+		{Num: "003", Spec: "003_c.md", Status: StatusPaused},
+		{Num: "004", Spec: "004_d.md", Status: StatusQueued},
+		{Num: "005", Spec: "005_e.md", Status: StatusDone},
+		{Num: "006", Spec: "006_f.md", Status: StatusQueued},
+	}
+	if err := WriteStatus(l.StatusPath, rows); err != nil {
+		t.Fatal(err)
+	}
+
+	blocked, err := BlockDependents(l, "001_a.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blocked) != 2 || blocked[0].Spec != "002_b.md" || blocked[1].Spec != "003_c.md" {
+		t.Fatalf("newly blocked = %+v, want 002 and 003", blocked)
+	}
+
+	got, err := ReadStatus(l.StatusPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]Row{
+		"001_a.md": {Status: StatusBlocked, Reason: "on-fail"},
+		"002_b.md": {Status: StatusBlocked, Reason: "depends on 001_a.md, which is BLOCKED"},
+		"003_c.md": {Status: StatusBlocked, Reason: "depends on 002_b.md, which is BLOCKED"},
+		"004_d.md": {Status: StatusQueued},
+		"005_e.md": {Status: StatusDone},
+		"006_f.md": {Status: StatusQueued},
+	}
+	for _, r := range got {
+		w := want[r.Spec]
+		if r.Status != w.Status || r.Reason != w.Reason {
+			t.Errorf("%s = %s: %q, want %s: %q", r.Spec, r.Status, r.Reason, w.Status, w.Reason)
+		}
+	}
+
+	// The blocked rows are never pending again.
+	_, queue, err := Sync(l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(queue, ",") != "004_d.md,006_f.md" {
+		t.Errorf("queue after cascade = %v, want only 004 and 006", queue)
+	}
+}
+
+func TestBlockDependentsWithoutDependantsWritesNothing(t *testing.T) {
+	l := NewLayout(t.TempDir())
+	if err := l.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(l.SpecDir, "002_b.md"), []byte("# B\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteStatus(l.StatusPath, []Row{{Num: "001", Spec: "001_a.md", Status: StatusBlocked}, {Num: "002", Spec: "002_b.md", Status: StatusQueued}}); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.Stat(l.StatusPath)
+	blocked, err := BlockDependents(l, "001_a.md")
+	if err != nil || blocked != nil {
+		t.Fatalf("BlockDependents = %v, %v; want nothing", blocked, err)
+	}
+	after, _ := os.Stat(l.StatusPath)
+	if !before.ModTime().Equal(after.ModTime()) {
+		t.Error("STATUS.md was rewritten although nothing changed")
+	}
+}

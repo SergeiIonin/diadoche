@@ -30,6 +30,10 @@ func TestResetStatusKeepsOnlyDoneAndParkedFailed(t *testing.T) {
 		{Num: "006", Spec: "006_f.md", Status: specs.StatusBlocked, Reason: "merge conflict"},
 		// PAUSED is unfinished, like IN_PROGRESS: re-queued.
 		{Num: "007", Spec: "007_g.md", Status: specs.StatusPaused, Reason: "claude usage window exhausted, resumes at 2026-09-24T19:00:00Z"},
+		// BLOCKED by diadoche's --on-fail block, and by a blocked dependency:
+		// both kept with their reasons, like a merge conflict.
+		{Num: "008", Spec: "008_h.md", Status: specs.StatusBlocked, Reason: "not DONE after 3 iteration(s); on-fail policies applied: escalate, block (see .claude/diadoche/spec/008_BLOCKED.md)"},
+		{Num: "009", Spec: "009_i.md", Status: specs.StatusBlocked, Reason: "depends on 008_h.md, which is BLOCKED"},
 	}
 	if err := specs.WriteStatus(l.StatusPath, rows); err != nil {
 		t.Fatal(err)
@@ -55,8 +59,8 @@ func TestResetStatusKeepsOnlyDoneAndParkedFailed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 3 || got[0].Spec != "001_a.md" || got[1].Spec != "005_e.md" || got[2] != rows[5] {
-		t.Errorf("STATUS.md rows = %+v, want only 001_a.md, 005_e.md and the BLOCKED 006_f.md with its reason", got)
+	if len(got) != 5 || got[0].Spec != "001_a.md" || got[1].Spec != "005_e.md" || got[2] != rows[5] || got[3] != rows[7] || got[4] != rows[8] {
+		t.Errorf("STATUS.md rows = %+v, want only 001_a.md, 005_e.md and the BLOCKED 006_f.md, 008_h.md and 009_i.md with their reasons", got)
 	}
 	if _, err := os.Stat(leftover); !os.IsNotExist(err) {
 		t.Errorf("interrupted-write temp file not cleaned up: %v", err)
